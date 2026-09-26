@@ -32,17 +32,25 @@ DEFAULT_OAUTH_PATH = REPO_ROOT / "data" / "rh_oauth.json"
 _REFRESH_MARGIN_SECONDS = 300
 
 
+def _reseed_requested() -> bool:
+    flag = (get_secret("RH_OAUTH_RESEED") or "").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
 def maybe_seed_oauth_from_env(path: Path = DEFAULT_OAUTH_PATH) -> bool:
     """First-boot seed from the RH_OAUTH_JSON env var into the writable data volume.
 
-    Lets the token be delivered as a Coolify env var (simple UI paste) instead of hand-placing a
-    file in the volume. The on-disk file is authoritative afterwards — refreshes/rotations persist
-    there — so an EXISTING file is never overwritten (the env only seeds a first boot). Returns True
-    if it wrote the file this call.
+    Lets the token be delivered as a Coolify/Render env var (simple UI paste) instead of
+    hand-placing a file in the volume. The on-disk file is authoritative afterwards —
+    refreshes/rotations persist there — so an EXISTING file is never overwritten unless
+    ``RH_OAUTH_RESEED=1`` is set. Returns True if it wrote the file this call.
     """
-    if path.exists():
-        return False
     raw = get_secret("RH_OAUTH_JSON")
+    force = _reseed_requested()
+    if path.exists() and not force:
+        return False
+    if force and path.exists():
+        log.warning("RH_OAUTH_RESEED is set — overwriting %s from RH_OAUTH_JSON.", path)
     if not raw:
         return False
     try:

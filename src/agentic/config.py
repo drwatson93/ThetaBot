@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 DEFAULT_EXAMPLE_PATH = REPO_ROOT / "config.example.yaml"
+# Render Secret Files appear here (Dashboard → Environment → Secret Files).
+RENDER_SECRET_CONFIG = Path("/etc/secrets/config.yaml")
 # Writable overlay (lives in the persistent data volume, NOT the read-only mounted base config)
 # where the in-app settings editor persists runtime edits. Deep-merged over the base at load.
 OVERLAY_PATH = REPO_ROOT / "data" / "config_overlay.yaml"
@@ -420,11 +422,24 @@ class Settings(BaseModel):
     @property
     def public_base_url(self) -> str:
         """Base URL for one-tap approval links. Uses the public tunnel hostname when set
-        (so the buttons work from a phone), else the local control port."""
+        (so the buttons work from a phone), else Render's public URL, else localhost."""
         if self.tunnel.hostname:
             host = self.tunnel.hostname
             return host if host.startswith("http") else f"https://{host}"
+        render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+        if render_url:
+            return render_url.rstrip("/")
         return f"http://localhost:{self.web.port}"
+
+    def http_bind_port(self) -> int:
+        """Listen port: honor ``$PORT`` (Render) when set, else ``web.port``."""
+        raw = os.environ.get("PORT")
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+        return self.web.port
 
     @property
     def db_path(self) -> Path:
@@ -457,6 +472,22 @@ def save_overlay(overlay: dict, path: str | Path | None = None) -> None:
     p.write_text(yaml.safe_dump(overlay, sort_keys=False), encoding="utf-8")
 
 
+def resolve_config_path(explicit: str | Path | None = None) -> Path:
+    """Pick the strategy config file.
+
+    Order: explicit path (CLI) → ``THETABOT_CONFIG`` / ``CONFIG_PATH`` env →
+    Render Secret File at ``/etc/secrets/config.yaml`` → ``./config.yaml``.
+    """
+    if explicit:
+        return Path(explicit)
+    env = os.environ.get("THETABOT_CONFIG") or os.environ.get("CONFIG_PATH")
+    if env:
+        return Path(env)
+    if RENDER_SECRET_CONFIG.is_file():
+        return RENDER_SECRET_CONFIG
+    return DEFAULT_CONFIG_PATH
+
+
 def load_config(path: str | Path | None = None, *, apply_overlay: bool = True) -> Settings:
     """Load Settings from a YAML file, falling back to config.example.yaml.
 
@@ -464,7 +495,7 @@ def load_config(path: str | Path | None = None, *, apply_overlay: bool = True) -
     ``apply_overlay`` is set (default), any runtime edits saved via the in-app settings editor
     (``OVERLAY_PATH``) are deep-merged over the base so they survive restarts.
     """
-    candidate = Path(path) if path else DEFAULT_CONFIG_PATH
+    candidate = resolve_config_path(path)
     if not candidate.exists():
         candidate = DEFAULT_EXAMPLE_PATH
     data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}

@@ -26,15 +26,16 @@ It sells cash-secured puts on stocks you'd be happy to own, manages them to a pr
 4. [Setup overview](#setup-overview)
 5. [Step 1 — Robinhood account + one-time login](#step-1--robinhood-account--one-time-login)
 6. [Step 2 — Spin up a Hostinger VPS](#step-2--spin-up-a-hostinger-vps)
-7. [Step 3 — Install & deploy](#step-3--install--deploy)
-8. [Step 4 — First run, paper → live](#step-4--first-run-paper--live)
-9. [Configuration reference](#configuration-reference)
-10. [Accessing your dashboard securely](#accessing-your-dashboard-securely)
-11. [Optional integrations (Alpaca / TradingView)](#optional-integrations-for-different-setups)
-12. [Operating the bot](#operating-the-bot)
-11. [Safety & risk controls](#safety--risk-controls)
-12. [Troubleshooting](#troubleshooting)
-13. [Disclaimer & license](#disclaimer--license)
+7. [Host on Render (paper practice week)](#host-on-render-paper-practice-week)
+8. [Step 3 — Install & deploy](#step-3--install--deploy)
+9. [Step 4 — First run, paper → live](#step-4--first-run-paper--live)
+10. [Configuration reference](#configuration-reference)
+11. [Accessing your dashboard securely](#accessing-your-dashboard-securely)
+12. [Optional integrations (Alpaca / TradingView)](#optional-integrations-for-different-setups)
+13. [Operating the bot](#operating-the-bot)
+14. [Safety & risk controls](#safety--risk-controls)
+15. [Troubleshooting](#troubleshooting)
+16. [Disclaimer & license](#disclaimer--license)
 
 ---
 
@@ -111,7 +112,7 @@ Browser:   open the dashboard → verify health → (when ready) arm live
 >
 > ```
 > #!/bin/bash
-> curl -fsSL https://raw.githubusercontent.com/SaltyMeat23/ThetaBot/main/scripts/bootstrap.sh | bash
+> curl -fsSL https://raw.githubusercontent.com/drwatson93/ThetaBot/main/scripts/bootstrap.sh | bash
 > ```
 > *(Requires the repo to be public. Then just SSH in, edit `.env` + `config.yaml`, upload your token, and start it.)*
 
@@ -126,12 +127,26 @@ Browser:   open the dashboard → verify health → (when ready) arm live
    ssh root@YOUR_VPS_IP
    ```
 
+## Host on Render (paper practice week)
+
+For a one-week **paper** soak with real Robinhood quotes and **simulated** fills (no real orders):
+
+1. On your **desktop**, run the one-time login (see Step 1) and copy the one-line `RH_OAUTH_JSON` it prints.
+2. Copy `config.render.example.yaml` into a Render **Secret File** named `config.yaml`. Fill `entry.watchlist` with names you are willing to own, and set `paper_buying_power` to your real account size. Keep `mode: paper`.
+3. In Render: **New → Blueprint**, point it at [drwatson93/ThetaBot](https://github.com/drwatson93/ThetaBot), apply `render.yaml`. Paste `RH_OAUTH_JSON` when prompted. Copy `DASHBOARD_PASSWORD` from the Environment tab after create.
+4. Open `https://<service>.onrender.com/health`. You want `"mode":"paper"`, `"live_armed":false`, `"robinhood_connected":true`, `"practice":true`. If `robinhood_connected` is false, the scanner has no real chains — re-check the token.
+5. Leave `mode: live` and `i_understand_live_trading` **off** for the whole practice week.
+
+The Blueprint uses one Starter web service, Virginia, a 1 GB disk at `/app/data` (required: the OAuth refresh token is rewritten on every use), and auto-deploy **off**. Free Render instances will not work (no disk, they sleep after 15 minutes).
+
+To replace a broken token later: run `rh_login` on the desktop again, paste the new JSON into `RH_OAUTH_JSON`, set `RH_OAUTH_RESEED=1` for one deploy, then turn that flag off.
+
 ## Step 3 — Install & deploy
 
 > ### ⚡ Fastest path — one command
 > On a fresh Ubuntu VPS (or if you used the Hostinger post-install script above, this is already done):
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/SaltyMeat23/ThetaBot/main/scripts/bootstrap.sh | bash
+> curl -fsSL https://raw.githubusercontent.com/drwatson93/ThetaBot/main/scripts/bootstrap.sh | bash
 > ```
 > That installs Docker, clones ThetaBot, and creates your `.env` + `config.yaml`. Then jump to editing them below (steps 3 & 5) — you can skip the manual Docker install and clone.
 
@@ -148,7 +163,7 @@ On the VPS:
 2. **Clone this repo** and enter it:
 
    ```bash
-   git clone https://github.com/SaltyMeat23/ThetaBot.git
+   git clone https://github.com/drwatson93/ThetaBot.git
    cd ThetaBot
    ```
 

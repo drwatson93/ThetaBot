@@ -43,6 +43,36 @@ def _construct(name: str, settings: Settings) -> ExecutionBroker:
     return cls()
 
 
+async def build_paper_runtime(settings: Settings) -> tuple[ExecutionBroker, ExecutionBroker | None]:
+    """Paper-mode runtime: simulated fills, optional live Robinhood market-data session.
+
+    Orders always go to ``PaperBroker`` (the live-order guard still blocks any RH write).
+    When ``market_data: robinhood`` and the MCP session connects, that session is returned
+    as the data broker so chains/quotes/earnings use real Robinhood data.
+    """
+    data: ExecutionBroker | None = None
+    if settings.market_data == "robinhood":
+        rh = RobinhoodMCPBroker(
+            account_number=settings.robinhood.account_number, settings=settings
+        )
+        await rh.connect()
+        if getattr(rh, "_connected", False):
+            data = rh
+            log.info(
+                "Practice mode: live Robinhood market data; every order stays on the "
+                "paper simulator (no real trades)."
+            )
+        else:
+            log.warning(
+                "Practice mode: Robinhood MCP is NOT connected — using SYNTHETIC paper "
+                "data. The scanner will not see real option chains. Set RH_OAUTH_JSON "
+                "or run `python -m agentic.tools.rh_login` on a desktop."
+            )
+    paper = _construct("paper", settings)
+    await paper.connect()
+    return paper, data
+
+
 async def build_broker(settings: Settings) -> ExecutionBroker:
     """Construct, connect, and (if needed) fall back to a capable broker."""
     broker = _construct(settings.broker, settings)
