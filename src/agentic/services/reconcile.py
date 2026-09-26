@@ -146,19 +146,16 @@ class ReconcileLoop:
                 has_filled_close = filled_close(self.orders.list_by_position(spos.id)) is not None
             shares = equity_by_symbol.get(spos.underlying, 0)
             assigned_shares = spos.quantity * 100
-            # Assignment beats "past expiry = full-premium win": most assignments happen
-            # exactly at expiration. A filled buy-to-close on a name we already hold is a
-            # close, not an assignment.
+            # Assignment beats "past expiry = full-premium win": a vanished short put plus
+            # the matching shares (including early assignment) is shares bought at the
+            # strike. A filled buy-to-close on a name we already hold is a close, not an
+            # assignment.
             if has_filled_close:
                 if spos.option_type is OptionType.CALL:
                     status, j_status = PositionStatus.CLOSED, "called_away"
                 else:
                     status, j_status = PositionStatus.CLOSED, "closed"
-            elif (
-                spos.option_type is OptionType.PUT
-                and spos.dte() <= 0
-                and shares >= assigned_shares
-            ):
+            elif spos.option_type is OptionType.PUT and shares >= assigned_shares:
                 status, j_status = PositionStatus.ASSIGNED, "assigned"
                 notify = (
                     f"CSP ASSIGNED: {spos.underlying}",

@@ -309,7 +309,16 @@ def test_reserve_line_for_reports(tmp_path):
 
 @pytest.mark.asyncio
 async def test_scanner_nets_reserve_and_excludes_it_from_calls(tmp_path, monkeypatch):
-    from tests.test_entry_intelligence import CRIT, _scanner
+    import importlib.util
+    from pathlib import Path
+    # Load sibling helpers by file path — a site-packages `tests` package can shadow
+    # `from tests.test_entry_intelligence import ...`.
+    _path = Path(__file__).resolve().parent / "test_entry_intelligence.py"
+    _spec = importlib.util.spec_from_file_location("_entry_intelligence_helpers", _path)
+    _mod = importlib.util.module_from_spec(_spec)
+    assert _spec.loader is not None
+    _spec.loader.exec_module(_mod)
+    CRIT, _scanner = _mod.CRIT, _mod._scanner
     monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
     closes = [10 + i * 0.1 for i in range(260)]                       # StubMD price = closes[-1] for any symbol
     sc, *_ = _scanner(tmp_path, closes, CRIT)

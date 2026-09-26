@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 TEST_DASH_USER = "admin"
 TEST_DASH_PASS = "test-dashboard-password-ok"
 TEST_CONTROL_TOKEN = "test-control-token-ok-long"
+_AUTH_UNSET = object()
 
 
 @pytest.fixture(autouse=True)
@@ -36,13 +37,19 @@ def _order_window_open(monkeypatch):
     )
 
 
+def _is_httpx_default_auth(auth) -> bool:
+    """httpx get/post pass auth=USE_CLIENT_DEFAULT, which is not a real credential."""
+    return type(auth).__name__ == "UseClientDefault"
+
+
 @pytest.fixture(autouse=True)
 def _authed_test_client(monkeypatch):
     orig = TestClient.request
 
-    def _request(self, method, url, **kwargs):
-        if "auth" not in kwargs:
+    def _request(self, method, url, *args, **kwargs):
+        auth = kwargs.get("auth", _AUTH_UNSET)
+        if auth is _AUTH_UNSET or _is_httpx_default_auth(auth):
             kwargs["auth"] = (TEST_DASH_USER, TEST_DASH_PASS)
-        return orig(self, method, url, **kwargs)
+        return orig(self, method, url, *args, **kwargs)
 
     monkeypatch.setattr(TestClient, "request", _request)

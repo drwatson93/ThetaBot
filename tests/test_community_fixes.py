@@ -261,9 +261,8 @@ async def test_tax_reserve_paper_plus_real_broker_does_not_buy(tmp_path):
     audit = AuditStore(db)
     loop = TaxReserveLoop(settings, _Real(seed_positions=[], buying_power=10_000),
                           _MD(), _J(), TaxReserveStore(db), audit, KillSwitch(db, audit))
-    # reuse the Friday helper from test_tax_reserve
-    from tests.test_tax_reserve import _fri
-    r = await loop.run_once(now=_fri(15, 41))
+    friday = datetime(2026, 9, 11, 15, 41, tzinfo=ET)
+    r = await loop.run_once(now=friday)
     assert r["status"] == "dry_run"
     assert "paper mode" in r["why"]
 
