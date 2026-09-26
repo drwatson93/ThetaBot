@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from ..domain.enums import OrderStatus, PositionStatus
+from ..domain.enums import OptionType, OrderStatus, PositionStatus
 from ..domain.models import CloseDecision, Order, Position
 
 MULTIPLIER = 100  # shares per option contract
@@ -54,7 +54,24 @@ def filled_close(orders_for_pos: list[Order]) -> Order | None:
     return sorted(filled, key=lambda o: (o.submitted_at is not None, o.submitted_at, o.id))[-1]
 
 
-def position_pnl(pos: Position, close_order: Order | None) -> dict:
+def assignment_realized_pnl(pos: Position, stock_price: float | None) -> float | None:
+    """Option P&L at assignment: premium kept minus intrinsic (shares acquired at the strike).
+
+    A $10 put assigned with the stock at $8 is not a full-premium win: intrinsic is $2,
+    so realized = (credit − 2) × 100 × qty. Returns None when the stock price is unknown
+    — never invent a full-credit expiry profit.
+    """
+    if stock_price is None:
+        return None
+    if pos.option_type is OptionType.PUT:
+        intrinsic = max(0.0, pos.strike - stock_price)
+    else:
+        intrinsic = max(0.0, stock_price - pos.strike)
+    return round((pos.credit_received - intrinsic) * MULTIPLIER * pos.quantity, 2)
+
+
+def position_pnl(pos: Position, close_order: Order | None, *,
+                 underlying_price: float | None = None) -> dict:
     """Classify a position and compute realized/unrealized P&L in dollars."""
     gross_credit = pos.credit_received * MULTIPLIER * pos.quantity
     out: dict = {
@@ -77,6 +94,13 @@ def position_pnl(pos: Position, close_order: Order | None) -> dict:
         return out
     if pos.status == PositionStatus.ASSIGNED:
         out["outcome"] = "assigned"
+        pnl = assignment_realized_pnl(pos, underlying_price)
+        if pnl is not None:
+            out["realized_pnl"] = pnl
+            if pos.option_type.value == "put" or str(pos.option_type).endswith("PUT"):
+                out["close_price"] = round(max(0.0, pos.strike - underlying_price), 4)
+            else:
+                out["close_price"] = round(max(0.0, underlying_price - pos.strike), 4)
         return out
     if pos.status == PositionStatus.CLOSED:
         debit = close_order.avg_fill_price if close_order is not None else None
@@ -203,6 +227,8 @@ def compute_stats(
                 continue  # resolved outside the window -> not part of this week
         if outcome in ("assigned", "closed"):
             assigned += outcome == "assigned"
+            if info["realized_pnl"] is not None:
+                realized += info["realized_pnl"]
             continue
         # win or loss -> realized
         realized += info["realized_pnl"]

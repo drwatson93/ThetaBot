@@ -159,17 +159,17 @@ def test_get_config_returns_editable_and_readonly(client):
     assert "mode" not in body["editable"]
 
 
-def test_post_valid_edit_applies(client):
+def test_post_config_is_read_only(client):
     c, settings = client
     r = c.post("/api/config", json={"entry": {"watchlist": ["F", "SOFI", "T"]}})
-    assert r.status_code == 200
-    assert r.json()["ok"] is True
-    assert settings.entry.watchlist == ["F", "SOFI", "T"]
+    assert r.status_code == 403
+    assert r.json()["ok"] is False
+    assert settings.entry.watchlist == []
 
 
 def test_post_protected_edit_rejected(client):
     c, settings = client
     r = c.post("/api/config", json={"mode": "live"})
-    assert r.status_code == 400
+    assert r.status_code == 403
     assert r.json()["ok"] is False
     assert settings.mode == "paper"

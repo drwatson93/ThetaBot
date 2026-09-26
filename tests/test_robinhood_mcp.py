@@ -14,8 +14,13 @@ from agentic.domain.enums import Direction, OptionType, Strategy
 from agentic.domain.models import Order
 
 
-def _broker(account_number="1234567890"):
-    return RobinhoodMCPBroker(account_number=account_number)
+def _broker(account_number="1234567890", settings=None):
+    from agentic.config import Settings
+    # Adapter tests that place an order must be live-armed; the broker-layer
+    # guard refuses paper / unset settings.
+    if settings is None:
+        settings = Settings(mode="live", i_understand_live_trading=True)
+    return RobinhoodMCPBroker(account_number=account_number, settings=settings)
 
 
 def test_build_close_order_args_uses_legs_and_strings():

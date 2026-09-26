@@ -27,7 +27,7 @@ from ..store.trade_journal import TradeJournalStore
 from .risk_breaker import apply_sector_cap, evaluate_risk_breaker
 from .executor import OrderExecutor
 from .killswitch import KillSwitch
-from .market_hours import is_market_hours
+from .market_hours import is_market_hours, is_order_window
 from ..entry.context import UnderlyingContext, build_context, passes_underlying_gates
 from ..entry.regime import MarketRegime, build_market_regime, classify_move
 from ..entry.risk import RiskSizer
@@ -231,6 +231,8 @@ class OpportunityScanner:
             log.debug("Scanner skipped: killswitch paused.")
             return 0
         if not is_market_hours():
+            return 0
+        if not is_order_window(start=self.settings.trading_start):
             return 0
 
         # Account state for sizing.

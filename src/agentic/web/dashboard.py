@@ -814,6 +814,15 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
     async def calculator() -> str:
         return CALC_PAGE
 
+    @router.get("/api/rules")
+    async def api_rules() -> dict:
+        from .rules_view import describe_active_rules
+        return {"rules": describe_active_rules(deps.settings)}
+
+    @router.get("/rules", response_class=HTMLResponse)
+    async def rules_page() -> str:
+        return _RULES_PAGE
+
     return router
 
 
@@ -1074,6 +1083,7 @@ _PAGE = """<!doctype html>
   <div class="masthead">
     <h1>Trader Cortex <span>· wheel bot</span></h1>
     <div class="updated"><span id="ago">loading…</span>
+      <a class="rbtn" href="/rules" style="text-decoration:none">Rules</a>
       <a class="rbtn" href="/calculator" style="text-decoration:none">Calculator</a>
       <button class="rbtn" onclick="loadAll()">Refresh now</button></div>
   </div>
@@ -1088,6 +1098,7 @@ _PAGE = """<!doctype html>
     <button class="tab-btn" data-tab="overview"><span class="ti">&#9673;</span>Overview</button>
     <button class="tab-btn" data-tab="research"><span class="ti">&#9776;</span>Watchlist</button>
     <button class="tab-btn" data-tab="brief"><span class="ti">&#9636;</span>Brief</button>
+    <button class="tab-btn" data-tab="rules"><span class="ti">&#9777;</span>Rules</button>
     <button class="tab-btn" data-tab="tuning"><span class="ti">&#9881;</span>Tuning</button>
     <button class="tab-btn" data-tab="history"><span class="ti">&#8635;</span>History</button>
   </nav>
@@ -1241,9 +1252,18 @@ _PAGE = """<!doctype html>
   </section>
   </div>
 
+  <div class="tabpane" id="pane-rules" hidden>
+  <section class="card2">
+    <div class="card-h"><h2>Active rules</h2><span class="count">from the running config · read-only</span></div>
+    <div class="hint">These are the hard limits the engine is using right now, written in plain English. They come from the same config the scanner and monitor read, so this page cannot drift. Edit <code>config.yaml</code> (or environment variables) and restart to change them.</div>
+    <div id="rules-list" class="muted">Loading…</div>
+  </section>
+  </div>
+
   <div class="tabpane" id="pane-tuning" hidden>
   <section class="card2">
-    <div class="card-h"><h2>Tuning</h2><span class="count">applies live · persists</span></div>
+    <div class="card-h"><h2>Tuning</h2><span class="count">read-only</span></div>
+    <div class="hint">The dashboard no longer changes trading limits. See the <a href="/rules">Rules</a> page for the live values. Edits belong in <code>config.yaml</code>.</div>
     <div class="ctl">
       <div class="ctl-lab">Tax reserve / gains sweep</div>
       <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-on"/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
@@ -1401,7 +1421,7 @@ _PAGE = """<!doctype html>
   </section>
   </div>
 
-  <div class="foot">Read-only monitoring · settings changes are logged · powered by AgenticRobinhood</div>
+  <div class="foot">Read-only monitoring · no order approvals here · powered by AgenticRobinhood</div>
 </div></div>
 
 <script>
@@ -1807,11 +1827,7 @@ function renderWatchlist(){
 }
 function say(id, msg, ok){ const e=$(id); e.textContent=msg; e.className="say "+(ok?"ok":"err"); if(ok) setTimeout(()=>{if(e.textContent===msg)e.textContent="";},4000); }
 async function postConfig(patch){
-  const r = await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
-    credentials:"same-origin",body:JSON.stringify(patch)});
-  const j = await r.json().catch(()=>({}));
-  if(!r.ok || !j.ok) throw new Error(j.error || ("HTTP "+r.status));
-  return j;
+  throw new Error("Dashboard is read-only. Edit config.yaml and restart.");
 }
 async function saveWatchlist(next, okmsg){
   try { const j = await postConfig({entry:{watchlist:next}});
@@ -2097,12 +2113,31 @@ async function openSavedBrief(id){
 
 /* ---- orchestration ---- */
 let lastLoad = 0;
+async function loadRules(){
+  const box = $("rules-list");
+  if(!box) return;
+  const d = await getJSON("/api/rules");
+  const rows = d.rules || [];
+  if(!rows.length){ box.innerHTML = "<p class='muted'>No rules loaded.</p>"; return; }
+  let html = "";
+  let group = "";
+  for(const r of rows){
+    if(r.group !== group){
+      group = r.group;
+      html += `<div class="ctl-lab" style="margin-top:16px">${esc(group)}</div>`;
+    }
+    html += `<div class="wkline"><span class="wklbl">${esc(r.name)}</span> ${esc(r.value)}</div>`;
+    if(r.detail) html += `<div class="hint">${esc(r.detail)}</div>`;
+  }
+  box.innerHTML = html;
+}
 async function loadAll(){
   for (const [fn,name] of [[loadConn,"conn"],[loadHolds,"holds"],[loadWeek,"week"],
                            [loadFeed,"feed"],[loadScanStatus,"scan"],[loadTvLevels,"tv"],
                            [loadQuality,"quality"],[loadSetups,"setups"],[loadSetupAccuracy,"setupacc"],
                            [loadRiskProfile,"riskprofile"],[loadRegimeStatus,"regime"],
-                           [loadReserve,"reserve"],[loadTiers,"tiers"],[loadTables,"tables"]]) {
+                           [loadReserve,"reserve"],[loadTiers,"tiers"],[loadTables,"tables"],
+                           [loadRules,"rules"]]) {
     try { await fn(); } catch(e){ console.error(name, e); }
   }
   lastLoad = Date.now();
@@ -2168,3 +2203,46 @@ setInterval(tickAgo, 1000);
 </script>
 </body>
 </html>"""
+
+
+_RULES_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Rules — ThetaBot</title>
+<style>
+  :root{--bg:#0f1419;--card:#1a222b;--ink:#e8eef4;--muted:#8b9aab;--line:#2a3542;--pos:#3dd68c}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,sans-serif}
+  .wrap{max-width:820px;margin:0 auto;padding:24px 18px 48px}
+  h1{font-size:22px;margin:0 0 6px} .sub{color:var(--muted);margin:0 0 22px}
+  a{color:#8ec8ff} .group{margin:22px 0 0;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+  .row{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0}
+  .name{font-weight:600} .val{color:var(--pos);margin-top:2px} .detail{color:var(--muted);font-size:13.5px;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p><a href="/dashboard">&larr; Dashboard</a></p>
+  <h1>Active trading rules</h1>
+  <p class="sub">Generated from the same config the engine is running. This page is read-only.</p>
+  <div id="list">Loading…</div>
+</div>
+<script>
+function esc(s){ return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[c])); }
+(async () => {
+  const r = await fetch("/api/rules", {credentials:"same-origin"});
+  const d = await r.json();
+  const list = document.getElementById("list");
+  let html = "", group = "";
+  for (const row of (d.rules || [])) {
+    if (row.group !== group) { group = row.group; html += `<div class="group">${esc(group)}</div>`; }
+    html += `<div class="row"><div class="name">${esc(row.name)}</div><div class="val">${esc(row.value)}</div>`
+         + (row.detail ? `<div class="detail">${esc(row.detail)}</div>` : "") + `</div>`;
+  }
+  list.innerHTML = html || "<p>No rules loaded.</p>";
+})();
+</script>
+</body>
+</html>
+"""

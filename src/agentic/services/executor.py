@@ -34,6 +34,7 @@ from ..store.orders import OrderStore
 from ..store.positions import PositionStore
 from ..store.trade_journal import TradeJournalStore
 from .killswitch import KillSwitch
+from .market_hours import is_order_window
 from .stats import position_pnl
 
 log = logging.getLogger("agentic.executor")
@@ -52,20 +53,25 @@ def compute_limit_price(
     buffer_pct: float,
     slippage_cap_pct: float,
     tick: float = 0.01,
+    toward_fill: float = 0.0,
 ) -> float | None:
-    """Buy-to-close limit price: midpoint nudged up by ``buffer_pct`` to improve fill odds,
-    but never above ``ask * (1 + slippage_cap_pct)``. Returns None if the quote can't price.
+    """Buy-to-close limit: start at mid (between bid and ask), then step toward the ask.
 
-    Buying back a short, we pay a debit, so we bias *up* from mid (a higher limit fills more
-    readily) while the slippage cap bounds how much we'll overpay versus the current ask.
+    ``toward_fill`` is 0..1 (0 = mid, 1 = the ask). Never above ``ask * (1 + slippage_cap)``.
+    ``buffer_pct`` is kept for callers; the first submit uses mid, not a percent nudge.
     """
     mid = quote.midpoint
     if mid is None or mid <= 0:
         return None
-    target = mid * (1 + buffer_pct)
-    if quote.ask is not None and quote.ask > 0:
-        cap = quote.ask * (1 + slippage_cap_pct)
-        target = min(target, cap)
+    ask = quote.ask
+    if toward_fill <= 0:
+        target = mid
+    elif ask is not None and ask > 0:
+        target = mid + (ask - mid) * min(1.0, toward_fill)
+    else:
+        target = mid * (1 + buffer_pct)
+    if ask is not None and ask > 0:
+        target = min(target, ask * (1 + slippage_cap_pct))
     return round_to_tick(target, tick)
 
 
@@ -75,18 +81,23 @@ def compute_open_limit_price(
     buffer_pct: float,
     slippage_cap_pct: float,
     tick: float = 0.01,
+    toward_fill: float = 0.0,
 ) -> float | None:
-    """Sell-to-open limit price: midpoint nudged *down* by ``buffer_pct`` toward the bid to
-    improve fill odds, but never below ``bid * (1 - slippage_cap_pct)`` so we don't dump credit.
-    Selling a short put we collect a credit, so a lower limit fills more readily.
+    """Sell-to-open limit: start at mid, then step toward the bid. Never below
+    ``bid * (1 - slippage_cap)``.
     """
     mid = quote.midpoint
     if mid is None or mid <= 0:
         return None
-    target = mid * (1 - buffer_pct)
-    if quote.bid is not None and quote.bid > 0:
-        floor = quote.bid * (1 - slippage_cap_pct)
-        target = max(target, floor)
+    bid = quote.bid
+    if toward_fill <= 0:
+        target = mid
+    elif bid is not None and bid > 0:
+        target = mid - (mid - bid) * min(1.0, toward_fill)
+    else:
+        target = mid * (1 - buffer_pct)
+    if bid is not None and bid > 0:
+        target = max(target, bid * (1 - slippage_cap_pct))
     return round_to_tick(target, tick)
 
 
@@ -128,6 +139,10 @@ class OrderExecutor:
         # 1. Kill-switch recheck (state may have changed since the decision was made).
         if self.killswitch.is_paused():
             await self._block(position, decision, "killswitch engaged; order suppressed")
+            return None
+        hours_block = self._order_window_block()
+        if hours_block:
+            await self._block(position, decision, hours_block)
             return None
 
         # 3. Fresh quote + stale guard (refetch unless the caller passed a fresh one).
@@ -230,11 +245,15 @@ class OrderExecutor:
                 priority="high",
             )
         else:
+            cancelled = await self._cancel_working(final)
+            if cancelled is not None:
+                final = cancelled
             self.decisions.set_status(decision.id, DecisionStatus.FAILED)
             await self._notify(
                 "Close did not fill",
                 f"{position.occ_symbol}: order {final.status.value} after "
-                f"{ex.fill_timeout_seconds}s (broker_id={final.broker_order_id}).",
+                f"{ex.fill_timeout_seconds}s (broker_id={final.broker_order_id}); "
+                f"working close cancelled.",
                 priority="high",
             )
         return final
@@ -256,21 +275,14 @@ class OrderExecutor:
         if self.killswitch.is_paused():
             await self._block_entry(decision, "killswitch engaged; entry suppressed")
             return None
+        hours_block = self._order_window_block()
+        if hours_block:
+            await self._block_entry(decision, hours_block)
+            return None
 
-        # Refetch a fresh quote if the caller's has gone stale. The AI review can add several
-        # seconds between the scan-time fetch and here, ageing the quote past the stale guard — an
-        # approved entry must not die just because analysis took a moment. Execution uses the
-        # freshest quote available; if the refetch fails we fall through to the guard below.
-        if quote is None or quote.is_stale(self.settings.max_quote_age_seconds):
-            try:
-                chain = await self.market_data.get_chain(decision.underlying)
-                fresh = next(
-                    (c for c in chain if c.occ_symbol == decision.occ_symbol), None)
-                if fresh is not None:
-                    quote = fresh
-            except Exception as exc:  # noqa: BLE001 — the stale guard below will block if needed
-                log.warning("execute_open quote refetch failed for %s: %s",
-                            decision.occ_symbol, exc)
+        # Always try a cache-bypassing quote first — chain cache as_of timestamps are the
+        # original fetch time, so a 15–30 minute scan would otherwise look "stale" forever.
+        quote = await self._fresh_open_quote(decision, quote)
 
         # 3. Quote stale/validity guard.
         bad = self._open_quote_problem(quote)
@@ -496,14 +508,19 @@ class OrderExecutor:
             return order  # can't safely reprice without a good quote; keep waiting
         ex = self.settings.execution
         new_limit = compute_limit_price(
-            quote, buffer_pct=ex.limit_buffer_pct * 2, slippage_cap_pct=ex.slippage_cap_pct
+            quote, buffer_pct=ex.limit_buffer_pct, slippage_cap_pct=ex.slippage_cap_pct,
+            toward_fill=1.0,
         )
         if new_limit is None or new_limit <= order.limit_price:
             return order
-        try:
-            await self.broker.cancel_order(order)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("cancel during reprice failed: %s", exc)
+        cancelled = await self._cancel_working(order)
+        if cancelled is None or cancelled.status not in (
+            OrderStatus.CANCELLED, OrderStatus.REJECTED,
+        ):
+            log.warning("reprice aborted for %s: cancel not confirmed (status=%s)",
+                        order.occ_symbol, getattr(cancelled, "status", None))
+            return cancelled or order
+        order = cancelled
 
         remaining = max(order.quantity - order.filled_qty, 0) or order.quantity
         new_order = Order(
@@ -524,12 +541,114 @@ class OrderExecutor:
             decision_id=order.decision_id, order_id=new_order.id,
         )
         new_order.submitted_at = utcnow()
-        submitted = await self.broker.submit_close_order(new_order)
+        try:
+            submitted = await self.broker.submit_close_order(new_order)
+        except Exception as exc:  # noqa: BLE001 — leave the cancelled original; do not half-replace
+            log.exception("reprice submit failed: %s", exc)
+            new_order.status = OrderStatus.REJECTED
+            new_order.last_status_at = utcnow()
+            self.orders.update(new_order)
+            return order
         submitted.last_status_at = utcnow()
         self.orders.update(submitted)
         return submitted
 
     # ------------------------------------------------------------------ helpers
+    def _is_paper_broker(self) -> bool:
+        try:
+            return bool(self.broker.capabilities().is_paper)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _order_window_block(self) -> str | None:
+        """Hard clock gate for every entry and exit, paper or live."""
+        start = self.settings.trading_start
+        if is_order_window(start=start):
+            return None
+        return (f"before trading start ({start} America/New_York); "
+                f"no entries, exits, or stop-loss orders yet")
+
+    def open_block_reason(
+        self, decision: EntryDecision, quote: OptionContractQuote | None
+    ) -> str | None:
+        """Why execute_open would refuse *before* submitting. Used to avoid half-rolls."""
+        if self.killswitch.is_paused():
+            return "killswitch engaged; entry suppressed"
+        hours = self._order_window_block()
+        if hours:
+            return hours
+        bad = self._open_quote_problem(quote)
+        if bad:
+            return f"unusable quote: {bad}"
+        ex = self.settings.execution
+        if compute_open_limit_price(
+            quote, buffer_pct=ex.limit_buffer_pct, slippage_cap_pct=ex.slippage_cap_pct
+        ) is None:
+            return "could not compute a limit price"
+        if not self._is_paper_broker() and not self.settings.is_live:
+            return (f"NOT ARMED (mode={self.settings.mode}); would sell-to-open "
+                    f"{decision.contracts}x {decision.occ_symbol}")
+        if (not self._is_paper_broker() and self.settings.is_live
+                and not getattr(self.market_data, "is_realtime", False)):
+            return "live entry requires a real-time feed; refusing on delayed data"
+        return None
+
+    async def _fresh_open_quote(
+        self, decision: EntryDecision, quote: OptionContractQuote | None
+    ) -> OptionContractQuote | None:
+        """Prefer a cache-bypassing quote; fall back to get_chain when the caller is stale."""
+        try:
+            fresh = await self.market_data.get_fresh_contract_quote(decision.occ_symbol)
+            if fresh is not None:
+                return fresh
+        except Exception as exc:  # noqa: BLE001
+            log.warning("execute_open fresh quote failed for %s: %s", decision.occ_symbol, exc)
+        if quote is None or quote.is_stale(self.settings.max_quote_age_seconds):
+            try:
+                chain = await self.market_data.get_chain(decision.underlying)
+                hit = next((c for c in chain if c.occ_symbol == decision.occ_symbol), None)
+                if hit is not None:
+                    return hit
+            except Exception as exc:  # noqa: BLE001
+                log.warning("execute_open quote refetch failed for %s: %s",
+                            decision.occ_symbol, exc)
+        return quote
+
+    async def _cancel_working(self, order: Order) -> Order | None:
+        """Cancel a working order and confirm the broker actually dropped it.
+
+        Returns the refreshed order when cancel was confirmed (CANCELLED/REJECTED) or the
+        order filled during cancel. Returns None if cancel could not be confirmed — callers
+        must not submit a replacement in that case.
+        """
+        if not order.broker_order_id and order.status in (
+            OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL,
+        ):
+            try:
+                await self.broker.cancel_order(order)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("cancel failed for %s: %s", order.client_order_id, exc)
+                return None
+        elif order.broker_order_id:
+            try:
+                await self.broker.cancel_order(order)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("cancel failed for %s: %s", order.client_order_id, exc)
+                return None
+        else:
+            return order if order.status in (OrderStatus.CANCELLED, OrderStatus.REJECTED,
+                                             OrderStatus.FILLED) else None
+        try:
+            refreshed = await self.broker.get_order(order)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_order after cancel failed for %s: %s", order.client_order_id, exc)
+            return None
+        refreshed.last_status_at = utcnow()
+        self.orders.update(refreshed)
+        if refreshed.status in (OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.FILLED):
+            return refreshed
+        return None
+
     def _quote_problem(self, quote: OptionQuote | None) -> str | None:
         if quote is None:
             return "no quote"

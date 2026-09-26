@@ -170,10 +170,11 @@ async def test_loop_waits_for_market_hours_and_respects_dry_run_and_killswitch(t
 
 def test_robinhood_equity_order_args_and_parse():
     b = RobinhoodMCPBroker(account_number="1234567890")
-    args = b._build_equity_order_args(symbol="sgov", dollar_amount=123.456, ref_id="ref-1")
-    assert args == {"account_number": "1234567890", "symbol": "SGOV", "side": "buy", "type": "market",
-                    "dollar_amount": "123.46", "time_in_force": "gfd", "market_hours": "regular_hours",
-                    "ref_id": "ref-1"}
+    args = b._build_equity_order_args(symbol="sgov", dollar_amount=123.456, ref_id="ref-1",
+                                     limit_price=100.5)
+    assert args == {"account_number": "1234567890", "symbol": "SGOV", "side": "buy", "type": "limit",
+                    "price": "100.50", "dollar_amount": "123.46", "time_in_force": "gfd",
+                    "market_hours": "regular_hours", "ref_id": "ref-1"}
     p = RobinhoodMCPBroker._parse_equity_order({"id": "o1", "state": "filled", "cumulative_quantity": "0.9876",
                                                 "average_price": "101.20", "executed_notional": {"amount": "99.95"}})
     assert p == {"order_id": "o1", "status": "filled", "shares": 0.9876, "avg_price": 101.2, "dollars": 99.95, "raw_state": "filled"}
@@ -289,7 +290,7 @@ def test_endpoints_and_page_markers(tmp_path):
     assert c.get("/api/holdings").json() == {"holdings": []}
     # tax_reserve is hot-editable
     r = c.post("/api/config", json={"tax_reserve": {"pct": 0.25, "dry_run": False}})
-    assert r.status_code == 200 and r.json()["editable"]["tax_reserve"]["pct"] == 0.25
+    assert r.status_code == 403 and r.json()["ok"] is False
 
 
 def test_reserve_line_for_reports(tmp_path):
@@ -308,7 +309,16 @@ def test_reserve_line_for_reports(tmp_path):
 
 @pytest.mark.asyncio
 async def test_scanner_nets_reserve_and_excludes_it_from_calls(tmp_path, monkeypatch):
-    from tests.test_entry_intelligence import CRIT, _scanner
+    import importlib.util
+    from pathlib import Path
+    # Load sibling helpers by file path — a site-packages `tests` package can shadow
+    # `from tests.test_entry_intelligence import ...`.
+    _path = Path(__file__).resolve().parent / "test_entry_intelligence.py"
+    _spec = importlib.util.spec_from_file_location("_entry_intelligence_helpers", _path)
+    _mod = importlib.util.module_from_spec(_spec)
+    assert _spec.loader is not None
+    _spec.loader.exec_module(_mod)
+    CRIT, _scanner = _mod.CRIT, _mod._scanner
     monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
     closes = [10 + i * 0.1 for i in range(260)]                       # StubMD price = closes[-1] for any symbol
     sc, *_ = _scanner(tmp_path, closes, CRIT)

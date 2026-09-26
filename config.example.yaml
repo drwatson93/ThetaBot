@@ -25,7 +25,8 @@ poll_interval_seconds: 60          # monitor loop during market hours
 poll_interval_closed_seconds: 300  # monitor loop when market closed
 reconcile_interval_seconds: 300
 approval_timeout_seconds: 900      # how long an approval request stays valid
-max_quote_age_seconds: 10          # reject quotes older than this when executing
+max_quote_age_seconds: 90          # reject quotes older than this when executing (fresh quote is fetched first)
+trading_start: "10:00"             # no new entries, exits, or stop-loss orders before this ET time
 auto_trip_after_errors: 0          # auto-engage kill switch after N consecutive errors (0=off)
 
 execution:
@@ -47,7 +48,7 @@ entry:
   enabled: false             # master switch; scanner does not run unless true
   watchlist: []              # tickers to scan, e.g. ["MSFT","NVDA","AMD"]
   feed: indicative           # ONLY used when market_data=alpaca (set 'opra' then). Ignored for robinhood.
-  scan_interval_seconds: 300
+  scan_interval_seconds: 900     # 15 minutes; 15–30 min is the intended cadence
   earnings_gate: true        # skip a name whose earnings fall within (dte_max + exclude_earnings_days)
                              # days — never hold a short put through earnings. Enforced only when an
                              # earnings source is live (RH MCP + ROBINHOOD_MCP_TOKEN); else no-op.
@@ -145,6 +146,7 @@ tax_reserve:
   minute: 40
   min_order_dollars: 5       # smaller amounts roll into the next week
   dry_run: true              # log + ledger the intended order, place nothing
+  allow_sgov_test_buy: false # optional: allow one 1-share SGOV limit buy to test connectivity
 
 # --- Scheduled push reports (hands-off heartbeat) ---
 # For when you can't watch during the day: a daily digest (so 'no news' means 'all fine', not

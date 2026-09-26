@@ -222,11 +222,11 @@ On the VPS:
 
 ## Step 4 — First run, paper → live
 
-1. **Open the dashboard:** `http://YOUR_VPS_IP:8000` — log in with the `DASHBOARD_USER` / `DASHBOARD_PASSWORD` you set.
-2. **Confirm health:** the top banner should show the broker connected and *not degraded*. Check `http://YOUR_VPS_IP:8000/health` returns `ok`.
+1. **Open the dashboard via SSH tunnel** (port 8000 is bound to localhost only): `ssh -L 8000:localhost:8000 user@YOUR_VPS` then `http://localhost:8000` — log in with the `DASHBOARD_USER` / `DASHBOARD_PASSWORD` you set.
+2. **Confirm health:** the top banner should show the broker connected and *not degraded*. Check `http://localhost:8000/health` returns `ok`.
 3. **Let it run in paper mode for a while.** Watch it screen, "trade," and manage positions with no real money. Read the decision log — make sure its choices make sense to *you*.
 4. **Add HTTPS (recommended before going live).** Exposing a password over plain `http://` is risky. The simplest option is to put **Caddy** in front for automatic HTTPS with a domain you point at the VPS — see the wiki/`docs/`. At minimum, restrict port 8000 with a firewall to your own IP.
-5. **Go live only when you're ready:** set `mode: live` in `config.yaml`, start with a **small** account and a **short** watchlist, then `docker compose up -d` to apply. The dashboard will show `live_armed: true`.
+5. **Go live only when you're ready:** set **both** `mode: live` **and** `i_understand_live_trading: true` in `config.yaml`, start with a **small** account and a **short** watchlist, then `docker compose up -d` to apply. The dashboard will show `live_armed: true`. Leaving the second flag false keeps the bot read-only even if `mode` says live.
 
 ---
 
@@ -234,8 +234,8 @@ On the VPS:
 
 The dashboard runs on your server at port **8000**. **You do not need a domain or a website.** Pick the access method that fits — simplest to most polished:
 
-### 1. Direct IP — quick look only
-`http://YOUR_VPS_IP:8000`. Instant, but it's plain HTTP (password unencrypted) and open to the internet. Fine for a first peek — **do not leave it exposed.** At minimum, firewall port 8000 to your own IP.
+### 1. Direct IP — not the default
+Port 8000 is bound to `127.0.0.1` only. `http://YOUR_VPS_IP:8000` will not work unless you deliberately republish the port. Prefer the SSH tunnel or Cloudflare Tunnel below.
 
 ### 2. SSH tunnel — recommended default (nothing exposed, free)
 Nothing to install, no open ports. From your computer:
@@ -265,70 +265,59 @@ Prefer to self-host HTTPS like a classic web app? Point a domain at the VPS and 
 `config.yaml` (hot-reloadable via the dashboard). Key sections:
 
 ```yaml
-mode: paper | live
+mode: paper
+i_understand_live_trading: false   # required (with mode: live) before any real order
+trading_start: "10:00"             # America/New_York; no new entries/exits/stops before this
 
 market_data: robinhood       # robinhood | alpaca | paper  (see "Optional integrations")
 
 entry:
   enabled: true
   watchlist: [F, SOFI, T, ...]   # ONLY names you'd own
-  feed: opra                     # ignored for the robinhood provider
-  prefer_iv_rank: true           # sell where premium is richest vs the name's own history
+  feed: indicative               # ignored for the robinhood provider; use opra only with Alpaca
   earnings_gate: true            # never hold a short put through earnings
-  criteria:                      # the CSP screen
+  criteria:                      # the CSP screen — matches config.example.yaml
     delta_min: 0.10
     delta_max: 0.20              # ~how likely you are to be assigned; 0.10-0.20 measured best (docs/backtests.md)
     dte_min: 7
     dte_max: 14
-    min_annualized_yield: 0.52   # ~1%/week floor on collateral; lower it for more (thinner) trades
+    min_annualized_yield: 0.20   # (premium/strike)/dte*365 floor (0.20 = 20%)
     min_open_interest: 100
     min_volume: 10
     max_spread_pct: 0.10
-    max_pct_below_sma200: 0.20   # skip broken downtrends
-    require_strike_below_support: true
-    min_strike_expected_moves: null # OFF. Require the strike >= N option-implied expected-moves OTM
-                                    # (scales the cushion to each name's own volatility).
-    min_iv_rv_ratio: 1.3            # Only sell when IV is >= 1.3x the name's 20-day realized vol: the
-                                    # variance-risk-premium edge. Measured: +1.90%/trade vs +1.20% off,
-                                    # fewer assignments, ~1/3 fewer entries. null = off.
+    min_iv_rv_ratio: 1.3         # only sell when IV is >= 1.3x the name's 20-day realized vol
   cc_criteria:                   # the covered-call screen (post-assignment)
     delta_min: 0.20
     delta_max: 0.30
     min_annualized_yield: 0.20
-    cc_below_basis_after_days: null # OFF. Assignment clock: after N days under water, allow calls
-    cc_otm_band: [0.05, 0.10]       # BELOW basis inside this band above spot (capital turns over)
+    cc_below_basis_after_days: null
+    cc_otm_band: [0.05, 0.10]
   sizing:
-    target_positions: 20         # spread capital across ~N names (scale-invariant)
-    max_position_size_pct: 0.50  # per-name backstop cap
-    total_bp_utilization_target: 0.80
-    buying_power_reserve_pct: 0.15
-    max_pct_of_oi: 0.10          # never take >10% of a strike's open interest
-    max_pct_per_underlying: null # OFF by default. Set (e.g. 0.15) to allow MORE THAN ONE CSP per
-                                 # name -- laddered strikes/expiries up to this % of account in that
-                                 # name; still no averaging-in over later days. null = one per name.
-  per_ticker:                    # optional: override any `criteria` field for one name (merged over it)
-    # NVDA: { delta_max: 0.22, min_iv_rank: 40 }
-  watchlist_tiers: {}            # names to PROPOSE once one contract fits under the per-name cap
-    # KO: { min_collateral: 7000, per_ticker: { min_annualized_yield: 0.20 } }
+    max_position_size_pct: 0.10  # cap each CSP at 10% of account value
+    max_concurrent_positions: 5
+    total_bp_utilization_target: 0.50
+    buying_power_reserve_pct: 0.10
 
-macro:                           # market-regime read (SPY vs its 200-day, VIX term structure)
-  skip_confirmed_downtrend: false # opt-in: pause NEW puts after 5 straight SPY closes under the 200-day
-
-tax_reserve:                     # weekly gains sweep -- see "Operating the bot"
+tax_reserve:                     # weekly gains sweep — paper/dry-run never places a real buy
   enabled: false
-  pct: 0.20                      # of the week's NET realized gains (losses carry forward)
-  symbol: SGOV                   # any stock/ETF: T-bills for taxes, or an index fund to reinvest
-  dry_run: true                  # first cycle: log + ledger only
+  pct: 0.20
+  symbol: SGOV
+  dry_run: true
+  allow_sgov_test_buy: false     # optional 1-share SGOV connectivity test
 
 risk:                            # loss circuit breaker (freezes NEW entries; never force-closes)
   loss_breaker_enabled: true
   lookback_days: 7
-  max_realized_loss_pct: 0.10    # halt new entries if realized losses over the window exceed 10% of account
+  max_realized_loss_pct: 0.10
   max_consecutive_losses: 4
 
-rules:                           # position management
-  - name: profit-trail
-    params: { profit_pct: 0.8, trailing: true, trail_gap: 0.2 }   # take profit ~80% of max
+rules:                           # each rule needs rule_type (required by the config schema)
+  - name: profit-target
+    rule_type: PROFIT_TARGET
+    enabled: true
+    requires_approval: false
+    params:
+      profit_pct: 0.5            # close once 50% of the credit is captured
 ```
 
 Tune the yield floor and delta band to your own risk tolerance. Higher `min_annualized_yield` = fewer, richer, higher-IV trades; lower = more, thinner ones. The defaults above are the ones that survived a real-option-print backtest under both fair and worst-case fills; **[docs/backtests.md](docs/backtests.md)** lists every lever tested, what held up, and what did not.

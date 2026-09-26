@@ -31,7 +31,7 @@ def _construct(name: str, settings: Settings) -> ExecutionBroker:
     if cls is None:
         raise ValueError(f"Unknown broker '{name}'. Options: {list(_REGISTRY)}")
     if cls is RobinhoodMCPBroker:
-        return cls(account_number=settings.robinhood.account_number)
+        return cls(account_number=settings.robinhood.account_number, settings=settings)
     if cls is PaperBroker:
         # None -> broker uses its built-in demo seed; [] -> start empty (real-soak / no phantom
         # collateral blocking the entry sizer). See Settings.paper_seed_positions.

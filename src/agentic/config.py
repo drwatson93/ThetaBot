@@ -168,7 +168,7 @@ class EntryConfig(BaseModel):
     # "note": str, "per_ticker": {...overrides applied on add, e.g. "min_annualized_yield": 0.20}}.
     watchlist_tiers: dict[str, dict] = Field(default_factory=dict)
     feed: Literal["indicative", "opra"] = "indicative"  # opra (real-time) REQUIRED for live entry
-    scan_interval_seconds: int = 300
+    scan_interval_seconds: int = 900
     # Skip a name whose earnings fall within (dte_max + exclude_earnings_days) days — so a short
     # put is never held through an earnings report. Enforced only when an earnings source is
     # available (RH MCP + ROBINHOOD_MCP_TOKEN); otherwise fails open (never blocks).
@@ -341,6 +341,10 @@ class TaxReserveConfig(BaseModel):
     minute: int = 40
     min_order_dollars: float = 5.0   # smaller amounts roll into the next period
     dry_run: bool = True             # log + ledger the intended order without placing it
+    # Off by default. When true, the broker may place ONE 1-share SGOV limit buy as a
+    # deliberate connectivity test even if the bot is not live-armed. Weekly sweeps still
+    # respect paper / dry-run and never become a real dollar-amount buy in paper mode.
+    allow_sgov_test_buy: bool = False
     check_interval_seconds: int = 300
 
 
@@ -387,7 +391,9 @@ class Settings(BaseModel):
     poll_interval_closed_seconds: int = 300
     reconcile_interval_seconds: int = 300
     approval_timeout_seconds: int = 900
-    max_quote_age_seconds: int = 10
+    max_quote_age_seconds: int = 90
+    # No new entries, exits, or stop-loss orders before this America/New_York clock time.
+    trading_start: str = "10:00"
     auto_trip_after_errors: int = 0  # auto-engage kill switch after N consecutive errors (0=off)
 
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -469,6 +475,45 @@ def load_config(path: str | Path | None = None, *, apply_overlay: bool = True) -
     return Settings.model_validate(data)
 
 
+# Values that ship in .env.example or are otherwise not real secrets. Starting with one of
+# these must fail closed — they are public knowledge.
+_PLACEHOLDER_SECRETS = frozenset({
+    "",
+    "change-me-to-something-strong",
+    "change-me-long-random",
+    "change-me",
+    "changeme",
+    "password",
+    "secret",
+})
+
+
+def is_usable_secret(value: str | None) -> bool:
+    """True when ``value`` is a non-empty secret that is not a known placeholder."""
+    if value is None:
+        return False
+    return value.strip().lower() not in _PLACEHOLDER_SECRETS
+
+
+def require_runtime_secrets() -> None:
+    """Refuse to start unless dashboard password and control token are real secrets.
+
+    Secrets come from the environment (or a local .env). Placeholder values that ship in
+    ``.env.example`` are treated as unset.
+    """
+    missing: list[str] = []
+    if not is_usable_secret(get_secret("DASHBOARD_PASSWORD")):
+        missing.append("DASHBOARD_PASSWORD")
+    if not is_usable_secret(get_secret("CONTROL_TOKEN")):
+        missing.append("CONTROL_TOKEN")
+    if missing:
+        raise SystemExit(
+            "Refusing to start: " + " and ".join(missing)
+            + " must be set to a real secret (not blank, not a placeholder). "
+            "Supply them as environment variables."
+        )
+
+
 def get_secret(name: str, default: str | None = None) -> str | None:
     """Read a secret from the environment. Loads .env on first call if present."""
     _ensure_dotenv_loaded()
@@ -487,7 +532,7 @@ def _action_token(kind: str, decision_id: str) -> str | None:
     import hmac as _hmac
 
     secret = get_secret("CONTROL_TOKEN")
-    if not secret:
+    if not is_usable_secret(secret):
         return None
     return _hmac.new(secret.encode(), f"{kind}:{decision_id}".encode(), hashlib.sha256).hexdigest()
 

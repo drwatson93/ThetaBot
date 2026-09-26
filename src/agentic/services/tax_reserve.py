@@ -121,8 +121,22 @@ class TaxReserveLoop:
             result = {"status": "skipped", "net": net, "amount": amount, "carry_out": net}
         else:
             caps = self.broker.capabilities()
-            real_money = self.settings.is_live and not caps.is_paper
-            if real_money and (cfg.dry_run or not getattr(caps, "supports_equity_orders", False)):
+            paper_broker = bool(getattr(caps, "is_paper", False))
+            real_money = self.settings.is_live and not paper_broker
+            if not real_money:
+                # Paper mode on a REAL broker must never buy. A paper *simulator* may still
+                # fill a simulated order so the ledger can be exercised. dry_run always logs only.
+                if cfg.dry_run or not paper_broker:
+                    why = "dry_run" if cfg.dry_run else "paper mode — no real tax-reserve buy"
+                    self.store.record(**base, carry_out=0.0, amount_due=amount, status="dry_run",
+                                      dollar_amount=amount, error=why)
+                    result = {"status": "dry_run", "net": net, "amount": amount, "why": why}
+                    await self._notify(
+                        f"Tax reserve (dry run): would buy ${amount:,.2f} of {cfg.symbol}",
+                        f"Week net realized {net:+,.2f} x {cfg.pct:.0%}. No order placed ({why}).")
+                else:
+                    result = await self._buy(base, net, amount, key)
+            elif cfg.dry_run or not getattr(caps, "supports_equity_orders", False):
                 why = "dry_run" if cfg.dry_run else "broker has no equity order tool"
                 self.store.record(**base, carry_out=0.0, amount_due=amount, status="dry_run",
                                   dollar_amount=amount, error=why)
@@ -144,8 +158,10 @@ class TaxReserveLoop:
             log.warning("reserve price read failed for %s: %s", cfg.symbol, exc)
         ref_id = str(uuid.uuid5(_NS, key))
         try:
+            if price is None or price <= 0:
+                raise RuntimeError(f"no usable limit price for {cfg.symbol}")
             filled = await self.broker.submit_equity_order(
-                symbol=cfg.symbol, side="buy", dollar_amount=amount, order_type="market",
+                symbol=cfg.symbol, side="buy", dollar_amount=amount, order_type="limit",
                 ref_id=ref_id, price_hint=price)
         except Exception as exc:  # noqa: BLE001
             self.store.record(**base, carry_out=net, amount_due=amount, status="failed",

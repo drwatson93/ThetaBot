@@ -28,8 +28,9 @@ from ..store.entry_decisions import EntryDecisionStore
 from ..store.orders import OrderStore
 from ..store.positions import PositionStore
 from ..store.trade_journal import TradeJournalStore
+from .holdings import reserve_symbols
 from .killswitch import KillSwitch
-from .stats import filled_close, position_pnl
+from .stats import assignment_realized_pnl, filled_close, position_pnl
 
 log = logging.getLogger("agentic.reconcile")
 
@@ -46,6 +47,7 @@ class ReconcileLoop:
         notifier: Notifier | None = None,
         trade_journal: TradeJournalStore | None = None,
         entry_decisions: EntryDecisionStore | None = None,
+        market_data=None,
     ):
         self.settings = settings
         self.broker = broker
@@ -56,6 +58,7 @@ class ReconcileLoop:
         self.notifier = notifier
         self.trade_journal = trade_journal
         self.entry_decisions = entry_decisions
+        self.market_data = market_data
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -122,7 +125,6 @@ class ReconcileLoop:
 
         # Snapshot equity holdings to detect assignment (a short put gone + shares appearing).
         equity_by_symbol: dict[str, int] = {}
-        from .holdings import reserve_symbols
         reserve = reserve_symbols(self.settings)
         try:
             for h in await self.broker.get_equity_positions():
@@ -135,22 +137,35 @@ class ReconcileLoop:
         # Gone -> classify EXPIRED / ASSIGNED / called-away / CLOSED, and notify on the wheel
         # hand-offs (assignment + called-away). Plain expiry is routine (esp. weeklies) -> quiet.
         classified: list[dict] = []
+        stock_prices: dict[str, float] = {}
         for occ in gone:
             spos = store_open[occ]
             notify: tuple[str, str] | None = None
-            if spos.dte() < 0:
-                status, j_status = PositionStatus.EXPIRED, "expired"
-            elif spos.option_type is OptionType.PUT and equity_by_symbol.get(spos.underlying):
-                # Short put vanished before expiry and we now hold the shares -> assigned.
+            has_filled_close = False
+            if self.orders is not None:
+                has_filled_close = filled_close(self.orders.list_by_position(spos.id)) is not None
+            shares = equity_by_symbol.get(spos.underlying, 0)
+            assigned_shares = spos.quantity * 100
+            # Assignment beats "past expiry = full-premium win": a vanished short put plus
+            # the matching shares (including early assignment) is shares bought at the
+            # strike. A filled buy-to-close on a name we already hold is a close, not an
+            # assignment.
+            if has_filled_close:
+                if spos.option_type is OptionType.CALL:
+                    status, j_status = PositionStatus.CLOSED, "called_away"
+                else:
+                    status, j_status = PositionStatus.CLOSED, "closed"
+            elif spos.option_type is OptionType.PUT and shares >= assigned_shares:
                 status, j_status = PositionStatus.ASSIGNED, "assigned"
                 notify = (
                     f"CSP ASSIGNED: {spos.underlying}",
                     f"{spos.occ_symbol} assigned — you now hold "
-                    f"{equity_by_symbol[spos.underlying]} sh of {spos.underlying}. "
+                    f"{shares} sh of {spos.underlying} at the ${spos.strike:.2f} strike. "
                     f"A covered call becomes a candidate next scan.",
                 )
+            elif spos.dte() < 0:
+                status, j_status = PositionStatus.EXPIRED, "expired"
             elif spos.option_type is OptionType.CALL:
-                # Short call vanished before expiry -> likely called away (shares sold).
                 status, j_status = PositionStatus.CLOSED, "called_away"
                 notify = (
                     f"Covered call gone: {spos.underlying}",
@@ -159,8 +174,15 @@ class ReconcileLoop:
                 )
             else:
                 status, j_status = PositionStatus.CLOSED, "closed"
+            px = None
+            if j_status == "assigned" and spos.underlying not in stock_prices:
+                px = await self._underlying_price(spos.underlying)
+                if px is not None:
+                    stock_prices[spos.underlying] = px
+            elif spos.underlying in stock_prices:
+                px = stock_prices[spos.underlying]
             self.positions.set_status(spos.id, status)
-            self._journal_close(spos, j_status)
+            self._journal_close(spos, j_status, underlying_price=px)
             entry = {"occ": occ, "status": status.value}
             if status is PositionStatus.ASSIGNED:
                 entry["assigned"] = True
@@ -227,13 +249,21 @@ class ReconcileLoop:
                 self.positions.set_status(refreshed.position_id, PositionStatus.CLOSED)
         return finalized
 
-    def _journal_close(self, spos, j_status: str) -> None:
+    async def _underlying_price(self, symbol: str) -> float | None:
+        if self.market_data is None:
+            return None
+        try:
+            return await self.market_data.get_underlying_price(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("assignment price read failed for %s: %s", symbol, exc)
+            return None
+
+    def _journal_close(self, spos, j_status: str, *, underlying_price: float | None = None) -> None:
         """Backfill the open trade-journal row when a position resolves externally.
 
-        Realized P&L is computed for both expiry (full credit kept) and a close/called-away
-        before expiry — the latter from the filled buy-to-close order if we captured it, else
-        estimated from the last mark (position_pnl fallback). Assignment is left P&L-less (it
-        depends on how the assigned shares are later disposed).
+        Realized P&L is computed for expiry (full credit kept), a close/called-away
+        before expiry, and assignment (premium minus intrinsic at the share price —
+        shares acquired at the strike, not a full-profit expiry).
         """
         if self.trade_journal is None:
             return
@@ -244,6 +274,11 @@ class ReconcileLoop:
         if j_status == "expired":
             spos.status = PositionStatus.EXPIRED  # full credit kept
             realized = position_pnl(spos, None)["realized_pnl"]
+        elif j_status == "assigned":
+            spos.status = PositionStatus.ASSIGNED
+            realized = assignment_realized_pnl(spos, underlying_price)
+            if underlying_price is not None and spos.option_type is OptionType.PUT:
+                close_price = round(max(0.0, spos.strike - underlying_price), 4)
         elif j_status in ("closed", "called_away"):
             spos.status = PositionStatus.CLOSED  # so position_pnl takes the realized branch
             close_order = (filled_close(self.orders.list_by_position(spos.id))

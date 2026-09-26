@@ -163,14 +163,19 @@ class PaperBroker(ExecutionBroker):
         return list(self._holdings)
 
     async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
-                                  quantity: float | None = None, order_type: str = "market",
+                                  quantity: float | None = None, order_type: str = "limit",
                                   ref_id: str | None = None, price_hint: float | None = None) -> dict[str, Any]:
-        """Simulated market BUY by dollar amount: fills at ``price_hint`` (or the last known price,
-        else $100), fractional shares, merged into holdings at a weighted average cost."""
-        if side != "buy" or not dollar_amount or dollar_amount <= 0:
-            raise RuntimeError("paper submit_equity_order only supports market BUY by dollar amount.")
+        """Simulated limit BUY: fills at ``price_hint`` (or $100). Dollar-amount or share qty."""
+        if side != "buy" or order_type != "limit":
+            raise RuntimeError("paper submit_equity_order only supports limit BUY.")
         price = float(price_hint or getattr(self, "_last_prices", {}).get(symbol.upper()) or 100.0)
-        shares = round(float(dollar_amount) / price, 6)
+        if dollar_amount and dollar_amount > 0:
+            shares = round(float(dollar_amount) / price, 6)
+        elif quantity and quantity > 0:
+            shares = float(quantity)
+            dollar_amount = shares * price
+        else:
+            raise RuntimeError("paper submit_equity_order needs a dollar_amount or quantity.")
         sym = symbol.upper()
         for h in self._holdings:
             if h.symbol.upper() == sym:

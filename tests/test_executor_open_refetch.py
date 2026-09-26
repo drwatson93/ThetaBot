@@ -74,7 +74,7 @@ async def test_stale_quote_is_refetched_and_entry_proceeds(executor):
     ex, md, entry_decisions = executor
     d = _decision()
     entry_decisions.insert_if_new(d)
-    stale = _quote(as_of=utcnow() - timedelta(seconds=30))   # 30s old > 10s guard
+    stale = _quote(as_of=utcnow() - timedelta(seconds=200))  # older than max_quote_age (90s)
     order = await ex.execute_open(d, stale)
     assert md.get_chain_calls == 1                            # it refetched instead of blocking
     assert order is not None and order.status == OrderStatus.FILLED

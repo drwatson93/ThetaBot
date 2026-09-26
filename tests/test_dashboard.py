@@ -150,12 +150,12 @@ def test_option_oi_fail_open_without_rh_broker(tmp_path):
     assert j["symbol"] == "SMR" and j["available"] is False and "reason" in j
 
 
-def test_auth_open_when_no_password(tmp_path, monkeypatch):
+def test_auth_locked_when_no_password(tmp_path, monkeypatch):
     monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
     client = _bare_app(tmp_path)
-    assert client.get("/api/stats").status_code == 200       # open in dev
-    assert client.get("/dashboard").status_code == 200
-    assert client.get("/health").status_code == 200
+    assert client.get("/api/stats", auth=None).status_code == 401
+    assert client.get("/dashboard", auth=None).status_code == 401
+    assert client.get("/health", auth=None).status_code == 200  # health stays open
 
 
 def test_auth_enforced_when_password_set(tmp_path, monkeypatch):
@@ -163,9 +163,9 @@ def test_auth_enforced_when_password_set(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "s3cret")
     client = _bare_app(tmp_path)
     # Protected endpoints reject anonymous / wrong creds...
-    assert client.get("/api/stats").status_code == 401
-    assert client.get("/dashboard").status_code == 401
-    assert client.get("/control/status").status_code == 401
+    assert client.get("/api/stats", auth=None).status_code == 401
+    assert client.get("/dashboard", auth=None).status_code == 401
+    assert client.get("/control/status", auth=None).status_code == 401
     assert client.get("/api/stats", auth=("me", "nope")).status_code == 401
     # ...and accept correct creds.
     assert client.get("/api/stats", auth=("me", "s3cret")).status_code == 200

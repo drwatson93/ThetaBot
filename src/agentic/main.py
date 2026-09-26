@@ -10,7 +10,7 @@ import logging
 import signal
 
 from .brokers.factory import broker_degraded, build_broker
-from .config import Settings, load_config
+from .config import Settings, load_config, require_runtime_secrets
 from .logging_setup import setup_logging
 from .marketdata.alpaca_md import AlpacaMarketData
 from .marketdata.base import MarketDataProvider, PaperMarketData
@@ -81,11 +81,11 @@ def build_web_server(settings, signals, killswitch, approval_gate, audit,
         log.warning("Web API requested but the 'web' extra is not installed; skipping.")
         return None
 
-    if not get_secret("DASHBOARD_PASSWORD"):
-        log.warning(
-            "SECURITY: web API enabled but DASHBOARD_PASSWORD is not set — /dashboard, "
-            "/api/*, and /control status/pause/resume are UNAUTHENTICATED. Set "
-            "DASHBOARD_PASSWORD (and DASHBOARD_USER) to lock them down before public exposure."
+    from .config import is_usable_secret
+    if not is_usable_secret(get_secret("DASHBOARD_PASSWORD")):
+        raise RuntimeError(
+            "DASHBOARD_PASSWORD is unset or a placeholder — refusing to start the dashboard. "
+            "Set a real password in the environment."
         )
 
     deps = WebDeps(
@@ -106,6 +106,7 @@ def build_web_server(settings, signals, killswitch, approval_gate, audit,
 
 async def main_async(config_path: str | None = None) -> None:
     setup_logging()
+    require_runtime_secrets()
     settings = load_config(config_path)
 
     if settings.mode == "live" and not settings.i_understand_live_trading:
@@ -187,6 +188,7 @@ async def main_async(config_path: str | None = None) -> None:
     reconcile = ReconcileLoop(
         settings, broker, positions, audit, orders=orders, killswitch=killswitch,
         notifier=notifier, trade_journal=trade_journal, entry_decisions=entry_decisions,
+        market_data=market_data,
     )
 
     tax_reserve = TaxReserveLoop(

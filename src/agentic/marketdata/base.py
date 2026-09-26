@@ -12,10 +12,19 @@ from .quote import OptionContractQuote, OptionQuote
 
 
 class MarketDataProvider(ABC):
+    @property
+    def is_realtime(self) -> bool:
+        """True when quotes are live (not a delayed/indicative feed). Default: no."""
+        return False
+
     @abstractmethod
     async def get_quote(self, position: Position) -> OptionQuote | None:
         """Return a fresh OptionQuote for the position's contract, or None if unavailable."""
         raise NotImplementedError
+
+    async def get_fresh_contract_quote(self, occ_symbol: str) -> OptionContractQuote | None:
+        """Bypass any chain cache and return one contract quote, or None."""
+        return None
 
     # --- entry-side (chain scanning); default no-op so close-only providers still work ---
     async def get_chain(self, underlying: str) -> list[OptionContractQuote]:
