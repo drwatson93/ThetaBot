@@ -127,8 +127,9 @@ class MonitorLoop:
             source="monitor",
         )
 
-        # Phase 3: drain queued TradingView signals and expire stale approval requests.
-        if self.signal_processor is not None:
+        # Phase 3: drain queued TradingView signals only inside the order window —
+        # a signal close is still an exit and must wait until trading_start.
+        if can_trade and self.signal_processor is not None:
             await self.signal_processor.process_pending()
         if self.approval_gate is not None:
             self.approval_gate.expire_stale()

@@ -24,16 +24,19 @@ def _runtime_secrets(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _order_window_open(monkeypatch):
-    """Scanner/monitor tests assume the 10:00 ET gate is already open.
+    """Scanner/monitor/executor tests assume the 10:00 ET gate is already open.
 
-    The real helper is unit-tested separately; executor still enforces it on
-    non-paper brokers.
+    The real helper is unit-tested separately; tests that check the gate patch
+    ``is_order_window`` back to False on the module under test.
     """
     monkeypatch.setattr(
         "agentic.services.scanner.is_order_window", lambda *a, **k: True, raising=False
     )
     monkeypatch.setattr(
         "agentic.services.monitor.is_order_window", lambda *a, **k: True, raising=False
+    )
+    monkeypatch.setattr(
+        "agentic.services.executor.is_order_window", lambda *a, **k: True, raising=False
     )
 
 

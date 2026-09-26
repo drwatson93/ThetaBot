@@ -41,9 +41,11 @@ def describe_active_rules(settings: Settings) -> list[dict[str, Any]]:
         "Robinhood quotes are treated as real-time. Alpaca needs feed=opra for live entry.")
 
     add("Hours", "Trading start", f"{_hhmm(s.trading_start)} America/New_York",
-        "No new entries, exits, or stop-loss orders before this time.")
+        "No new entries, profit-target exits, stop-loss exits, DTE closes, signal closes, "
+        "or rolls before this time.")
     add("Hours", "Regular session", "09:30–16:00 ET weekdays",
-        "The 10:00 start is inside the regular session so the open-bell spread is skipped.")
+        "Quotes still refresh from 09:30; orders wait for the trading-start clock so the "
+        "open-bell spread is skipped.")
 
     add("Entries", "Scanner", _on(e.enabled),
         f"Watchlist: {', '.join(e.watchlist) if e.watchlist else '(empty)'}."
@@ -98,8 +100,9 @@ def describe_active_rules(settings: Settings) -> list[dict[str, Any]]:
             add("Exits", rule.name, "profit target", detail)
         elif rule.rule_type == "STOP_LOSS":
             add("Exits", rule.name, "stop loss",
-                f"Buy back if cost-to-close ≥ {params.get('loss_mult', 0):.1f}× credit "
-                f"or |delta| ≥ {params.get('delta_stop', 0):.2f}.")
+                f"Buy back if the mid cost-to-close ≥ {params.get('loss_mult', 0):.1f}× credit "
+                f"or |delta| ≥ {params.get('delta_stop', 0):.2f}. "
+                "The close is a limit starting at the bid/ask midpoint, never a market order at the ask.")
         elif rule.rule_type == "DTE":
             add("Exits", rule.name, f"{params.get('action', 'close')} at {params.get('dte_threshold')} DTE",
                 "Near-expiry close (or alert) so a weekly is not held into expiration by accident.")

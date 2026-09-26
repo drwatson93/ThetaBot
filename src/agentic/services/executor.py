@@ -561,9 +561,7 @@ class OrderExecutor:
             return False
 
     def _order_window_block(self) -> str | None:
-        """Hard clock gate for real brokers. Paper simulators stay usable in tests."""
-        if self._is_paper_broker():
-            return None
+        """Hard clock gate for every entry and exit, paper or live."""
         start = self.settings.trading_start
         if is_order_window(start=start):
             return None

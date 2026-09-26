@@ -73,8 +73,15 @@ def test_trailing_floors_at_arm():
 
 def test_stop_loss_on_loss_multiple():
     r = StopLossRule("stop", False, {"loss_mult": 2.0, "delta_stop": 0.5})
-    d = r.evaluate(_pos(credit=1.0), _q(ask=2.1, bid=2.0, delta=-0.3), NOW)  # cost 2.1 >= 2x
+    d = r.evaluate(_pos(credit=1.0), _q(ask=2.1, bid=2.0, delta=-0.3), NOW)  # mid 2.05 >= 2x
     assert d is not None and "Stop-loss" in d.reason
+
+
+def test_stop_loss_does_not_trip_on_wide_ask():
+    """A momentary wide ask must not fire the stop when the mid is still under the multiple."""
+    r = StopLossRule("stop", False, {"loss_mult": 2.0, "delta_stop": 0.5})
+    # ask 2.20 would have tripped the old ask-priced stop; mid 1.85 does not.
+    assert r.evaluate(_pos(credit=1.0), _q(ask=2.20, bid=1.50, delta=-0.3), NOW) is None
 
 
 def test_stop_loss_on_delta():

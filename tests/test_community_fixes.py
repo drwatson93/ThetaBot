@@ -10,13 +10,16 @@ from agentic.brokers.live_guard import LiveOrderBlocked, assert_live_order_allow
 from agentic.brokers.paper_broker import PaperBroker
 from agentic.brokers.robinhood_mcp import RobinhoodMCPBroker
 from agentic.config import (
+    RuleConfig,
     Settings,
     TaxReserveConfig,
     is_usable_secret,
     require_runtime_secrets,
 )
-from agentic.domain.enums import Direction, OptionType, OrderStatus, PositionStatus, Strategy
-from agentic.domain.models import EntryDecision, Order, Position
+from agentic.domain.enums import (
+    Direction, OptionType, OrderStatus, PositionStatus, RuleType, Strategy,
+)
+from agentic.domain.models import CloseDecision, EntryDecision, Order, Position
 from agentic.marketdata.base import MarketDataProvider, PaperMarketData
 from agentic.marketdata.quote import OptionContractQuote, OptionQuote
 from agentic.marketdata.robinhood_md import RobinhoodMarketData
@@ -306,10 +309,17 @@ def test_rules_page_and_api(tmp_path):
 
 
 def test_describe_rules_reads_same_settings():
-    s = Settings(mode="paper", trading_start="10:30")
+    s = Settings(mode="paper", trading_start="10:30", rules=[
+        RuleConfig(name="stop-loss", rule_type="STOP_LOSS", requires_approval=False,
+                   params={"loss_mult": 2.0, "delta_stop": 0.5}),
+    ])
     rows = describe_active_rules(s)
     start = next(r for r in rows if r["name"] == "Trading start")
     assert "10:30" in start["value"]
+    assert "stop-loss" in start["detail"]
+    stop = next(r for r in rows if r["name"] == "stop-loss")
+    assert "midpoint" in stop["detail"]
+    assert "never a market order at the ask" in stop["detail"]
 
 
 # --- order handling ---------------------------------------------------------------------------
@@ -346,6 +356,113 @@ async def test_real_broker_blocked_before_trading_start(tmp_path, monkeypatch):
     ex.entry_decisions.insert_if_new(d)
     assert await ex.execute_open(d, await md.get_fresh_contract_quote(OCC)) is None
     assert broker.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_all_exits_blocked_before_trading_start(tmp_path, monkeypatch):
+    """Stop-loss, profit-target, and every other close wait for trading_start — paper too."""
+    broker = PaperBroker(seed_positions=[], buying_power=50_000)
+    settings = Settings(mode="paper", broker="paper", trading_start="10:00")
+    md = _RHLike()
+    ex, db = _exec(tmp_path, broker, md=md, settings=settings)
+    monkeypatch.setattr("agentic.services.executor.is_order_window", lambda *a, **k: False)
+    pos = Position(
+        occ_symbol=OCC, underlying="F", option_type=OptionType.PUT,
+        strategy=Strategy.CASH_SECURED_PUT, direction=Direction.SHORT, quantity=1,
+        strike=14.0, expiration=EXP, credit_received=0.20,
+    )
+    quote = OptionQuote(OCC, 0.40, 0.50, 0.45)
+    for rule_type, name in (
+        (RuleType.STOP_LOSS, "stop-loss"),
+        (RuleType.PROFIT_TARGET, "profit-50"),
+        (RuleType.DTE, "dte-2"),
+        (RuleType.SIGNAL, "tv-signal"),
+    ):
+        dec = CloseDecision(
+            position_id="p", rule_name=name, rule_type=rule_type, reason="test",
+            requires_approval=False, dedup_key=f"{name}:gate",
+        )
+        DecisionStore(db).insert_if_new(dec)
+        assert await ex.execute_close(pos, dec, quote) is None
+    assert broker._orders == {}
+
+
+@pytest.mark.asyncio
+async def test_monitor_does_not_evaluate_exits_before_trading_start(tmp_path, monkeypatch):
+    from agentic.rules.engine import RulesEngine, build_rules
+    from agentic.services.monitor import MonitorLoop
+
+    monkeypatch.setattr("agentic.services.monitor.is_market_hours", lambda *a, **k: True)
+    monkeypatch.setattr("agentic.services.monitor.is_order_window", lambda *a, **k: False)
+    db = Database(tmp_path / "mon-gate.db")
+    audit = AuditStore(db)
+    positions = PositionStore(db)
+    decisions = DecisionStore(db)
+    pos = Position(
+        occ_symbol=OCC, underlying="F", option_type=OptionType.PUT,
+        strategy=Strategy.CASH_SECURED_PUT, direction=Direction.SHORT, quantity=1,
+        strike=14.0, expiration=EXP, credit_received=0.20,
+    )
+
+    class _B:
+        async def get_open_positions(self):
+            return [pos]
+        def capabilities(self):
+            return BrokerCapabilities("paper", supports_options_orders=True, is_paper=True)
+
+    class _MD:
+        async def get_quote(self, p):
+            return OptionQuote(OCC, 0.40, 0.50, 0.45, delta=-0.6)
+
+    rules = [RuleConfig(name="stop-loss", rule_type="STOP_LOSS", requires_approval=False,
+                        params={"loss_mult": 2.0, "delta_stop": 0.50})]
+    submitted = []
+
+    class _Ex:
+        async def execute_close(self, *a, **k):
+            submitted.append(a)
+
+    mon = MonitorLoop(
+        Settings(mode="paper", trading_start="10:00", rules=rules),
+        _B(), _MD(), positions, audit, KillSwitch(db, audit),
+        rules_engine=RulesEngine(build_rules(rules)), decisions=decisions, executor=_Ex(),
+    )
+    await mon.run_once()
+    assert decisions.recent() == []
+    assert submitted == []
+
+
+@pytest.mark.asyncio
+async def test_stop_loss_close_limit_starts_at_mid(tmp_path, monkeypatch):
+    class _FillClose(_LiveBroker):
+        async def submit_close_order(self, order):
+            await super().submit_close_order(order)
+            order.status = OrderStatus.FILLED
+            order.filled_qty = order.quantity
+            order.avg_fill_price = order.limit_price
+            self._orders[order.client_order_id] = order
+            return order
+
+    broker = _FillClose()
+    settings = Settings(mode="live", i_understand_live_trading=True)
+    md = _RHLike()
+    ex, db = _exec(tmp_path, broker, md=md, settings=settings)
+    monkeypatch.setattr("agentic.services.executor.is_order_window", lambda *a, **k: True)
+    pos = Position(
+        occ_symbol=OCC, underlying="F", option_type=OptionType.PUT,
+        strategy=Strategy.CASH_SECURED_PUT, direction=Direction.SHORT, quantity=1,
+        strike=14.0, expiration=EXP, credit_received=0.20,
+    )
+    quote = OptionQuote(OCC, bid=1.00, ask=1.20, mark=1.10)
+    dec = CloseDecision(
+        position_id="p", rule_name="stop-loss", rule_type=RuleType.STOP_LOSS,
+        reason="stop", requires_approval=False, dedup_key="stop:mid",
+    )
+    DecisionStore(db).insert_if_new(dec)
+    order = await ex.execute_close(pos, dec, quote)
+    assert order is not None
+    assert order.limit_price == 1.10  # mid, not the 1.20 ask
+    assert any(s[0] == "close" and s[2] == 1.10 for s in broker.submitted)
 
 
 @pytest.mark.asyncio

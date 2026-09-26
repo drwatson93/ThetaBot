@@ -8,7 +8,8 @@ Two independent triggers (either fires a close, whichever hits first):
     breached and assignment risk is climbing.
 
 Stateless. For the wheel, assignment is acceptable, so this is a deliberate opt-in defense against
-a name that "keeps going down". Uses the conservative ask as cost-to-close.
+a name that "keeps going down". Cost-to-close is the bid/ask midpoint so a momentary wide ask
+cannot trip the stop. The close order itself is a limit that starts at mid.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ class StopLossRule(Rule):
     ) -> CloseDecision | None:
         if position.credit_received <= 0 or quote is None or not quote.is_valid:
             return None
-        cost = quote.ask if quote.ask is not None else quote.midpoint
+        cost = quote.midpoint
         if cost is None:
             return None
 
