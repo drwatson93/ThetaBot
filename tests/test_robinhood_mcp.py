@@ -223,11 +223,11 @@ async def test_oauth_sessions_serialized_and_provider_reused(monkeypatch):
     b = RobinhoodMCPBroker(account_number="acct")
     b._token = None  # force the OAuth path
 
-    results = await asyncio.gather(*[b._call_tool("t", {}) for _ in range(5)])
+    results = await asyncio.gather(*[b._call_tool("get_accounts", {}) for _ in range(5)])
 
     assert active["max"] == 1          # never two OAuth sessions open at once (serialized)
     assert builds["n"] == 1            # provider built once and reused across all calls
-    assert all(r == {"ok": "t"} for r in results)
+    assert all(r == {"ok": "get_accounts"} for r in results)
 
 
 # --- order fill-tracking: capture broker_order_id + fill state from the real RH shapes ----------

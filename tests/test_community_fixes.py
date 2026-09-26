@@ -300,6 +300,11 @@ def test_rules_page_and_api(tmp_path):
     body = client.get("/api/rules").json()
     names = {r["name"] for r in body["rules"]}
     assert "Trading mode" in names
+    assert "Real orders" in names
+    assert any(
+        r["name"] == "Real orders" and r["value"] == "HARD DISABLED in code"
+        for r in body["rules"]
+    )
     assert "Max cash / collateral per trade" in names
     assert "Trading start" in names
     assert any("paper" in r["value"].lower() for r in body["rules"] if r["name"] == "Trading mode")

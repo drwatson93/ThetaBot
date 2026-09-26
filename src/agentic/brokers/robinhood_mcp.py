@@ -54,6 +54,94 @@ log = logging.getLogger("agentic.brokers.rh_mcp")
 
 MCP_URL = "https://agent.robinhood.com/mcp/trading"
 
+# HARD LOCK. Not read from config.yaml, env, the dashboard, mode, or
+# i_understand_live_trading. The only way to turn this off is to edit this file
+# and redeploy. When True, _call_tool refuses every MCP tool that is not on
+# READ_ONLY_MCP_TOOLS — including unknown / newly added write tools.
+ORDERS_HARD_DISABLED = True
+REAL_ORDERS_LOCK_LABEL = "Real orders: HARD DISABLED in code"
+
+
+class RobinhoodWriteBlocked(RuntimeError):
+    """Raised when ORDERS_HARD_DISABLED refuses a non-read Robinhood MCP tool."""
+
+
+# Official Robinhood agentic MCP tools that only read. Unknown names are denied.
+READ_ONLY_MCP_TOOLS: frozenset[str] = frozenset({
+    "get_accounts",
+    "get_alert_log",
+    "get_alerts",
+    "get_crypto_account_onboarding_info",
+    "get_crypto_orders",
+    "get_crypto_positions",
+    "get_crypto_quotes",
+    "get_currency_pairs",
+    "get_earnings_calendar",
+    "get_earnings_results",
+    "get_equity_analyst_ratings",
+    "get_equity_fundamentals",
+    "get_equity_historicals",
+    "get_equity_orders",
+    "get_equity_positions",
+    "get_equity_price_book",
+    "get_equity_quotes",
+    "get_equity_tax_lots",
+    "get_equity_technical_indicators",
+    "get_equity_tradability",
+    "get_financials",
+    "get_index_historicals",
+    "get_index_quotes",
+    "get_indexes",
+    "get_limited_margin_upgrade_info",
+    "get_option_chains",
+    "get_option_historicals",
+    "get_option_instruments",
+    "get_option_level_upgrade_info",
+    "get_option_orders",
+    "get_option_positions",
+    "get_option_quotes",
+    "get_option_watchlist",
+    "get_pnl_trade_history",
+    "get_politician_trades",
+    "get_popular_watchlists",
+    "get_portfolio",
+    "get_realized_pnl",
+    "get_scanner_datapoints",
+    "get_scanner_filter_specs",
+    "get_scans",
+    "get_sec_filing",
+    "get_sec_filing_facts",
+    "get_sec_filing_facts_catalog",
+    "get_sec_filing_index",
+    "get_watchlist_items",
+    "get_watchlists",
+    "search",
+    # Aliases the bot may resolve via substring matching.
+    "earnings_results",
+    "equity_fundamentals",
+    "financials",
+})
+
+
+def assert_mcp_tool_allowed(name: str) -> None:
+    """Refuse any MCP tool that is not on the read-only allowlist.
+
+    Runs before a session is opened. Cannot be bypassed by live flags.
+    """
+    if not ORDERS_HARD_DISABLED:
+        return
+    if name in READ_ONLY_MCP_TOOLS:
+        return
+    log.error(
+        "ORDERS_HARD_DISABLED: refusing Robinhood MCP tool %r before any network call "
+        "(not on the read-only allowlist).",
+        name,
+    )
+    raise RobinhoodWriteBlocked(
+        f"ORDERS_HARD_DISABLED: refusing Robinhood MCP tool {name!r}"
+    )
+
+
 # Logical role -> ordered substring hints used to resolve a concrete tool name from the
 # probe. First tool whose lower-cased name contains ALL hints in any one tuple wins.
 # Multiple tuples per role = alternative naming schemes to try in priority order.
@@ -127,6 +215,11 @@ class RobinhoodMCPBroker(ExecutionBroker):
             return
 
         self._connected = True
+        if ORDERS_HARD_DISABLED:
+            log.warning(
+                "ORDERS_HARD_DISABLED=True: Robinhood write tools are refused in code "
+                "(%s).", REAL_ORDERS_LOCK_LABEL,
+            )
         self._roles = self._resolve_roles(self._tools)
         # We can place option closes only if an account is configured AND both a place and a
         # positions tool resolved. Without account_number every RH options tool 400s, so this
@@ -570,6 +663,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
 
     async def _call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Call one MCP tool and return its parsed structured content (or text)."""
+        assert_mcp_tool_allowed(name)
         async with self._session() as session:
             result = await session.call_tool(name, arguments=arguments)
         if getattr(result, "isError", False):
