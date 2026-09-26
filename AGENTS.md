@@ -70,8 +70,10 @@ through Hostinger); (c) they've run the desktop login (Step 1) and have a `data/
    ```bash
    cp .env.example .env
    ```
-   Have the user fill in `DASHBOARD_PASSWORD` and `CONTROL_TOKEN` (long random strings). Optional keys
-   can stay blank. Do **not** print the resulting `.env`.
+   Have the user fill in `DASHBOARD_PASSWORD` and `CONTROL_TOKEN` (long random strings). Optional
+   `PAUSE_TOKEN` (a *different* long random string) lets a monitoring bot pause via
+   `POST /control/pause-only` without receiving `CONTROL_TOKEN`. Other optional keys can stay
+   blank. Do **not** print the resulting `.env`.
 
 2. **Robinhood token.** The user runs `python -m agentic.tools.rh_login` **on their desktop** (not the
    server), which produces `data/rh_oauth.json`. They copy that file to `./data/` on the server (e.g.

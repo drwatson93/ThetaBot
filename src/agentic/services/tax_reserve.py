@@ -1,8 +1,8 @@
 """Tax-reserve sweep: once a week, move a fixed share of the NET realized gains into a cash-equivalent
 ETF (SGOV by default) so the tax bill is funded as the account grows.
 
-Schedule: the configured ET weekday/hour/minute (default Friday 15:40, inside regular hours because
-share market orders only fill then). Each period:
+Schedule: the configured ET weekday/hour/minute (default Friday 15:40, inside the trading window
+because share orders only fill on NYSE session days after ``trading_start``). Each period:
 
     net = realized P&L closed since the previous period end + any loss carried forward
     net <= 0                     -> skipped, carry the (negative) balance forward
@@ -23,7 +23,7 @@ from typing import Any
 
 from ..domain.enums import AuditEventType
 from ..domain.models import utcnow
-from .market_hours import is_market_hours
+from .market_hours import is_order_window
 from .reporting import now_et
 
 log = logging.getLogger("agentic.tax_reserve")
@@ -92,9 +92,11 @@ class TaxReserveLoop:
         key = period_key(sched)
         if self.store.has_period(key):
             return None
-        if not is_market_hours(now):
+        if not is_order_window(now, start=self.settings.trading_start):
             if self._waiting_logged != key:
-                log.info("Tax reserve sweep for %s is due; waiting for regular hours.", key)
+                log.info(
+                    "Tax reserve sweep for %s is due; waiting for the trading window.", key
+                )
                 self._waiting_logged = key
             return None
         if self.killswitch is not None and self.killswitch.is_paused():

@@ -133,7 +133,7 @@ For a one-week **paper** soak with real Robinhood quotes and **simulated** fills
 
 1. On your **desktop**, run the one-time login (see Step 1) and copy the one-line `RH_OAUTH_JSON` it prints.
 2. Copy `config.render.example.yaml` into a Render **Secret File** named `config.yaml`. Fill `entry.watchlist` with names you are willing to own, and set `paper_buying_power` to your real account size. Keep `mode: paper`.
-3. In Render: **New → Blueprint**, point it at [drwatson93/ThetaBot](https://github.com/drwatson93/ThetaBot), apply `render.yaml`. Paste `RH_OAUTH_JSON` when prompted. Copy `DASHBOARD_PASSWORD` from the Environment tab after create.
+3. In Render: **New → Blueprint**, point it at [drwatson93/ThetaBot](https://github.com/drwatson93/ThetaBot), apply `render.yaml`. Paste `RH_OAUTH_JSON` when prompted. Copy `DASHBOARD_PASSWORD` from the Environment tab after create. Optionally set `PAUSE_TOKEN` (Environment → add, a long random string *different* from `CONTROL_TOKEN`) so a monitoring bot can pause via `POST /control/pause-only` without getting the resume/approval secret.
 4. Open `https://<service>.onrender.com/health`. You want `"mode":"paper"`, `"live_armed":false`, `"robinhood_connected":true`, `"practice":true`. If `robinhood_connected` is false, the scanner has no real chains — re-check the token.
 5. Leave `mode: live` and `i_understand_live_trading` **off** for the whole practice week.
 
@@ -182,7 +182,11 @@ On the VPS:
    DASHBOARD_PASSWORD=change-this-to-something-strong
 
    # A random token that protects the control endpoints (pause/resume/etc.)
+   # Never give this to a monitoring bot — it also derives one-tap approval tokens.
    CONTROL_TOKEN=another-long-random-string
+
+   # Optional. Pause-only token for a monitoring bot (cannot resume or approve).
+   PAUSE_TOKEN=
 
    # (Optional) desktop push alerts via Pushover — leave blank to skip
    PUSHOVER_TOKEN=
@@ -397,7 +401,7 @@ If no fresh alert has arrived for a symbol, these gates simply **don't apply** (
 - **Ready to add** (`entry.watchlist_tiers`, optional): list quality names with the collateral one contract needs; once the account can hold one under the per-name cap, they show up on the Overview and Tuning tabs with a one-tap **Add** that carries their `per_ticker` overrides. The bot never adds names on its own (`GET /api/tiers`).
 - **Assignment clock** (`cc_below_basis_after_days`, opt-in, per ticker): by default calls are never sold below cost basis, which on volatile names can park capital for months. With a clock set, shares still under water that many days after assignment may be written against below basis inside a 5-10% OTM band, so the capital turns over. The holdings table shows each name's days held and whether below-basis calls are allowed.
 - **Open interest:** `GET /api/option-oi?symbol=SMR` returns the full call+put chain with OI, volume, IV and greeks (Robinhood-sourced; Alpaca's snapshots carry no OI).
-- **Pause / resume:** the kill switch halts *all* new orders instantly; use it any time you want to stop trading without touching positions.
+- **Pause / resume:** the kill switch halts *all* new orders instantly; use it any time you want to stop trading without touching positions. Resume needs the dashboard login plus `CONTROL_TOKEN`. A monitoring bot can pause (only) with `POST /control/pause-only?token=$PAUSE_TOKEN&reason=...` — that token cannot resume or approve trades.
 - **Loss circuit breaker:** trips automatically on a losing streak (see below) and shows in `/api/ops` — it freezes *new* entries but keeps managing what's open.
 - **Logs:** `docker compose logs -f` on the VPS.
 - **Updating:** `git pull && docker compose up -d --build`.
