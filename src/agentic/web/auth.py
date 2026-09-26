@@ -5,8 +5,9 @@ dependency is a no-op so local dev and tests run open. Username defaults to ``ad
 be overridden with ``DASHBOARD_USER``. Comparisons are constant-time.
 
 Applied to: /dashboard, /, /api/*, and /control/status|pause|resume. NOT applied to /health
-(Coolify healthcheck), /webhook/tradingview (own shared-secret token), or the UUID-guarded
-/control/approve|reject links (so phone notification taps keep working).
+(Coolify healthcheck), /webhook/tradingview (own shared-secret token), the UUID-guarded
+/control/approve|reject links (so phone notification taps keep working), or
+/control/pause-only (PAUSE_TOKEN only; fail-closed pause).
 """
 from __future__ import annotations
 

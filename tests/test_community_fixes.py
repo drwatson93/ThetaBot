@@ -307,6 +307,8 @@ def test_rules_page_and_api(tmp_path):
     )
     assert "Max cash / collateral per trade" in names
     assert "Trading start" in names
+    assert "Pause-only token" in names
+    assert any("NYSE" in r["value"] or "NYSE" in r["detail"] for r in body["rules"])
     assert any("paper" in r["value"].lower() for r in body["rules"] if r["name"] == "Trading mode")
     dash = client.get("/dashboard").text
     assert 'data-tab="rules"' in dash

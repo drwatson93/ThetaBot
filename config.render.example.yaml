@@ -21,7 +21,8 @@ poll_interval_closed_seconds: 300  # monitor loop when market closed
 reconcile_interval_seconds: 300
 approval_timeout_seconds: 900      # how long an approval request stays valid
 max_quote_age_seconds: 90          # reject quotes older than this when executing (fresh quote is fetched first)
-trading_start: "10:00"             # no new entries, exits, or stop-loss orders before this ET time
+trading_start: "10:00"             # no new entries, exits, stops, or tax-reserve buys before this ET time
+                                   # (also closed on NYSE full-day holidays and after 1pm early closes)
 auto_trip_after_errors: 0          # auto-engage kill switch after N consecutive errors (0=off)
 
 execution:

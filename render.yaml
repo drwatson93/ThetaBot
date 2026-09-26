@@ -39,6 +39,8 @@ services:
         generateValue: true
       - key: CONTROL_TOKEN
         generateValue: true
+      - key: PAUSE_TOKEN
+        sync: false
       - key: RH_OAUTH_JSON
         sync: false
       - key: PUSHOVER_TOKEN

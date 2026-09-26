@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/drwatson93/ThetaBot/main/scripts/bo
 
 ## 3. Configure
 ```bash
-nano ~/ThetaBot/.env           # set DASHBOARD_PASSWORD (and CONTROL_TOKEN)
+nano ~/ThetaBot/.env           # set DASHBOARD_PASSWORD and CONTROL_TOKEN (optional PAUSE_TOKEN)
 nano ~/ThetaBot/config.yaml     # your watchlist; leave mode: paper for now
 ```
 Upload your token from your computer:

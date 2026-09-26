@@ -332,8 +332,8 @@ class WebConfig(BaseModel):
 
 class TaxReserveConfig(BaseModel):
     """Weekly sweep of a share of NET realized gains into a cash-equivalent ETF (services/tax_reserve.py).
-    Runs at the ET weekday/time below -- inside regular hours, because share market orders only
-    fill then. Losses carry forward; the bot never sells the reserve; the reserve is walled off
+    Runs at the ET weekday/time below -- inside the NYSE trading window after trading_start,
+    because share orders only fill then. Losses carry forward; the bot never sells the reserve; the reserve is walled off
     from the sizer, the covered-call scanner and assignment detection."""
     enabled: bool = False
     pct: float = 0.20

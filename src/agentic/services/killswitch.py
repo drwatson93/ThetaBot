@@ -50,15 +50,15 @@ class KillSwitch:
         row = self.db.conn.execute("SELECT reason FROM control WHERE id = 1").fetchone()
         return row["reason"] if row else None
 
-    def pause(self, reason: str = "manual") -> None:
-        self._set(True, reason)
+    def pause(self, reason: str = "manual", *, source: str = "killswitch") -> None:
+        self._set(True, reason, source=source)
         log.warning("KILL SWITCH ENGAGED: %s", reason)
 
-    def resume(self, reason: str = "manual") -> None:
-        self._set(False, reason)
+    def resume(self, reason: str = "manual", *, source: str = "killswitch") -> None:
+        self._set(False, reason, source=source)
         log.info("Kill switch released: %s", reason)
 
-    def _set(self, paused: bool, reason: str) -> None:
+    def _set(self, paused: bool, reason: str, *, source: str = "killswitch") -> None:
         self.db.conn.execute(
             "UPDATE control SET paused = ?, reason = ?, updated_at = ? WHERE id = 1",
             (1 if paused else 0, reason, utcnow().isoformat()),
@@ -67,5 +67,5 @@ class KillSwitch:
         self.audit.record(
             AuditEventType.KILLSWITCH,
             {"paused": paused, "reason": reason},
-            source="killswitch",
+            source=source,
         )

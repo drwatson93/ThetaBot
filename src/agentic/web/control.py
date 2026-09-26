@@ -2,21 +2,25 @@
 
   POST /control/approve/{decision_id}   -> approve a parked close (executes it)
   POST /control/reject/{decision_id}    -> reject it
-  POST /control/pause                    -> engage the kill switch
-  POST /control/resume                   -> release it
+  POST /control/pause                    -> engage the kill switch (Basic + CONTROL_TOKEN)
+  POST /control/pause-only               -> engage the kill switch (PAUSE_TOKEN only)
+  POST /control/resume                   -> release it (Basic + CONTROL_TOKEN)
   GET  /control/status                   -> current control state
 
 These are POSTed by the notification action buttons. They are protected only by the
-unguessable decision id and (in production) by the tunnel; pause/resume optionally take a
-``?token=`` matching CONTROL_TOKEN when set.
+unguessable decision id and (in production) by the tunnel; pause/resume take a
+``?token=`` matching CONTROL_TOKEN. ``/control/pause-only`` is the exception: it
+skips dashboard Basic auth so a monitoring bot can fail-closed pause with PAUSE_TOKEN,
+which cannot resume or approve anything.
 """
 from __future__ import annotations
 
 import hmac
 import logging
+import time
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 
 from ..config import get_secret, is_usable_secret
@@ -27,6 +31,33 @@ if TYPE_CHECKING:
     from .app import WebDeps
 
 log = logging.getLogger("agentic.web.control")
+
+# Failed PAUSE_TOKEN guesses, per client host. Successful pauses are never delayed.
+_PAUSE_FAIL_MAX = 10
+_PAUSE_FAIL_WINDOW_S = 60.0
+_pause_fail_times: dict[str, list[float]] = {}
+
+
+def _pause_token_authorized(token: str | None) -> bool:
+    expected = get_secret("PAUSE_TOKEN")
+    if not is_usable_secret(expected):
+        return False
+    return bool(token) and hmac.compare_digest(token, expected)
+
+
+def _pause_client_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _pause_auth_rate_limited(key: str) -> bool:
+    now = time.monotonic()
+    times = [t for t in _pause_fail_times.get(key, []) if now - t < _PAUSE_FAIL_WINDOW_S]
+    _pause_fail_times[key] = times
+    return len(times) >= _PAUSE_FAIL_MAX
+
+
+def _record_pause_auth_fail(key: str) -> None:
+    _pause_fail_times.setdefault(key, []).append(time.monotonic())
 
 
 def make_control_router(deps: "WebDeps") -> APIRouter:
@@ -71,6 +102,31 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             return JSONResponse({"status": "unauthorized"}, status_code=401)
         deps.killswitch.pause(reason)
         return JSONResponse({"status": "paused", "reason": reason})
+
+    @router.post("/pause-only")
+    async def pause_only(
+        request: Request,
+        token: str | None = None,
+        reason: str = "pause_token",
+        x_pause_token: str | None = Header(default=None, alias="X-Pause-Token"),
+    ) -> JSONResponse:
+        """Engage the kill switch using PAUSE_TOKEN. No dashboard login, no resume."""
+        client = _pause_client_key(request)
+        if _pause_auth_rate_limited(client):
+            return JSONResponse({"status": "rate_limited"}, status_code=429)
+        provided = token or x_pause_token
+        if not _pause_token_authorized(provided):
+            _record_pause_auth_fail(client)
+            return JSONResponse({"status": "unauthorized"}, status_code=401)
+        why = (reason or "pause_token").strip() or "pause_token"
+        if deps.killswitch.is_paused():
+            return JSONResponse({
+                "status": "paused",
+                "reason": deps.killswitch.reason(),
+                "already_paused": True,
+            })
+        deps.killswitch.pause(why, source="pause_token")
+        return JSONResponse({"status": "paused", "reason": why, "already_paused": False})
 
     @router.post("/resume", dependencies=[Depends(require_auth)])
     async def resume(reason: str = "manual", token: str | None = None) -> JSONResponse:
