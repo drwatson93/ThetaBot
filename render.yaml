@@ -1,0 +1,46 @@
+# ThetaBot — PAPER-mode practice week on Render.
+# One Docker web service + a 1 GB disk (SQLite, rotating RH OAuth file, paper book).
+#
+# After the Blueprint creates the service, add a Secret File named "config.yaml"
+# (copy config.render.example.yaml and fill the watchlist). Paste RH_OAUTH_JSON
+# from `python -m agentic.tools.rh_login` (desktop only) when prompted.
+services:
+  - type: web
+    name: thetabot
+    runtime: docker
+    repo: https://github.com/drwatson93/ThetaBot
+    region: virginia
+    plan: starter
+    numInstances: 1
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: "off"
+    maxShutdownDelaySeconds: 60
+    disk:
+      name: thetabot-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: TZ
+        value: America/New_York
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: THETABOT_CONFIG
+        value: /etc/secrets/config.yaml
+      - key: DASHBOARD_USER
+        value: admin
+      - key: DASHBOARD_PASSWORD
+        generateValue: true
+      - key: CONTROL_TOKEN
+        generateValue: true
+      - key: RH_OAUTH_JSON
+        sync: false
+      - key: PUSHOVER_TOKEN
+        sync: false
+      - key: PUSHOVER_USER
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false

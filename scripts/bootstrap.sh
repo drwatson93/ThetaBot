@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ThetaBot — one-command bootstrap for a fresh Ubuntu VPS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/SaltyMeat23/ThetaBot/main/scripts/bootstrap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/drwatson93/ThetaBot/main/scripts/bootstrap.sh | bash
 #
 # Installs Docker (if missing), clones the repo, and scaffolds your config files.
 # It does NOT start trading, does NOT need any secrets, and NEVER overwrites an existing
 # .env or config.yaml. Everything after this is a few edits + `docker compose up`.
 set -euo pipefail
 
-REPO="${THETABOT_REPO:-https://github.com/SaltyMeat23/ThetaBot.git}"
+REPO="${THETABOT_REPO:-https://github.com/drwatson93/ThetaBot.git}"
 DIR="${THETABOT_DIR:-$HOME/ThetaBot}"
 
 echo "=================================================="

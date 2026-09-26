@@ -9,7 +9,7 @@ import asyncio
 import logging
 import signal
 
-from .brokers.factory import broker_degraded, build_broker
+from .brokers.factory import broker_degraded, build_broker, build_paper_runtime
 from .config import Settings, load_config, require_runtime_secrets
 from .logging_setup import setup_logging
 from .marketdata.alpaca_md import AlpacaMarketData
@@ -67,7 +67,8 @@ def build_market_data(settings: Settings, broker=None) -> MarketDataProvider:
 def build_web_server(settings, signals, killswitch, approval_gate, audit,
                      positions, orders, decisions, entry_decisions, scanner, trade_journal,
                      tv_indicators=None, ai_reviews=None, notifier=None, entry_candidates=None,
-                     news=None, briefs=None, tax_reserve=None, tax_reserve_store=None):
+                     news=None, briefs=None, tax_reserve=None, tax_reserve_store=None,
+                     practice=None):
     """Build a uvicorn Server for the control/webhook/dashboard API, or None if disabled."""
     if not settings.web.enabled:
         log.info("Web API disabled (web.enabled=false).")
@@ -96,10 +97,11 @@ def build_web_server(settings, signals, killswitch, approval_gate, audit,
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
         entry_candidates=entry_candidates, news=news, briefs=briefs,
         tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
+        practice=practice,
     )
     app = create_app(deps)
     config = uvicorn.Config(
-        app, host=settings.web.host, port=settings.web.port, log_level="info"
+        app, host=settings.web.host, port=settings.http_bind_port(), log_level="info"
     )
     return uvicorn.Server(config)
 
@@ -133,8 +135,19 @@ async def main_async(config_path: str | None = None) -> None:
     signals = SignalStore(db)
     killswitch = KillSwitch(db, audit, auto_trip_threshold=settings.auto_trip_after_errors)
 
-    broker = await build_broker(settings)
-    market_data = build_market_data(settings, broker)
+    data_broker = None
+    if settings.is_live:
+        broker = await build_broker(settings)
+        if hasattr(broker, "_call_tool") and getattr(broker, "_connected", False):
+            data_broker = broker
+    else:
+        broker, data_broker = await build_paper_runtime(settings)
+    market_data = build_market_data(settings, data_broker or broker)
+    rh_connected = bool(data_broker is not None and getattr(data_broker, "_connected", False))
+    if settings.market_data == "robinhood" and not rh_connected:
+        log.warning(
+            "health: robinhood_connected=false — practice fills will not see real chains."
+        )
     notifier = build_notifier(settings)
     rules_engine = RulesEngine.from_configs(settings.rules)
     executor = OrderExecutor(
@@ -144,8 +157,8 @@ async def main_async(config_path: str | None = None) -> None:
     scanner = OpportunityScanner(
         settings, broker, market_data, entry_decisions, executor, audit, killswitch,
         trade_journal=trade_journal, ai_reviewer=ai_reviewer, tv_indicators=tv_indicators,
-        ai_reviews=ai_reviews, earnings=build_earnings_provider(settings, broker),
-        company_data=build_company_data(settings, broker),
+        ai_reviews=ai_reviews, earnings=build_earnings_provider(settings, data_broker or broker),
+        company_data=build_company_data(settings, data_broker or broker),
         entry_candidates=entry_candidates,
         news_provider=build_news_provider(settings), news=news,
         setup_events=setup_events,
@@ -158,10 +171,20 @@ async def main_async(config_path: str | None = None) -> None:
     )
 
     caps = broker.capabilities()
+    md_effective = settings.market_data
+    if settings.market_data == "robinhood" and not rh_connected:
+        md_effective = "paper"
+    practice = {
+        "execution_broker": caps.name,
+        "market_data": md_effective,
+        "robinhood_connected": rh_connected,
+        "practice": (not settings.is_live),
+    }
     log.info(
-        "Starting AgenticRobinhood: mode=%s live_armed=%s broker=%s options=%s data=%s",
+        "Starting AgenticRobinhood: mode=%s live_armed=%s broker=%s options=%s "
+        "data=%s robinhood_connected=%s",
         settings.mode, settings.is_live, caps.name, caps.supports_options_orders,
-        settings.market_data,
+        md_effective, rh_connected,
     )
     # Loud alarm for the "looks live but isn't" state: live-armed, but the broker fell back to
     # paper (RH connect failed). The bot is not managing the real account — page the operator.
@@ -203,6 +226,7 @@ async def main_async(config_path: str | None = None) -> None:
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
         entry_candidates=entry_candidates, news=news, briefs=briefs,
         tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
+        practice=practice,
     )
 
     reporting = ReportingLoop(
@@ -239,7 +263,7 @@ async def main_async(config_path: str | None = None) -> None:
                  len(settings.entry.watchlist), settings.entry.feed)
         tasks.append(asyncio.create_task(scanner.run()))
     if web_server is not None:
-        log.info("Control/webhook API on http://%s:%d", settings.web.host, settings.web.port)
+        log.info("Control/webhook API on http://%s:%d", settings.web.host, settings.http_bind_port())
         tasks.append(asyncio.create_task(web_server.serve()))
     try:
         await stop_event.wait()

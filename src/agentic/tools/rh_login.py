@@ -102,14 +102,16 @@ async def main() -> int:
         catcher.stop()
 
     print(f"\n[OK] Authorized — {len(tools.tools)} tools available. Tokens saved to:\n  {storage.path}")
-    print("\nEASIEST DEPLOY: set this as a Coolify env var named  RH_OAUTH_JSON  (one line):\n")
+    print("\nEASIEST DEPLOY: set this as a Render/Coolify env var named  RH_OAUTH_JSON  (one line):\n")
     try:
         import json as _json
         print("  " + _json.dumps(_json.loads(storage.path.read_text("utf-8")), separators=(",", ":")))
     except Exception:  # noqa: BLE001
         print("  (could not compact; upload the file to /app/data/rh_oauth.json instead)")
-    print("\nThen redeploy (mode:live). The bot seeds the writable volume on first boot and "
-          "auto-refreshes from there. (Alternatively, place the file at /app/data/rh_oauth.json.)")
+    print("\nThen redeploy (keep mode: paper for practice). The bot seeds the writable volume "
+          "on first boot and auto-refreshes from there. To force a re-seed after a new login, "
+          "set RH_OAUTH_RESEED=1 for one boot. (Alternatively, place the file at "
+          "/app/data/rh_oauth.json.)")
     return 0
 
 

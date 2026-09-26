@@ -50,6 +50,7 @@ class WebDeps:
     briefs: Any | None = None       # store.briefs.BriefStore (saved weekly briefs)
     tax_reserve: Any | None = None   # services.tax_reserve.TaxReserveLoop (status for the dashboard)
     tax_reserve_store: Any | None = None  # store.tax_reserve.TaxReserveStore
+    practice: dict | None = None     # paper-runtime snapshot (data source + RH connect)
 
 
 def create_app(deps: WebDeps) -> FastAPI:
@@ -57,12 +58,15 @@ def create_app(deps: WebDeps) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict:
-        return {
+        out = {
             "status": "ok",
             "mode": deps.settings.mode,
             "live_armed": deps.settings.is_live,
             "paused": deps.killswitch.is_paused(),
         }
+        if deps.practice:
+            out.update(deps.practice)
+        return out
 
     app.include_router(make_webhook_router(deps))
     app.include_router(make_control_router(deps))

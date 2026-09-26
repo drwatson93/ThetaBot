@@ -18,7 +18,7 @@ Creates `data/rh_oauth.json`. Keep it secret — never commit or share it.
 Create a VPS (Hostinger — **https://www.hostinger.com?REFERRALCODE=LRBKTHIELNOA**), choose **Ubuntu**, and paste this into the **"Post-install script"** field so it installs automatically:
 ```
 #!/bin/bash
-curl -fsSL https://raw.githubusercontent.com/SaltyMeat23/ThetaBot/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/drwatson93/ThetaBot/main/scripts/bootstrap.sh | bash
 ```
 (Or SSH in later and run that one line yourself.)
 
