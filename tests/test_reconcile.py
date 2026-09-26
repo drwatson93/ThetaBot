@@ -23,14 +23,17 @@ from agentic.store.positions import PositionStore
 
 
 class FakeBroker(ExecutionBroker):
-    def __init__(self, open_positions=None, order_states=None):
+    def __init__(self, open_positions=None, order_states=None, equity=None):
         self._open = open_positions or []
         self._order_states = order_states or {}  # client_order_id -> Order
+        self._equity = equity or []
     async def connect(self): ...
     def capabilities(self):
         return BrokerCapabilities("fake", supports_options_orders=True, is_paper=True)
     async def get_open_positions(self):
         return list(self._open)
+    async def get_equity_positions(self):
+        return list(self._equity)
     async def submit_close_order(self, order):
         return order
     async def get_order(self, order):
@@ -255,3 +258,61 @@ async def test_expired_still_journals_full_credit(wiring):
 
     je = journal.recent(10)[0]
     assert je.status == "expired" and je.realized_pnl == 11.5   # 0.115 * 100 kept
+
+
+@pytest.mark.asyncio
+async def test_expired_put_with_shares_is_assigned_not_full_profit(wiring):
+    """An assigned put at expiration is shares bought at the strike, not a full-premium expiry."""
+    from agentic.domain.models import EquityHolding, TradeJournalEntry
+    from agentic.store.trade_journal import TradeJournalStore
+    db, audit, positions, orders, settings = wiring
+    journal = TradeJournalStore(db)
+    pos = Position(
+        occ_symbol="F260717P00010000", underlying="F", option_type=OptionType.PUT,
+        strategy=Strategy.CASH_SECURED_PUT, direction=Direction.SHORT, quantity=1, strike=10.0,
+        expiration=date.today() - timedelta(days=1), credit_received=0.50,
+    )
+    positions.upsert(pos)
+    journal.insert(TradeJournalEntry(occ_symbol=pos.occ_symbol, underlying="F", kind="CSP",
+                                     contracts=1, strike=10.0, dte=8, premium=0.50))
+
+    class _MD:
+        async def get_underlying_price(self, symbol):
+            return 8.0
+
+    broker = FakeBroker(open_positions=[], equity=[EquityHolding("F", 100, 10.0)])
+    rec = ReconcileLoop(settings, broker, positions, audit, orders=orders,
+                        trade_journal=journal, market_data=_MD())
+    diff = await rec.run_once()
+    assert {d["occ"]: d["status"] for d in diff["gone"]}["F260717P00010000"] == "ASSIGNED"
+    je = journal.recent(10)[0]
+    assert je.status == "assigned"
+    assert je.realized_pnl == -150.0   # (0.50 - (10-8)) * 100
+    assert journal.realized_since("1970-01-01T00:00:00+00:00")[0] == -150.0
+
+
+@pytest.mark.asyncio
+async def test_early_close_with_existing_shares_is_not_assignment(wiring):
+    """A filled buy-to-close on a name we already hold is a close, not an assignment."""
+    from agentic.domain.models import EquityHolding, TradeJournalEntry
+    from agentic.store.trade_journal import TradeJournalStore
+    db, audit, positions, orders, settings = wiring
+    journal = TradeJournalStore(db)
+    pos = Position(
+        occ_symbol="F260730P00010000", underlying="F", option_type=OptionType.PUT,
+        strategy=Strategy.CASH_SECURED_PUT, direction=Direction.SHORT, quantity=1, strike=10.0,
+        expiration=date.today() + timedelta(days=5), credit_received=0.40,
+    )
+    positions.upsert(pos)
+    pos = positions.get_by_occ(pos.occ_symbol)
+    journal.insert(TradeJournalEntry(occ_symbol=pos.occ_symbol, underlying="F", kind="CSP",
+                                     contracts=1, strike=10.0, dte=12, premium=0.40))
+    filled = Order(decision_id="d", position_id=pos.id, occ_symbol=pos.occ_symbol,
+                   quantity=1, limit_price=0.10, is_paper=True, client_order_id="btc-1",
+                   status=OrderStatus.FILLED, avg_fill_price=0.10, filled_qty=1)
+    orders.insert_if_new(filled)
+    broker = FakeBroker(open_positions=[], equity=[EquityHolding("F", 100, 9.0)])
+    rec = ReconcileLoop(settings, broker, positions, audit, orders=orders, trade_journal=journal)
+    diff = await rec.run_once()
+    assert {d["occ"]: d["status"] for d in diff["gone"]}[pos.occ_symbol] == "CLOSED"
+    assert journal.recent(10)[0].status == "closed"

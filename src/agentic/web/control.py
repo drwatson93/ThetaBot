@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
-from ..config import get_secret
+from ..config import get_secret, is_usable_secret
 from ..domain.enums import AuditEventType
 from .auth import require_auth
 
@@ -34,8 +34,8 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
 
     def _control_authorized(token: str | None) -> bool:
         expected = get_secret("CONTROL_TOKEN")
-        if not expected:
-            return True  # no token configured -> rely on tunnel/network protection
+        if not is_usable_secret(expected):
+            return False
         return bool(token) and hmac.compare_digest(token, expected)
 
     def _close_action_authorized(decision_id: str, token: str | None) -> bool:

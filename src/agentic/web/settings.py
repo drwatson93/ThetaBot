@@ -136,10 +136,9 @@ def make_settings_router(deps: "WebDeps") -> APIRouter:
 
     @router.post("/config", dependencies=[Depends(require_auth)])
     async def post_config(patch: dict = Body(...)) -> JSONResponse:
-        try:
-            changed = apply_patch(deps.settings, patch)
-        except SettingsEditError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-        return JSONResponse({"ok": True, "changed": changed, "editable": _editable_view(deps.settings)})
+        return JSONResponse(
+            {"ok": False, "error": "Dashboard is read-only. Edit config.yaml (or env vars) and restart."},
+            status_code=403,
+        )
 
     return router

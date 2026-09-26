@@ -20,7 +20,7 @@ from ..store.decisions import DecisionStore
 from ..store.positions import PositionStore
 from ..rules.base import cost_to_close, profit_captured
 from .killswitch import KillSwitch
-from .market_hours import is_market_hours
+from .market_hours import is_market_hours, is_order_window
 
 log = logging.getLogger("agentic.monitor")
 
@@ -91,6 +91,7 @@ class MonitorLoop:
         # you can't act on — and repeat them every closed-market poll. Position sync still runs
         # around the clock so the dashboard and reconcile stay current.
         market_open = is_market_hours()
+        can_trade = is_order_window(start=self.settings.trading_start)
         for pos in broker_positions:
             quote = await self.market_data.get_quote(pos)
             if quote is not None:
@@ -111,11 +112,11 @@ class MonitorLoop:
             self.positions.upsert(pos)
 
             # Phase 1+: evaluate rules; persist new decisions and notify (regular session only).
-            if market_open and self.rules_engine is not None and self.decisions is not None:
+            if can_trade and self.rules_engine is not None and self.decisions is not None:
                 await self._evaluate(pos, quote)
             # Roll defense: a tested put near expiry is rolled out-and-down for a credit rather
             # than stopped out or assigned at a bad basis (no-op unless roll.enabled + tested).
-            if market_open and self.roll_manager is not None:
+            if can_trade and self.roll_manager is not None:
                 await self.roll_manager.try_roll(pos, quote)
 
         self.audit.record(

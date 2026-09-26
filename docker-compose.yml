@@ -10,7 +10,7 @@ services:
     environment:
       - TZ=America/New_York   # market-hours logic uses US/Eastern
     ports:
-      - "8000:8000"           # dashboard + API (put HTTPS in front for production — see README)
+      - "127.0.0.1:8000:8000" # localhost only — use SSH tunnel or the Cloudflare Tunnel profile for remote access
     volumes:
       - ./data:/app/data                      # SQLite state + rh_oauth.json (back this up)
       - ./config.yaml:/app/config.yaml:ro     # your strategy config (copy from config.example.yaml)

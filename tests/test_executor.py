@@ -24,16 +24,18 @@ def test_round_to_tick():
     assert round_to_tick(2.07, 0.05) == 2.05
 
 
-def test_limit_price_mid_plus_buffer():
+def test_limit_price_starts_at_mid():
     q = OptionQuote("X", bid=1.00, ask=1.10, mark=1.05)  # mid = 1.05
-    # 1.05 * 1.02 = 1.071 -> 1.07; cap = 1.10*1.05 = 1.155, not binding.
-    assert compute_limit_price(q, buffer_pct=0.02, slippage_cap_pct=0.05) == 1.07
+    assert compute_limit_price(q, buffer_pct=0.02, slippage_cap_pct=0.05) == 1.05
 
 
-def test_limit_price_respects_slippage_cap():
+def test_limit_price_steps_toward_ask_and_respects_cap():
     q = OptionQuote("X", bid=1.00, ask=1.02, mark=1.01)  # mid = 1.01
-    # buffer would give 1.01*1.20 = 1.212, but cap = 1.02*1.05 = 1.071 -> 1.07.
-    assert compute_limit_price(q, buffer_pct=0.20, slippage_cap_pct=0.05) == 1.07
+    # Full step toward the ask = 1.02; cap = 1.02*1.05 = 1.071, not binding.
+    assert compute_limit_price(q, buffer_pct=0.20, slippage_cap_pct=0.05, toward_fill=1.0) == 1.02
+    # Cap still binds if we somehow go past the ask.
+    wide = OptionQuote("X", bid=1.00, ask=1.02, mark=1.01)
+    assert compute_limit_price(wide, buffer_pct=0.20, slippage_cap_pct=0.05, toward_fill=1.0) <= 1.08
 
 
 def test_limit_price_none_when_unpriceable():

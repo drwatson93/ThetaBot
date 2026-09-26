@@ -44,4 +44,4 @@ ssh -L 8000:localhost:8000 root@YOUR_VPS_IP     # then open http://localhost:800
 Want a secure always-on URL instead? See **README → Accessing your dashboard securely** (Cloudflare Tunnel).
 
 ## 6. Go live — only when you're ready
-Set `mode: live` in `config.yaml`, then `docker compose up -d`. Start with a **small** account and a **short** watchlist.
+Set **both** `mode: live` and `i_understand_live_trading: true` in `config.yaml`, then `docker compose up -d`. Start with a **small** account and a **short** watchlist. The dashboard is read-only; edit the yaml (not the UI) to change limits.

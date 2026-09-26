@@ -80,9 +80,10 @@ _REF_ID_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
 
 
 class RobinhoodMCPBroker(ExecutionBroker):
-    def __init__(self, url: str = MCP_URL, account_number: str = ""):
+    def __init__(self, url: str = MCP_URL, account_number: str = "", settings=None):
         self.url = url
         self._account_number = account_number
+        self._settings = settings
         self._token = get_secret("ROBINHOOD_MCP_TOKEN")
         self._tools: list[str] = []
         self._tool_defs: dict[str, dict] = {}  # tool name -> {description, input_schema} (diagnostic)
@@ -195,6 +196,13 @@ class RobinhoodMCPBroker(ExecutionBroker):
         rec = self._match_order_record(raw, order.broker_order_id)
         return self._apply_order_status(order, rec) if rec else order
 
+    def _require_live(self, *, kind: str = "option", symbol: str | None = None,
+                      quantity: float | None = None, side: str | None = None) -> None:
+        from .live_guard import assert_live_order_allowed
+        assert_live_order_allowed(
+            self._settings, kind=kind, symbol=symbol, quantity=quantity, side=side
+        )
+
     # ------------------------------------------------------------------ writes
     async def submit_close_order(self, order: Order) -> Order:
         """Submit a buy-to-close option order. Idempotent on ``order.client_order_id``.
@@ -208,6 +216,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
             raise RuntimeError(
                 "Robinhood MCP did not expose option order tools; configure broker_fallback."
             )
+        self._require_live(kind="option", side="buy")
         return await self._place_and_confirm(
             order, self._build_close_order_args(order), position_effect="close")
 
@@ -388,19 +397,25 @@ class RobinhoodMCPBroker(ExecutionBroker):
         return str(rec.get("id")) if rec.get("id") else None
 
     # ---- share orders (tax reserve BUY only) -------------------------------------------------
-    def _build_equity_order_args(self, *, symbol: str, dollar_amount: float, ref_id: str) -> dict[str, Any]:
-        """Market BUY for a dollar amount, regular hours (the only session that fills market orders),
-        fractional shares allowed. Mirrors the verified place_equity_order schema."""
-        return {
+    def _build_equity_order_args(self, *, symbol: str, ref_id: str, limit_price: float,
+                                dollar_amount: float | None = None,
+                                quantity: float | None = None) -> dict[str, Any]:
+        """Limit BUY, regular hours. Never a market order."""
+        args: dict[str, Any] = {
             "account_number": self._account_number,
             "symbol": symbol.upper(),
             "side": "buy",
-            "type": "market",
-            "dollar_amount": f"{dollar_amount:.2f}",
+            "type": "limit",
+            "price": f"{float(limit_price):.2f}",
             "time_in_force": "gfd",
             "market_hours": "regular_hours",
             "ref_id": ref_id,
         }
+        if dollar_amount:
+            args["dollar_amount"] = f"{float(dollar_amount):.2f}"
+        elif quantity:
+            args["quantity"] = str(quantity)
+        return args
 
     @staticmethod
     def _parse_equity_order(rec: dict[str, Any]) -> dict[str, Any]:
@@ -429,18 +444,25 @@ class RobinhoodMCPBroker(ExecutionBroker):
                 "shares": qty, "avg_price": px, "dollars": dollars, "raw_state": state}
 
     async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
-                                  quantity: float | None = None, order_type: str = "market",
+                                  quantity: float | None = None, order_type: str = "limit",
                                   ref_id: str | None = None, price_hint: float | None = None,
                                   timeout_seconds: float = 90.0, poll_seconds: float = 3.0) -> dict[str, Any]:
-        """BUY shares for a dollar amount (tax reserve). Refuses anything else: no sells, no limit
-        orders, no quantity orders -- the reserve is only ever reduced by the operator."""
-        if side != "buy" or order_type != "market" or not dollar_amount or dollar_amount <= 0 or quantity:
-            raise RuntimeError("submit_equity_order only supports market BUY by dollar amount.")
+        """BUY shares (tax reserve or the optional 1-share SGOV test). Limit orders only."""
+        self._require_live(kind="equity", symbol=symbol, quantity=quantity, side=side)
+        if side != "buy" or order_type != "limit":
+            raise RuntimeError("submit_equity_order only supports limit BUY.")
+        if (not dollar_amount or dollar_amount <= 0) and not quantity:
+            raise RuntimeError("submit_equity_order needs a dollar_amount or quantity.")
+        if price_hint is None or float(price_hint) <= 0:
+            raise RuntimeError("submit_equity_order needs a positive limit price (price_hint).")
         role = self._roles.get("place_equity_order")
         if not role or not self._account_number:
             raise RuntimeError("Robinhood MCP did not expose place_equity_order (or account_number unset).")
-        args = self._build_equity_order_args(symbol=symbol, dollar_amount=float(dollar_amount),
-                                             ref_id=ref_id or str(uuid.uuid4()))
+        args = self._build_equity_order_args(
+            symbol=symbol, ref_id=ref_id or str(uuid.uuid4()), limit_price=float(price_hint),
+            dollar_amount=float(dollar_amount) if dollar_amount else None,
+            quantity=quantity,
+        )
         raw = await self._call_tool(role, args)
         result = self._parse_equity_order(self._first_record(raw))
         deadline = asyncio.get_event_loop().time() + timeout_seconds
@@ -467,6 +489,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
             raise RuntimeError(
                 "Robinhood MCP did not expose option order tools; configure broker_fallback."
             )
+        self._require_live(kind="option", side="sell")
         return await self._place_and_confirm(
             order, self._build_open_order_args(order), position_effect="open")
 

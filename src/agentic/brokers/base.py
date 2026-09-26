@@ -70,7 +70,7 @@ class ExecutionBroker(ABC):
         return None
 
     async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
-                                  quantity: float | None = None, order_type: str = "market",
+                                  quantity: float | None = None, order_type: str = "limit",
                                   ref_id: str | None = None, price_hint: float | None = None) -> dict:
         """Place a SHARE order (used only to BUY the tax reserve). Returns
         ``{order_id, status, shares, avg_price, dollars}``. Default: unsupported."""

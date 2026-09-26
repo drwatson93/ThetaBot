@@ -66,6 +66,11 @@ class RobinhoodMarketData(MarketDataProvider):
         self._chain_cache: dict[str, tuple[float, list[OptionContractQuote]]] = {}
         self._bars_cache: dict[str, tuple[float, list[dict]]] = {}
 
+    @property
+    def is_realtime(self) -> bool:
+        """Robinhood's get_option_quotes is a real-time feed (not delayed indicative)."""
+        return True
+
     async def _call(self, tool: str, args: dict, *, retries: int = 2):
         """One RH tool call with exponential backoff on transient errors."""
         delay = 0.6
@@ -185,6 +190,38 @@ class RobinhoodMarketData(MarketDataProvider):
                     open_interest=_i(qd.get("open_interest")), volume=_i(qd.get("volume"))))
         self._chain_cache[underlying] = (time.time(), out)
         return out
+
+    async def get_fresh_contract_quote(self, occ_symbol: str) -> OptionContractQuote | None:
+        """One-contract quote that never reads the chain cache — used immediately before an order."""
+        parsed = _parse_occ(occ_symbol)
+        if not parsed:
+            return None
+        root, exp, typ, strike = parsed
+        try:
+            r = await self._call("get_option_instruments", {
+                "chain_symbol": root, "expiration_dates": exp.isoformat(),
+                "strike_price": str(strike), "type": typ, "tradability": "tradable"})
+        except Exception:  # noqa: BLE001
+            return None
+        insts = self._b._iter_records(r)
+        iid = str(insts[0].get("id")) if insts else None
+        if not iid:
+            return None
+        try:
+            q = await self._call("get_option_quotes", {"instrument_ids": [iid]})
+        except Exception:  # noqa: BLE001
+            return None
+        recs = self._b._iter_records(q)
+        qd = (recs[0].get("quote") or {}) if recs else {}
+        return OptionContractQuote(
+            occ_symbol=occ_symbol, underlying=root, option_id=iid,
+            option_type=typ, strike=strike, expiration=exp,
+            bid=_f(qd.get("bid_price")), ask=_f(qd.get("ask_price")),
+            mark=_f(qd.get("adjusted_mark_price")) or _f(qd.get("mark_price")),
+            delta=_f(qd.get("delta")), iv=_f(qd.get("implied_volatility")),
+            theta=_f(qd.get("theta")), gamma=_f(qd.get("gamma")), vega=_f(qd.get("vega")),
+            open_interest=_i(qd.get("open_interest")), volume=_i(qd.get("volume")),
+        )
 
     # --- held-contract quote (close side) --------------------------------------------------------
     async def get_quote(self, position: Position) -> OptionQuote | None:

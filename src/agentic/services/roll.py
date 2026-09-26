@@ -159,6 +159,49 @@ class RollManager:
             log.warning("Roll skipped: no option_id for %s", target.occ_symbol)
             return False
 
+        # Pre-flight the NEW leg before touching the old one. If execute_open would refuse
+        # (stale/cached quote, no realtime flag, not armed, before 10:00 ET, …) leave the
+        # tested put untouched rather than buying it back and failing to replace it.
+        entry_dec = EntryDecision(
+            underlying=position.underlying, occ_symbol=target.occ_symbol, option_id=option_id,
+            strike=target.strike, expiration=target.expiration, contracts=position.quantity,
+            premium=target.midpoint or 0.0, rule_name="roll",
+            reason=f"Roll from {position.occ_symbol} (net +${net:.2f}).",
+            dedup_key=f"roll:{target.occ_symbol}:{now.date().isoformat()}",
+        )
+        try:
+            fresh_target = await self.market_data.get_fresh_contract_quote(target.occ_symbol)
+            if fresh_target is not None:
+                target = fresh_target
+                entry_dec.premium = target.midpoint or entry_dec.premium
+                if fresh_target.option_id:
+                    entry_dec.option_id = fresh_target.option_id
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Roll: fresh quote for %s failed: %s", target.occ_symbol, exc)
+        block = None
+        if hasattr(self.executor, "open_block_reason"):
+            block = self.executor.open_block_reason(entry_dec, target)
+        if block:
+            marker = CloseDecision(
+                position_id=position.id, rule_name="roll", rule_type=RuleType.ROLL,
+                reason=f"Roll skipped; new leg would be refused ({block}). {reason}",
+                requires_approval=False,
+                dedup_key=f"{dedup_key(position.id, RuleType.ROLL, now)}:preflight",
+            )
+            if self.decisions.insert_if_new(marker):
+                self.audit.record(
+                    AuditEventType.ERROR,
+                    {"where": "roll.preflight", "from": position.occ_symbol,
+                     "to": target.occ_symbol, "error": block},
+                    source="roll", position_id=position.id,
+                )
+                await self._notify(
+                    f"Roll skipped for {position.underlying} {position.occ_symbol}",
+                    f"New leg {target.occ_symbol} would not open ({block}); "
+                    f"leaving the tested put untouched.")
+            log.warning("Roll skipped (preflight): %s", block)
+            return False
+
         close_dec = CloseDecision(
             position_id=position.id, rule_name="roll", rule_type=RuleType.ROLL,
             reason=f"Roll: {reason} -> {target.occ_symbol} (net +${net:.2f}).",
@@ -170,13 +213,6 @@ class RollManager:
         if close_order is None or close_order.status is not OrderStatus.FILLED:
             return False   # blocked / not filled -> do NOT open the new leg (never go naked-long)
 
-        entry_dec = EntryDecision(
-            underlying=position.underlying, occ_symbol=target.occ_symbol, option_id=option_id,
-            strike=target.strike, expiration=target.expiration, contracts=position.quantity,
-            premium=target.midpoint or 0.0, rule_name="roll",
-            reason=f"Roll from {position.occ_symbol} (net +${net:.2f}).",
-            dedup_key=f"roll:{target.occ_symbol}:{now.date().isoformat()}",
-        )
         self.entry_decisions.insert_if_new(entry_dec)
         open_order = await self.executor.execute_open(entry_dec, target)
         if open_order is None or open_order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):

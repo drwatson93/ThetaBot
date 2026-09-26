@@ -15,20 +15,24 @@ import hmac
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from ..config import get_secret
+from ..config import get_secret, is_usable_secret
 
 _basic = HTTPBasic(auto_error=False)
 
 
 def auth_enabled() -> bool:
-    return bool(get_secret("DASHBOARD_PASSWORD"))
+    return is_usable_secret(get_secret("DASHBOARD_PASSWORD"))
 
 
 def require_auth(credentials: HTTPBasicCredentials | None = Depends(_basic)) -> None:
-    """FastAPI dependency: enforce Basic Auth when a password is configured."""
+    """FastAPI dependency: the dashboard is locked unless a real password is set."""
     password = get_secret("DASHBOARD_PASSWORD")
-    if not password:
-        return  # auth disabled — no password configured
+    if not is_usable_secret(password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Dashboard is locked: DASHBOARD_PASSWORD is not configured",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     username = get_secret("DASHBOARD_USER", "admin")
     ok = credentials is not None and hmac.compare_digest(
         credentials.username, username
