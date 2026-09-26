@@ -46,6 +46,7 @@ HOLIDAYS_2027 = {
     date(2027, 9, 6),    # Labor
     date(2027, 11, 25),  # Thanksgiving
     date(2027, 12, 24),  # Christmas (December 25 is Saturday)
+    date(2027, 12, 31),  # New Year's 2028 observed (January 1 is Saturday)
 }
 
 

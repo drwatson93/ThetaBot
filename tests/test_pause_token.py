@@ -79,8 +79,8 @@ def test_pause_token_header_and_idempotent_repause(ctx):
     )
     assert first.status_code == 200 and first.json()["already_paused"] is False
     second = client.post(
-        "/control/pause-only?token=" + PAUSE,
-        params={"reason": "second"},
+        "/control/pause-only",
+        params={"token": PAUSE, "reason": "second"},
         auth=None,
     )
     assert second.status_code == 200
