@@ -16,7 +16,10 @@ services:
     dockerContext: .
     healthCheckPath: /health
     autoDeployTrigger: "off"
-    maxShutdownDelaySeconds: 60
+    # Do not set maxShutdownDelaySeconds: Render rejects it when a disk is attached
+    # ("max shutdown delay is not supported for services with a disk"). A disk already
+    # stops the old instance before the new one starts, so there is no zero-downtime
+    # drain window to extend. Default SIGTERM grace is 30s.
     disk:
       name: thetabot-data
       mountPath: /app/data
