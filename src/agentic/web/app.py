@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from ..brokers.robinhood_mcp import ORDERS_HARD_DISABLED, REAL_ORDERS_LOCK_LABEL
 from ..config import Settings
 from ..services.approval import ApprovalGate
 from ..services.killswitch import KillSwitch
@@ -66,6 +67,9 @@ def create_app(deps: WebDeps) -> FastAPI:
         }
         if deps.practice:
             out.update(deps.practice)
+        if ORDERS_HARD_DISABLED:
+            out["real_orders"] = "HARD DISABLED in code"
+            out["real_orders_lock"] = REAL_ORDERS_LOCK_LABEL
         return out
 
     app.include_router(make_webhook_router(deps))

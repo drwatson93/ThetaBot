@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..brokers.robinhood_mcp import ORDERS_HARD_DISABLED, REAL_ORDERS_LOCK_LABEL
 from ..config import Settings
 
 
@@ -36,6 +37,11 @@ def describe_active_rules(settings: Settings) -> list[dict[str, Any]]:
     mode_label = "paper (no real orders)" if not s.is_live else "LIVE — real orders armed"
     add("Mode", "Trading mode", mode_label,
         "Live requires both mode: live and i_understand_live_trading: true.")
+    if ORDERS_HARD_DISABLED:
+        add("Mode", "Real orders", "HARD DISABLED in code",
+            f"{REAL_ORDERS_LOCK_LABEL}. Hard-coded in the Robinhood MCP client. "
+            "Cannot be turned off by config.yaml, env, the dashboard, mode: live, "
+            "or i_understand_live_trading.")
     add("Mode", "Broker", s.broker, f"Fallback: {s.broker_fallback or 'none'}.")
     add("Mode", "Market data", s.market_data,
         "Robinhood quotes are treated as real-time. Alpaca needs feed=opra for live entry.")

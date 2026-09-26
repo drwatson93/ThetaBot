@@ -165,6 +165,8 @@ class RHEarningsProvider:
                 if tool is None:
                     self._cache[key] = None
                     return None
+                from ..brokers.robinhood_mcp import assert_mcp_tool_allowed
+                assert_mcp_tool_allowed(tool)
                 res = await session.call_tool(tool, arguments={"symbol": symbol.upper()})
                 raw = getattr(res, "structuredContent", None)
                 if raw is None:
