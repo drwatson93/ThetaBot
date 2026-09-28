@@ -25,11 +25,20 @@ from ..domain.enums import (
 from typing import Any
 
 from ..domain.enums import OptionType as _OptionType
+from ..domain.order_pricing import DEFAULT_TIME_IN_FORCE, NonLimitOrderRefused, assert_limit_only
 from ..domain.models import EquityHolding, Order, Position, utcnow
 from ..marketdata.alpaca_md import parse_occ_symbol
 from .base import BrokerCapabilities, ExecutionBroker
 
 log = logging.getLogger("agentic.brokers.paper")
+
+
+def _require_limit(order_type: str | None, **ctx) -> None:
+    try:
+        assert_limit_only(order_type, **ctx)
+    except NonLimitOrderRefused as exc:
+        log.error("%s", exc)
+        raise
 
 
 def _pos_to_dict(p: Position) -> dict:
@@ -166,7 +175,8 @@ class PaperBroker(ExecutionBroker):
                                   quantity: float | None = None, order_type: str = "limit",
                                   ref_id: str | None = None, price_hint: float | None = None) -> dict[str, Any]:
         """Simulated limit BUY: fills at ``price_hint`` (or $100). Dollar-amount or share qty."""
-        if side != "buy" or order_type != "limit":
+        _require_limit(order_type, where="paper.submit_equity", symbol=symbol)
+        if side != "buy":
             raise RuntimeError("paper submit_equity_order only supports limit BUY.")
         price = float(price_hint or getattr(self, "_last_prices", {}).get(symbol.upper()) or 100.0)
         if dollar_amount and dollar_amount > 0:
@@ -189,7 +199,9 @@ class PaperBroker(ExecutionBroker):
         self._save()
         oid = ref_id or uuid.uuid4().hex
         return {"order_id": oid, "status": "filled", "shares": shares, "avg_price": price,
-                "dollars": round(float(dollar_amount), 2), "raw_state": "filled"}
+                "dollars": round(float(dollar_amount), 2), "raw_state": "filled",
+                "order_type": "limit", "limit_price": price, "bid": None, "ask": None,
+                "mid": price, "time_in_force": DEFAULT_TIME_IN_FORCE}
 
     async def get_equity_order(self, order_id: str) -> dict[str, Any]:
         return {"order_id": order_id, "status": "filled", "raw_state": "filled"}
@@ -213,6 +225,8 @@ class PaperBroker(ExecutionBroker):
         ]
 
     async def submit_close_order(self, order: Order) -> Order:
+        _require_limit(order.order_type, where="paper.submit_close", occ=order.occ_symbol,
+                       client_order_id=order.client_order_id)
         # Idempotent: same client_order_id returns the existing order.
         if order.client_order_id in self._orders:
             return self._orders[order.client_order_id]
@@ -242,6 +256,8 @@ class PaperBroker(ExecutionBroker):
 
     async def submit_open_order(self, order: Order) -> Order:
         """Simulate a sell-to-open: fill at limit and materialize a new short-put position."""
+        _require_limit(order.order_type, where="paper.submit_open", occ=order.occ_symbol,
+                       client_order_id=order.client_order_id)
         if order.client_order_id in self._orders:
             return self._orders[order.client_order_id]
         order.broker_order_id = "paper-open-" + order.client_order_id[:8]

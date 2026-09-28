@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 from ..domain.enums import OptionType, OrderStatus, PositionStatus
 from ..domain.models import CloseDecision, Order, Position
+from ..domain.order_pricing import order_as_close_pricing, public_pricing_fields
 
 MULTIPLIER = 100  # shares per option contract
 
@@ -166,6 +167,12 @@ def position_rows(
         if real_only and _is_paper_position(p, paper_occs):
             continue  # paper position — excluded from live views
         info = position_pnl(p, filled_close(pos_orders))
+        close_o = filled_close(pos_orders)
+        open_o = next(
+            (o for o in orders
+             if o.occ_symbol == p.occ_symbol and o.side == "SELL_TO_OPEN"),
+            None,
+        )
         rows.append({
             "occ_symbol": p.occ_symbol,
             "underlying": p.underlying,
@@ -184,6 +191,8 @@ def position_rows(
             "close_price": info["close_price"],
             "pnl_estimated": info["pnl_estimated"],
             "rule": rule_by_pos.get(p.id),
+            **public_pricing_fields(open_o),
+            **order_as_close_pricing(close_o),
         })
     return rows
 

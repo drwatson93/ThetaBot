@@ -24,6 +24,12 @@ from ..brokers.base import ExecutionBroker
 from ..errors import describe_exception
 from ..domain.enums import AuditEventType, DecisionStatus, OrderStatus, PositionStatus
 from ..domain.models import CloseDecision, EntryDecision, Order, Position, utcnow
+from ..domain.order_pricing import (
+    NonLimitOrderRefused,
+    assert_limit_only,
+    pricing_kwargs,
+    stamp_order_quote,
+)
 from ..marketdata.base import MarketDataProvider
 from ..marketdata.quote import OptionContractQuote, OptionQuote
 from ..notify.base import Notifier
@@ -185,6 +191,15 @@ class OrderExecutor:
             is_paper=is_paper,
             client_order_id=f"close-{decision.id}",
         )
+        try:
+            self._prepare_submit(order, quote)
+        except NonLimitOrderRefused as exc:
+            await self._refuse_non_limit(
+                exc, order, decision_id=decision.id, position_id=position.id
+            )
+            self.decisions.set_status(decision.id, DecisionStatus.FAILED)
+            return None
+        self.decisions.set_order_snapshot(decision.id, **pricing_kwargs(order))
         if not self.orders.insert_if_new(order):
             existing = self.orders.get_by_client_order_id(order.client_order_id)
             if existing is not None:
@@ -197,6 +212,9 @@ class OrderExecutor:
         self.audit.record(
             AuditEventType.ORDER_SUBMIT,
             {"occ": order.occ_symbol, "qty": order.quantity, "limit": order.limit_price,
+             "limit_price": order.limit_price, "order_type": pricing_kwargs(order)["order_type"],
+             "bid": order.bid, "ask": order.ask, "mid": order.mid,
+             "time_in_force": order.time_in_force,
              "is_paper": order.is_paper, "client_order_id": order.client_order_id},
             source="executor", position_id=position.id,
             decision_id=decision.id, order_id=order.id,
@@ -330,6 +348,13 @@ class OrderExecutor:
             client_order_id=f"open-{decision.id}",
             side="SELL_TO_OPEN",
         )
+        try:
+            self._prepare_submit(order, quote)
+        except NonLimitOrderRefused as exc:
+            await self._refuse_non_limit(exc, order, decision_id=decision.id)
+            self.entry_decisions.set_status(decision.id, DecisionStatus.FAILED)
+            return None
+        self.entry_decisions.set_order_snapshot(decision.id, **pricing_kwargs(order))
         if not self.orders.insert_if_new(order):
             existing = self.orders.get_by_client_order_id(order.client_order_id)
             if existing is not None:
@@ -341,7 +366,10 @@ class OrderExecutor:
         self.audit.record(
             AuditEventType.ORDER_SUBMIT,
             {"open": True, "occ": order.occ_symbol, "qty": order.quantity,
-             "limit": order.limit_price, "is_paper": order.is_paper},
+             "limit": order.limit_price, "limit_price": order.limit_price,
+             "order_type": pricing_kwargs(order)["order_type"],
+             "bid": order.bid, "ask": order.ask, "mid": order.mid,
+             "time_in_force": order.time_in_force, "is_paper": order.is_paper},
             source="executor", decision_id=decision.id, order_id=order.id,
         )
 
@@ -533,10 +561,20 @@ class OrderExecutor:
             is_paper=order.is_paper,
             client_order_id=f"{order.client_order_id}-r1",
         )
+        try:
+            self._prepare_submit(new_order, quote)
+        except NonLimitOrderRefused as exc:
+            await self._refuse_non_limit(
+                exc, new_order, decision_id=order.decision_id, position_id=position.id
+            )
+            return order
         self.orders.insert_if_new(new_order)
         self.audit.record(
             AuditEventType.ORDER_SUBMIT,
-            {"reprice": True, "from": order.limit_price, "to": new_limit, "qty": remaining},
+            {"reprice": True, "from": order.limit_price, "to": new_limit, "qty": remaining,
+             "order_type": pricing_kwargs(new_order)["order_type"],
+             "limit_price": new_order.limit_price, "bid": new_order.bid, "ask": new_order.ask,
+             "mid": new_order.mid, "time_in_force": new_order.time_in_force},
             source="executor", position_id=position.id,
             decision_id=order.decision_id, order_id=new_order.id,
         )
@@ -694,8 +732,39 @@ class OrderExecutor:
             return
         position.status = PositionStatus.CLOSED  # so position_pnl computes the realized branch
         info = position_pnl(position, close_order)
+        snap = pricing_kwargs(close_order)
         self.trade_journal.set_outcome(
             je.id, status=info["outcome"], realized_pnl=info["realized_pnl"],
             close_price=info["close_price"], exit_reason=exit_reason, entered_at=je.entered_at,
             mfe_pct=position.peak_profit_pct, mae_pct=position.trough_profit_pct,
+            close_order_type=snap["order_type"], close_limit_price=snap["limit_price"],
+            close_bid=snap["bid"], close_ask=snap["ask"], close_mid=snap["mid"],
+            close_time_in_force=snap["time_in_force"],
+        )
+
+    def _prepare_submit(self, order: Order, quote) -> None:
+        """Stamp the pricing quote and refuse anything that isn't a limit order."""
+        stamp_order_quote(order, quote)
+        assert_limit_only(
+            order.order_type, where="executor", occ=order.occ_symbol,
+            client_order_id=order.client_order_id,
+        )
+
+    async def _refuse_non_limit(
+        self, exc: NonLimitOrderRefused, order: Order, *,
+        decision_id: str, position_id: str | None = None,
+    ) -> None:
+        """Log loudly + audit ERROR so /api/ops last_error surfaces the refusal."""
+        log.error("%s", exc)
+        self.audit.record(
+            AuditEventType.ERROR,
+            {"where": "executor.limit_only", **describe_exception(exc),
+             "order_type": order.order_type, "occ": order.occ_symbol,
+             "client_order_id": order.client_order_id},
+            source="executor", position_id=position_id, decision_id=decision_id, order_id=order.id,
+        )
+        await self._notify(
+            "LIMIT-ONLY RULE: order refused",
+            str(exc),
+            priority="high",
         )

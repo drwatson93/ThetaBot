@@ -19,6 +19,7 @@ from ..brokers.base import ExecutionBroker
 from ..errors import describe_exception
 from ..domain.enums import AuditEventType, DecisionStatus, OrderStatus
 from ..domain.models import EntryDecision, TradeJournalEntry, utcnow
+from ..domain.order_pricing import pricing_kwargs
 from ..marketdata.base import MarketDataProvider
 from ..marketdata.quote import OptionContractQuote
 from ..store.audit import AuditStore
@@ -526,7 +527,7 @@ class OpportunityScanner:
             if order is not None and order.status == OrderStatus.FILLED:
                 collected += c.premium * decision.contracts * 100  # count premium just collected
                 if self.trade_journal is not None:
-                    await self._journal_fill(decision, c, quote, tag)
+                    await self._journal_fill(decision, c, quote, tag, order)
         return n
 
     def _week_start_iso(self) -> str:
@@ -863,7 +864,7 @@ class OpportunityScanner:
         except Exception as exc:  # noqa: BLE001 — candidate logging must never break the scan
             log.warning("entry-candidate logging failed: %s", exc)
 
-    async def _journal_fill(self, decision: EntryDecision, candidate, quote, tag: str) -> None:
+    async def _journal_fill(self, decision: EntryDecision, candidate, quote, tag: str, order) -> None:
         ctx = self.last_context.get(candidate.underlying)
         context = {k: v for k, v in ctx.as_dict().items() if k != "symbol"} if ctx else {}
         # Per-option greeks at entry (extensible context; feeds the refinement dataset).
@@ -895,6 +896,7 @@ class OpportunityScanner:
                 underlying_price = await self.market_data.get_underlying_price(candidate.underlying)
             except Exception:  # noqa: BLE001 — price is best-effort context
                 underlying_price = None
+        snap = pricing_kwargs(order)
         self.trade_journal.insert(TradeJournalEntry(
             occ_symbol=candidate.occ_symbol,
             underlying=candidate.underlying,
@@ -912,6 +914,12 @@ class OpportunityScanner:
             underlying_price=underlying_price,
             context=context,
             entry_decision_id=decision.id,
+            order_type=snap["order_type"],
+            limit_price=snap["limit_price"],
+            bid=snap["bid"],
+            ask=snap["ask"],
+            mid=snap["mid"],
+            time_in_force=snap["time_in_force"],
         ))
 
     @staticmethod
