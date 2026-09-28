@@ -23,6 +23,7 @@ from typing import Any
 
 from ..domain.enums import AuditEventType
 from ..domain.models import utcnow
+from ..domain.order_pricing import DEFAULT_TIME_IN_FORCE, assert_limit_only
 from .market_hours import is_order_window
 from .reporting import now_et
 
@@ -162,8 +163,10 @@ class TaxReserveLoop:
         try:
             if price is None or price <= 0:
                 raise RuntimeError(f"no usable limit price for {cfg.symbol}")
+            order_type = "limit"
+            assert_limit_only(order_type, where="tax_reserve.buy", symbol=cfg.symbol)
             filled = await self.broker.submit_equity_order(
-                symbol=cfg.symbol, side="buy", dollar_amount=amount, order_type="limit",
+                symbol=cfg.symbol, side="buy", dollar_amount=amount, order_type=order_type,
                 ref_id=ref_id, price_hint=price)
         except Exception as exc:  # noqa: BLE001
             self.store.record(**base, carry_out=net, amount_due=amount, status="failed",
@@ -179,7 +182,12 @@ class TaxReserveLoop:
                           status=("filled" if ok else "failed"), dollar_amount=filled.get("dollars", amount),
                           shares=filled.get("shares"), fill_price=filled.get("avg_price"),
                           broker_order_id=filled.get("order_id"), ref_id=ref_id,
-                          error=(None if ok else f"order state {status or 'unknown'}"))
+                          error=(None if ok else f"order state {status or 'unknown'}"),
+                          order_type=filled.get("order_type") or "limit",
+                          limit_price=filled.get("limit_price", price),
+                          bid=filled.get("bid"), ask=filled.get("ask"),
+                          mid=filled.get("mid", price),
+                          time_in_force=filled.get("time_in_force") or DEFAULT_TIME_IN_FORCE)
         if ok:
             await self._notify(f"Tax reserve: bought ${filled.get('dollars', amount):,.2f} of {cfg.symbol}",
                                f"Week net realized {net:+,.2f} x {cfg.pct:.0%} -> {filled.get('shares')} sh "

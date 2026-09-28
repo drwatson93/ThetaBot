@@ -25,18 +25,21 @@ class TaxReserveStore:
                dollar_amount: float | None = None, shares: float | None = None,
                fill_price: float | None = None, broker_order_id: str | None = None,
                ref_id: str | None = None, error: str | None = None, meta: dict | None = None,
-               created_at=None) -> bool:
+               created_at=None, order_type: str | None = None, limit_price: float | None = None,
+               bid: float | None = None, ask: float | None = None, mid: float | None = None,
+               time_in_force: str | None = None) -> bool:
         """Insert one period row; False when that period_end already has a row."""
         cur = self.db.conn.execute(
             """INSERT OR IGNORE INTO tax_reserve
                  (id, created_at, period_start, period_end, net_realized, carry_in, carry_out,
                   amount_due, symbol, dollar_amount, shares, fill_price, broker_order_id, ref_id,
-                  status, error, meta)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  status, error, meta, order_type, limit_price, bid, ask, mid, time_in_force)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (uuid.uuid4().hex, (created_at or utcnow()).isoformat(), period_start, period_end,
              round(net_realized, 2), round(carry_in, 2), round(carry_out, 2), round(amount_due, 2),
              symbol.upper(), dollar_amount, shares, fill_price, broker_order_id, ref_id, status,
-             error, json.dumps(meta or {}, default=str)),
+             error, json.dumps(meta or {}, default=str),
+             order_type, limit_price, bid, ask, mid, time_in_force),
         )
         self.db.conn.commit()
         return cur.rowcount == 1

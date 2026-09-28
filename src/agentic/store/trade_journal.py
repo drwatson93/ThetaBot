@@ -14,6 +14,14 @@ from .db import Database
 _OUTCOME_STATUSES = ("win", "loss", "expired", "assigned", "called_away", "closed")
 
 
+def _col(r, key, default=None):
+    try:
+        v = r[key]
+    except (IndexError, KeyError):
+        return default
+    return default if v is None else v
+
+
 def _row_to_entry(r) -> TradeJournalEntry:
     return TradeJournalEntry(
         id=r["id"],
@@ -33,11 +41,23 @@ def _row_to_entry(r) -> TradeJournalEntry:
         annualized_ror=r["annualized_ror"],
         underlying_price=r["underlying_price"],
         context=json.loads(r["context"]) if r["context"] else {},
+        order_type=_col(r, "order_type"),
+        limit_price=_col(r, "limit_price"),
+        bid=_col(r, "bid"),
+        ask=_col(r, "ask"),
+        mid=_col(r, "mid"),
+        time_in_force=_col(r, "time_in_force"),
         status=r["status"],
         realized_pnl=r["realized_pnl"],
         close_price=r["close_price"],
         days_held=r["days_held"],
         exit_reason=r["exit_reason"],
+        close_order_type=_col(r, "close_order_type"),
+        close_limit_price=_col(r, "close_limit_price"),
+        close_bid=_col(r, "close_bid"),
+        close_ask=_col(r, "close_ask"),
+        close_mid=_col(r, "close_mid"),
+        close_time_in_force=_col(r, "close_time_in_force"),
         entered_at=datetime.fromisoformat(r["entered_at"]),
         closed_at=datetime.fromisoformat(r["closed_at"]) if r["closed_at"] else None,
     )
@@ -53,14 +73,20 @@ class TradeJournalStore:
                  (id, entry_decision_id, occ_symbol, underlying, kind, contracts, strike, dte,
                   delta, iv, premium, spread_pct, open_interest, volume, annualized_ror,
                   underlying_price, context, status, realized_pnl, close_price, days_held,
-                  exit_reason, entered_at, closed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  exit_reason, entered_at, closed_at,
+                  order_type, limit_price, bid, ask, mid, time_in_force,
+                  close_order_type, close_limit_price, close_bid, close_ask, close_mid,
+                  close_time_in_force)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 e.id, e.entry_decision_id, e.occ_symbol, e.underlying, e.kind, e.contracts,
                 e.strike, e.dte, e.delta, e.iv, e.premium, e.spread_pct, e.open_interest,
                 e.volume, e.annualized_ror, e.underlying_price, json.dumps(e.context),
                 e.status, e.realized_pnl, e.close_price, e.days_held, e.exit_reason,
                 e.entered_at.isoformat(), e.closed_at.isoformat() if e.closed_at else None,
+                e.order_type, e.limit_price, e.bid, e.ask, e.mid, e.time_in_force,
+                e.close_order_type, e.close_limit_price, e.close_bid, e.close_ask, e.close_mid,
+                e.close_time_in_force,
             ),
         )
         self.db.conn.commit()
@@ -84,6 +110,12 @@ class TradeJournalStore:
         entered_at: datetime | None = None,
         mfe_pct: float | None = None,
         mae_pct: float | None = None,
+        close_order_type: str | None = None,
+        close_limit_price: float | None = None,
+        close_bid: float | None = None,
+        close_ask: float | None = None,
+        close_mid: float | None = None,
+        close_time_in_force: str | None = None,
     ) -> None:
         now = utcnow()
         days_held = (now - entered_at).days if entered_at is not None else None
@@ -109,9 +141,13 @@ class TradeJournalStore:
         self.db.conn.execute(
             """UPDATE trade_journal SET
                  status = ?, realized_pnl = ?, close_price = ?, exit_reason = ?,
-                 days_held = ?, closed_at = ?
+                 days_held = ?, closed_at = ?,
+                 close_order_type = ?, close_limit_price = ?, close_bid = ?, close_ask = ?,
+                 close_mid = ?, close_time_in_force = ?
                WHERE id = ?""",
-            (status, realized_pnl, close_price, exit_reason, days_held, now.isoformat(), journal_id),
+            (status, realized_pnl, close_price, exit_reason, days_held, now.isoformat(),
+             close_order_type, close_limit_price, close_bid, close_ask, close_mid,
+             close_time_in_force, journal_id),
         )
         self.db.conn.commit()
 

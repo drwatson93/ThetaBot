@@ -12,6 +12,14 @@ from ..domain.models import EntryDecision
 from .db import Database
 
 
+def _col(r, key, default=None):
+    try:
+        v = r[key]
+    except (IndexError, KeyError):
+        return default
+    return default if v is None else v
+
+
 def _row_to_entry(r) -> EntryDecision:
     return EntryDecision(
         id=r["id"],
@@ -28,6 +36,12 @@ def _row_to_entry(r) -> EntryDecision:
         status=DecisionStatus(r["status"]),
         created_at=datetime.fromisoformat(r["created_at"]),
         decided_at=datetime.fromisoformat(r["decided_at"]) if r["decided_at"] else None,
+        order_type=_col(r, "order_type"),
+        limit_price=_col(r, "limit_price"),
+        bid=_col(r, "bid"),
+        ask=_col(r, "ask"),
+        mid=_col(r, "mid"),
+        time_in_force=_col(r, "time_in_force"),
     )
 
 
@@ -58,6 +72,26 @@ class EntryDecisionStore:
         self.db.conn.execute(
             "UPDATE entry_decisions SET status = ?, decided_at = ? WHERE id = ?",
             (status.value, utcnow().isoformat(), decision_id),
+        )
+        self.db.conn.commit()
+
+    def set_order_snapshot(
+        self,
+        decision_id: str,
+        *,
+        order_type: str | None,
+        limit_price: float | None,
+        bid: float | None,
+        ask: float | None,
+        mid: float | None,
+        time_in_force: str | None,
+    ) -> None:
+        """Stamp the priced order onto the entry decision (additive; does not change status)."""
+        self.db.conn.execute(
+            """UPDATE entry_decisions SET
+                 order_type = ?, limit_price = ?, bid = ?, ask = ?, mid = ?, time_in_force = ?
+               WHERE id = ?""",
+            (order_type, limit_price, bid, ask, mid, time_in_force, decision_id),
         )
         self.db.conn.commit()
 

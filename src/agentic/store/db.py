@@ -56,7 +56,13 @@ CREATE TABLE IF NOT EXISTS decisions (
     dedup_key       TEXT NOT NULL,
     created_at      TEXT NOT NULL,
     decided_at      TEXT,
-    expires_at      TEXT
+    expires_at      TEXT,
+    order_type      TEXT,
+    limit_price     REAL,
+    bid             REAL,
+    ask             REAL,
+    mid             REAL,
+    time_in_force   TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_dedup ON decisions(dedup_key);
 
@@ -77,7 +83,11 @@ CREATE TABLE IF NOT EXISTS orders (
     status          TEXT NOT NULL,
     is_paper        INTEGER NOT NULL,
     submitted_at    TEXT,
-    last_status_at  TEXT
+    last_status_at  TEXT,
+    bid             REAL,                   -- NBBO at the moment the limit was priced
+    ask             REAL,
+    mid             REAL,
+    time_in_force   TEXT                    -- e.g. gfd; null on rows written before this existed
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client ON orders(client_order_id);
 
@@ -95,7 +105,13 @@ CREATE TABLE IF NOT EXISTS entry_decisions (
     status          TEXT NOT NULL,
     dedup_key       TEXT NOT NULL,
     created_at      TEXT NOT NULL,
-    decided_at      TEXT
+    decided_at      TEXT,
+    order_type      TEXT,
+    limit_price     REAL,
+    bid             REAL,
+    ask             REAL,
+    mid             REAL,
+    time_in_force   TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_decisions_dedup ON entry_decisions(dedup_key);
 
@@ -123,7 +139,19 @@ CREATE TABLE IF NOT EXISTS trade_journal (
     days_held       INTEGER,
     exit_reason     TEXT,
     entered_at      TEXT NOT NULL,
-    closed_at       TEXT
+    closed_at       TEXT,
+    order_type      TEXT,                    -- entry order (null on pre-snapshot rows)
+    limit_price     REAL,
+    bid             REAL,
+    ask             REAL,
+    mid             REAL,
+    time_in_force   TEXT,
+    close_order_type TEXT,                   -- close/BTC order (null until a close fills)
+    close_limit_price REAL,
+    close_bid       REAL,
+    close_ask       REAL,
+    close_mid       REAL,
+    close_time_in_force TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_journal_occ_status ON trade_journal(occ_symbol, status);
 
@@ -200,7 +228,13 @@ CREATE TABLE IF NOT EXISTS tax_reserve (
     ref_id          TEXT,
     status          TEXT NOT NULL,            -- filled | skipped | dry_run | failed
     error           TEXT,
-    meta            TEXT NOT NULL DEFAULT '{}'
+    meta            TEXT NOT NULL DEFAULT '{}',
+    order_type      TEXT,
+    limit_price     REAL,
+    bid             REAL,
+    ask             REAL,
+    mid             REAL,
+    time_in_force   TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_reserve_period ON tax_reserve(period_end);
 
@@ -323,6 +357,47 @@ class Database:
             self.conn.execute("ALTER TABLE positions ADD COLUMN is_paper INTEGER")
         except sqlite3.OperationalError:
             pass  # column already present
+        # Quote/limit snapshot on every order path (additive; existing rows stay NULL).
+        for table, col, decl in (
+            ("orders", "bid", "REAL"),
+            ("orders", "ask", "REAL"),
+            ("orders", "mid", "REAL"),
+            ("orders", "time_in_force", "TEXT"),
+            ("trade_journal", "order_type", "TEXT"),
+            ("trade_journal", "limit_price", "REAL"),
+            ("trade_journal", "bid", "REAL"),
+            ("trade_journal", "ask", "REAL"),
+            ("trade_journal", "mid", "REAL"),
+            ("trade_journal", "time_in_force", "TEXT"),
+            ("trade_journal", "close_order_type", "TEXT"),
+            ("trade_journal", "close_limit_price", "REAL"),
+            ("trade_journal", "close_bid", "REAL"),
+            ("trade_journal", "close_ask", "REAL"),
+            ("trade_journal", "close_mid", "REAL"),
+            ("trade_journal", "close_time_in_force", "TEXT"),
+            ("entry_decisions", "order_type", "TEXT"),
+            ("entry_decisions", "limit_price", "REAL"),
+            ("entry_decisions", "bid", "REAL"),
+            ("entry_decisions", "ask", "REAL"),
+            ("entry_decisions", "mid", "REAL"),
+            ("entry_decisions", "time_in_force", "TEXT"),
+            ("decisions", "order_type", "TEXT"),
+            ("decisions", "limit_price", "REAL"),
+            ("decisions", "bid", "REAL"),
+            ("decisions", "ask", "REAL"),
+            ("decisions", "mid", "REAL"),
+            ("decisions", "time_in_force", "TEXT"),
+            ("tax_reserve", "order_type", "TEXT"),
+            ("tax_reserve", "limit_price", "REAL"),
+            ("tax_reserve", "bid", "REAL"),
+            ("tax_reserve", "ask", "REAL"),
+            ("tax_reserve", "mid", "REAL"),
+            ("tax_reserve", "time_in_force", "TEXT"),
+        ):
+            try:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # column already present
         # Replace the old UNIQUE(occ_symbol) index (which overwrote a closed trade when the same
         # contract was re-sold) with a non-unique one, so each open episode gets its own row.
         try:

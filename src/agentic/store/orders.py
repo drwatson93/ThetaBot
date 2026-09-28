@@ -14,6 +14,14 @@ from ..domain.models import Order
 from .db import Database
 
 
+def _col(r, key, default=None):
+    try:
+        v = r[key]
+    except (IndexError, KeyError):
+        return default
+    return default if v is None else v
+
+
 def _row_to_order(r) -> Order:
     return Order(
         id=r["id"],
@@ -31,6 +39,10 @@ def _row_to_order(r) -> Order:
         avg_fill_price=r["avg_fill_price"],
         status=OrderStatus(r["status"]),
         is_paper=bool(r["is_paper"]),
+        bid=_col(r, "bid"),
+        ask=_col(r, "ask"),
+        mid=_col(r, "mid"),
+        time_in_force=_col(r, "time_in_force"),
         submitted_at=datetime.fromisoformat(r["submitted_at"]) if r["submitted_at"] else None,
         last_status_at=datetime.fromisoformat(r["last_status_at"]) if r["last_status_at"] else None,
     )
@@ -47,14 +59,15 @@ class OrderStore:
             """INSERT OR IGNORE INTO orders
                  (id, decision_id, position_id, client_order_id, broker_order_id, option_id,
                   occ_symbol, side, order_type, quantity, limit_price, filled_qty, avg_fill_price,
-                  status, is_paper, submitted_at, last_status_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  status, is_paper, submitted_at, last_status_at, bid, ask, mid, time_in_force)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 o.id, o.decision_id, o.position_id, o.client_order_id, o.broker_order_id,
                 o.option_id, o.occ_symbol, o.side, o.order_type, o.quantity, o.limit_price,
                 o.filled_qty, o.avg_fill_price, o.status.value, 1 if o.is_paper else 0,
                 o.submitted_at.isoformat() if o.submitted_at else None,
                 o.last_status_at.isoformat() if o.last_status_at else None,
+                o.bid, o.ask, o.mid, o.time_in_force,
             ),
         )
         self.db.conn.commit()
@@ -65,13 +78,15 @@ class OrderStore:
         self.db.conn.execute(
             """UPDATE orders SET
                  broker_order_id = ?, status = ?, filled_qty = ?, avg_fill_price = ?,
-                 limit_price = ?, submitted_at = ?, last_status_at = ?
+                 limit_price = ?, submitted_at = ?, last_status_at = ?,
+                 bid = ?, ask = ?, mid = ?, time_in_force = ?
                WHERE client_order_id = ?""",
             (
                 o.broker_order_id, o.status.value, o.filled_qty, o.avg_fill_price,
                 o.limit_price,
                 o.submitted_at.isoformat() if o.submitted_at else None,
                 o.last_status_at.isoformat() if o.last_status_at else None,
+                o.bid, o.ask, o.mid, o.time_in_force,
                 o.client_order_id,
             ),
         )

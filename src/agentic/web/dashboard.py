@@ -19,6 +19,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from ..services.stats import compute_stats, position_rows
+from ..domain.order_pricing import public_close_pricing_fields, public_pricing_fields
 from .auth import require_auth
 from .calc_page import CALC_PAGE
 
@@ -88,6 +89,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             "status": d.status.value,
             "position_id": d.position_id,
             "decided_at": d.decided_at.isoformat() if d.decided_at else None,
+            **public_pricing_fields(d),
         } for d in ds]}
 
     @router.get("/api/audit")
@@ -390,6 +392,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             },
             "last_error": (
                 {"where": last_err["payload"].get("where"),
+                 "error": last_err["payload"].get("error"),
                  "root_causes": last_err["payload"].get("root_causes"),
                  "at": last_err["ts"]} if last_err else None
             ),
@@ -788,6 +791,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             "iv": j.iv, "premium": j.premium, "annualized_ror": j.annualized_ror,
             "status": j.status, "realized_pnl": j.realized_pnl, "days_held": j.days_held,
             "exit_reason": j.exit_reason,
+            **public_pricing_fields(j),
+            **public_close_pricing_fields(j),
         } for j in rows]}
 
     @router.get("/api/entry-decisions")
@@ -800,6 +805,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             "occ_symbol": d.occ_symbol, "strike": d.strike,
             "expiration": d.expiration.isoformat(), "contracts": d.contracts,
             "premium": d.premium, "status": d.status.value, "reason": d.reason,
+            **public_pricing_fields(d),
         } for d in ds]}
 
     @router.get("/", response_class=HTMLResponse)

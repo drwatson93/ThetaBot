@@ -105,6 +105,13 @@ class CloseDecision:
     created_at: datetime = field(default_factory=utcnow)
     decided_at: datetime | None = None
     expires_at: datetime | None = None
+    # Pricing snapshot of the close order actually submitted (null until then).
+    order_type: str | None = None
+    limit_price: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    mid: float | None = None
+    time_in_force: str | None = None
 
 
 @dataclass
@@ -125,6 +132,10 @@ class Order:
     filled_qty: int = 0
     avg_fill_price: float | None = None
     status: OrderStatus = OrderStatus.PENDING
+    bid: float | None = None             # NBBO bid at the moment the limit was priced
+    ask: float | None = None
+    mid: float | None = None
+    time_in_force: str | None = "gfd"    # Robinhood option/equity orders are good-for-day
     id: str = field(default_factory=_uuid)
     submitted_at: datetime | None = None
     last_status_at: datetime | None = None
@@ -152,6 +163,13 @@ class EntryDecision:
     id: str = field(default_factory=_uuid)
     created_at: datetime = field(default_factory=utcnow)
     decided_at: datetime | None = None
+    # Pricing snapshot of the sell-to-open actually submitted (null until then).
+    order_type: str | None = None
+    limit_price: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    mid: float | None = None
+    time_in_force: str | None = None
 
 
 @dataclass
@@ -181,12 +199,25 @@ class TradeJournalEntry:
     underlying_price: float | None = None
     context: dict[str, Any] = field(default_factory=dict)
     entry_decision_id: str | None = None
+    # entry order pricing snapshot (null on rows written before this existed)
+    order_type: str | None = None
+    limit_price: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    mid: float | None = None
+    time_in_force: str | None = None
     # outcome (backfilled at resolution)
     status: str = "open"                 # open | win | loss | expired | assigned | called_away
     realized_pnl: float | None = None
     close_price: float | None = None
     days_held: int | None = None
     exit_reason: str | None = None
+    close_order_type: str | None = None
+    close_limit_price: float | None = None
+    close_bid: float | None = None
+    close_ask: float | None = None
+    close_mid: float | None = None
+    close_time_in_force: str | None = None
     entered_at: datetime = field(default_factory=utcnow)
     closed_at: datetime | None = None
     id: str = field(default_factory=_uuid)
