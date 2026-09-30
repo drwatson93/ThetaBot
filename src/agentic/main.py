@@ -18,6 +18,7 @@ from .marketdata.earnings import build_earnings_provider
 from .marketdata.company_data import build_company_data
 from .marketdata.news import build_news_provider
 from .notify.factory import build_notifier
+from .notify.trade_alerts import TradeAlerts
 from .rules.engine import RulesEngine
 from .services.approval import ApprovalGate
 from .services.executor import OrderExecutor
@@ -68,7 +69,7 @@ def build_web_server(settings, signals, killswitch, approval_gate, audit,
                      positions, orders, decisions, entry_decisions, scanner, trade_journal,
                      tv_indicators=None, ai_reviews=None, notifier=None, entry_candidates=None,
                      news=None, briefs=None, tax_reserve=None, tax_reserve_store=None,
-                     practice=None):
+                     practice=None, trade_alerts=None):
     """Build a uvicorn Server for the control/webhook/dashboard API, or None if disabled."""
     if not settings.web.enabled:
         log.info("Web API disabled (web.enabled=false).")
@@ -97,7 +98,7 @@ def build_web_server(settings, signals, killswitch, approval_gate, audit,
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
         entry_candidates=entry_candidates, news=news, briefs=briefs,
         tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
-        practice=practice,
+        practice=practice, trade_alerts=trade_alerts,
     )
     app = create_app(deps)
     config = uvicorn.Config(
@@ -149,10 +150,12 @@ async def main_async(config_path: str | None = None) -> None:
             "health: robinhood_connected=false — practice fills will not see real chains."
         )
     notifier = build_notifier(settings)
+    trade_alerts = TradeAlerts(db, audit, settings)
     rules_engine = RulesEngine.from_configs(settings.rules)
     executor = OrderExecutor(
         settings, broker, market_data, positions, orders, decisions, audit, killswitch,
         notifier=notifier, entry_decisions=entry_decisions, trade_journal=trade_journal,
+        trade_alerts=trade_alerts,
     )
     scanner = OpportunityScanner(
         settings, broker, market_data, entry_decisions, executor, audit, killswitch,
@@ -226,7 +229,7 @@ async def main_async(config_path: str | None = None) -> None:
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
         entry_candidates=entry_candidates, news=news, briefs=briefs,
         tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
-        practice=practice,
+        practice=practice, trade_alerts=trade_alerts,
     )
 
     reporting = ReportingLoop(

@@ -5,6 +5,8 @@
   POST /control/pause                    -> engage the kill switch (Basic + CONTROL_TOKEN)
   POST /control/pause-only               -> engage the kill switch (PAUSE_TOKEN only)
   POST /control/resume                   -> release it (Basic + CONTROL_TOKEN)
+  POST /control/alerts-mode              -> set instant|regular|off (Basic + CONTROL_TOKEN)
+  POST /control/test-alert               -> send one test webhook (Basic + CONTROL_TOKEN)
   GET  /control/status                   -> current control state
 
 These are POSTed by the notification action buttons. They are protected only by the
@@ -134,6 +136,36 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             return JSONResponse({"status": "unauthorized"}, status_code=401)
         deps.killswitch.resume(reason)
         return JSONResponse({"status": "resumed", "reason": reason})
+
+    @router.post("/alerts-mode", dependencies=[Depends(require_auth)])
+    async def alerts_mode(mode: str = "instant", token: str | None = None) -> JSONResponse:
+        """Owner-only: persist alerts mode (instant | regular | off). PAUSE_TOKEN cannot."""
+        if not _control_authorized(token):
+            return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
+        from ..notify.trade_alerts import VALID_MODES, alerts_from_deps
+        wanted = (mode or "").strip().lower()
+        if wanted not in VALID_MODES:
+            return JSONResponse(
+                {"ok": False, "error": "mode must be instant, regular, or off",
+                 "valid": list(VALID_MODES)},
+                status_code=400,
+            )
+        al = alerts_from_deps(deps)
+        al.set_mode(wanted, source="control")
+        return JSONResponse({"ok": True, "alerts": al.status()})
+
+    @router.post("/test-alert", dependencies=[Depends(require_auth)])
+    async def test_alert(token: str | None = None) -> JSONResponse:
+        """Owner-only: send one clearly labeled test webhook. PAUSE_TOKEN cannot."""
+        if not _control_authorized(token):
+            return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
+        from ..notify.trade_alerts import alerts_from_deps
+        al = alerts_from_deps(deps)
+        result = await al.send_test()
+        body = {"ok": result["ok"], "alerts": al.status()}
+        if result.get("error"):
+            body["error"] = result["error"]
+        return JSONResponse(body)
 
     @router.post("/test-notify", dependencies=[Depends(require_auth)])
     async def test_notify() -> JSONResponse:
@@ -285,11 +317,13 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
 
     @router.get("/status", dependencies=[Depends(require_auth)])
     async def status() -> dict:
+        from ..notify.trade_alerts import alerts_from_deps
         return {
             "paused": deps.killswitch.is_paused(),
             "reason": deps.killswitch.reason(),
             "mode": deps.settings.mode,
             "live_armed": deps.settings.is_live,
+            "alerts": alerts_from_deps(deps).status(),
         }
 
     @router.get("/broker-status", dependencies=[Depends(require_auth)])
