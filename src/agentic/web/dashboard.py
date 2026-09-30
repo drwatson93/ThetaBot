@@ -27,6 +27,11 @@ if TYPE_CHECKING:
     from .app import WebDeps
 
 
+def _alerts_status(deps: "WebDeps") -> dict:
+    from ..notify.trade_alerts import alerts_from_deps
+    return alerts_from_deps(deps).status()
+
+
 def _sector_exposure(positions, riskcfg, account_value):
     """Current short-put collateral grouped by sector — a concentration signal for the tactical read.
     Filters to open positions, then reuses risk_breaker.sector_exposure so the math never drifts."""
@@ -397,6 +402,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                  "at": last_err["ts"]} if last_err else None
             ),
             "tv_health": tvh,
+            "alerts": _alerts_status(deps),
         }
 
     @router.get("/api/refinement-export")
@@ -823,7 +829,12 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
     @router.get("/api/rules")
     async def api_rules() -> dict:
         from .rules_view import describe_active_rules
-        return {"rules": describe_active_rules(deps.settings)}
+        from ..notify.trade_alerts import alerts_from_deps
+        al = alerts_from_deps(deps)
+        return {"rules": describe_active_rules(
+            deps.settings, alerts_mode=al.mode(),
+            webhook_configured=al.webhook_configured(),
+        )}
 
     @router.get("/rules", response_class=HTMLResponse)
     async def rules_page() -> str:
@@ -901,6 +912,8 @@ _PAGE = """<!doctype html>
   .chip b{color:var(--ink);font-weight:650}
   .chip.good{color:var(--pos);background:var(--pos-bg);border-color:transparent}
   .chip.warn{color:var(--warn);background:var(--warn-bg);border-color:transparent}
+  .seg{display:flex;gap:4px;flex-wrap:wrap}
+  .seg .rbtn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
   .ribbon-note{border-top:1px dashed var(--line);padding:9px 18px;font-size:12.5px;color:var(--muted);background:var(--raise)}
   /* layout */
   .grid{display:grid;grid-template-columns:1fr 300px;gap:16px;align-items:start}
@@ -1127,6 +1140,26 @@ _PAGE = """<!doctype html>
       <section class="card2">
         <div class="card-h"><h2>Overall</h2><span class="count">all-time · real trades</span></div>
         <div id="week"></div>
+      </section>
+      <section class="card2" id="alerts-card">
+        <div class="card-h"><h2>Trade alerts</h2><span class="count" id="al-note"></span></div>
+        <div class="ctl">
+          <div class="ctl-lab">Mode</div>
+          <div class="seg" id="al-modes">
+            <button class="rbtn" type="button" data-mode="instant">Instant</button>
+            <button class="rbtn" type="button" data-mode="regular">Regular</button>
+            <button class="rbtn" type="button" data-mode="off">Off</button>
+          </div>
+          <div class="hint">Instant: ThetaBot POSTs each fill to TRADE_ALERT_URL the moment it records it. Regular and Off: ThetaBot sends nothing; the watcher bot reads this mode. Owner-only (CONTROL_TOKEN). Pause token cannot change this.</div>
+          <div class="ctl-lab" style="margin-top:12px">Owner token</div>
+          <div class="row">
+            <input class="f" id="al-token" type="password" placeholder="CONTROL_TOKEN" autocomplete="off"/>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button class="go" type="button" id="al-test">Send test alert</button>
+          </div>
+          <div class="say" id="al-say"></div>
+        </div>
       </section>
       <section class="card2" id="reserve-card">
         <div class="card-h"><h2>Tax reserve</h2><span class="count" id="rsv-note"></span></div>
@@ -1461,6 +1494,9 @@ async function loadConn(){
   }
   try { bs = await getJSON("/control/broker-status"); } catch(e){ bs = {ok:false}; }
   let sc = null; try { sc = await getJSON("/api/scan-status"); } catch(e){ sc = null; }
+  const al = st.alerts || {};
+  const alLabel = al.mode==="instant" ? "Alerts instant" : (al.mode==="regular" ? "Alerts regular" : (al.mode==="off" ? "Alerts off" : ""));
+  const alChip = alLabel ? `<span class="chip ${al.mode==="instant"&&al.webhook_configured?"good":""}">${esc(alLabel)}</span>` : "";
   const paper = bs.is_paper === true, live = st.mode === "live";
   let scanChip = "";
   if(sc){
@@ -1480,6 +1516,7 @@ async function loadConn(){
     <div class="chips">
       <span class="chip ${live?"good":""}">${live?"Live trading armed":"Paper mode"}</span>
       <span class="chip ${st.paused?"warn":""}">${st.paused?"⏸ Paused":"Running"}</span>
+      ${alChip}
       ${scanChip}
       ${bs.buying_power!=null?`<span class="chip">Buying power <b>${money(bs.buying_power)}</b></span>`:""}
       ${bs.open_positions!=null?`<span class="chip">${bs.open_positions} open</span>`:""}
@@ -1488,6 +1525,84 @@ async function loadConn(){
     ? `<b style="color:var(--neg)">Heads up:</b> the bot is not managing your real Robinhood positions right now.`
     : `This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.`;
   const nd=$("nav-status"); if(nd) nd.className="nav-dot "+(klass||"good");
+  renderAlerts(al);
+}
+
+function ownerToken(){
+  const el = $("al-token");
+  const typed = el && el.value ? el.value.trim() : "";
+  if(typed){
+    try{ sessionStorage.setItem("tb_control_token", typed); }catch(e){}
+    return typed;
+  }
+  try{ return sessionStorage.getItem("tb_control_token") || ""; }catch(e){ return ""; }
+}
+function renderAlerts(a){
+  if(!a) return;
+  document.querySelectorAll("#al-modes .rbtn").forEach(b => {
+    b.classList.toggle("on", b.dataset.mode === a.mode);
+  });
+  const note = $("al-note");
+  if(note){
+    const cfg = a.webhook_configured ? "webhook configured" : "webhook not configured";
+    let last = a.last_status ? (" · last " + a.last_status) : "";
+    if(a.last_error) last += " — " + a.last_error;
+    note.textContent = (a.mode || "?") + " · " + cfg + last;
+  }
+}
+async function loadAlerts(){
+  const tokEl = $("al-token");
+  if(tokEl && !tokEl.value){
+    try{ const saved = sessionStorage.getItem("tb_control_token"); if(saved) tokEl.value = saved; }catch(e){}
+  }
+  try {
+    const st = await getJSON("/control/status");
+    renderAlerts(st.alerts || {});
+  } catch(e){}
+}
+async function setAlertMode(mode){
+  const say = $("al-say");
+  const tok = ownerToken();
+  if(!tok){
+    if(say){ say.className = "say err"; say.textContent = "Enter CONTROL_TOKEN to change alerts."; }
+    return;
+  }
+  try {
+    const r = await fetch("/control/alerts-mode?token="+encodeURIComponent(tok)+"&mode="+encodeURIComponent(mode), {method:"POST", credentials:"same-origin"});
+    const d = await r.json();
+    if(!r.ok || !d.ok){
+      if(say){ say.className = "say err"; say.textContent = d.error || d.status || ("HTTP "+r.status); }
+      return;
+    }
+    renderAlerts(d.alerts || {});
+    if(say){ say.className = "say ok"; say.textContent = "Alerts mode set to " + mode + "."; }
+  } catch(e){
+    if(say){ say.className = "say err"; say.textContent = "Could not change alerts mode."; }
+  }
+}
+async function sendTestAlert(){
+  const say = $("al-say");
+  const tok = ownerToken();
+  if(!tok){
+    if(say){ say.className = "say err"; say.textContent = "Enter CONTROL_TOKEN to send a test alert."; }
+    return;
+  }
+  if(say){ say.className = "say"; say.textContent = "Sending test alert…"; }
+  try {
+    const r = await fetch("/control/test-alert?token="+encodeURIComponent(tok), {method:"POST", credentials:"same-origin"});
+    const d = await r.json();
+    if(d.alerts) renderAlerts(d.alerts);
+    if(!r.ok){
+      if(say){ say.className = "say err"; say.textContent = d.error || d.status || ("HTTP "+r.status); }
+      return;
+    }
+    if(say){
+      say.className = d.ok ? "say ok" : "say err";
+      say.textContent = d.ok ? "Test alert sent." : (d.error || "Test alert failed.");
+    }
+  } catch(e){
+    if(say){ say.className = "say err"; say.textContent = "Could not send test alert."; }
+  }
 }
 
 /* ---- holdings (plain english) ---- */
@@ -2143,7 +2258,7 @@ async function loadAll(){
                            [loadQuality,"quality"],[loadSetups,"setups"],[loadSetupAccuracy,"setupacc"],
                            [loadRiskProfile,"riskprofile"],[loadRegimeStatus,"regime"],
                            [loadReserve,"reserve"],[loadTiers,"tiers"],[loadTables,"tables"],
-                           [loadRules,"rules"]]) {
+                           [loadRules,"rules"],[loadAlerts,"alerts"]]) {
     try { await fn(); } catch(e){ console.error(name, e); }
   }
   lastLoad = Date.now();
@@ -2156,6 +2271,10 @@ function tickAgo(){
 $("brief-run").onclick = generateBrief;
 $("brief-list").onchange = (e) => openSavedBrief(e.target.value);
 loadBriefList().catch(e=>console.error("briefs",e));
+document.querySelectorAll("#al-modes .rbtn").forEach(b => {
+  b.onclick = () => setAlertMode(b.dataset.mode);
+});
+$("al-test").onclick = sendTestAlert;
 $("scr-run").onclick = runScreen;
 $("scr-scan").onclick = runScan;
 $("wl-add").onclick = addTicker;

@@ -4,7 +4,7 @@ Auth is ACTIVE only when ``DASHBOARD_PASSWORD`` is set (env / Coolify secret); o
 dependency is a no-op so local dev and tests run open. Username defaults to ``admin`` and can
 be overridden with ``DASHBOARD_USER``. Comparisons are constant-time.
 
-Applied to: /dashboard, /, /api/*, and /control/status|pause|resume. NOT applied to /health
+Applied to: /dashboard, /, /api/*, and /control/status|pause|resume|alerts-mode|test-alert. NOT applied to /health
 (Coolify healthcheck), /webhook/tradingview (own shared-secret token), the UUID-guarded
 /control/approve|reject links (so phone notification taps keep working), or
 /control/pause-only (PAUSE_TOKEN only; fail-closed pause).

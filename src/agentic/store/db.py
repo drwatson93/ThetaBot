@@ -309,12 +309,16 @@ CREATE TABLE IF NOT EXISTS news_items (
 );
 CREATE INDEX IF NOT EXISTS idx_news_symbol_created ON news_items(symbol, created_at);
 
--- single-row control table for the kill switch / global pause
+-- single-row control table for the kill switch / global pause + alerts mode
 CREATE TABLE IF NOT EXISTS control (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     paused  INTEGER NOT NULL DEFAULT 0,
     reason  TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    alerts_mode TEXT NOT NULL DEFAULT 'instant',
+    alerts_last_sent_at TEXT,
+    alerts_last_status TEXT,
+    alerts_last_error TEXT
 );
 INSERT OR IGNORE INTO control (id, paused) VALUES (1, 0);
 """
@@ -393,6 +397,10 @@ class Database:
             ("tax_reserve", "ask", "REAL"),
             ("tax_reserve", "mid", "REAL"),
             ("tax_reserve", "time_in_force", "TEXT"),
+            ("control", "alerts_mode", "TEXT NOT NULL DEFAULT 'instant'"),
+            ("control", "alerts_last_sent_at", "TEXT"),
+            ("control", "alerts_last_status", "TEXT"),
+            ("control", "alerts_last_error", "TEXT"),
         ):
             try:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import Any
 
 from ..config import Settings
 from ..brokers.base import ExecutionBroker
@@ -121,6 +122,7 @@ class OrderExecutor:
         notifier: Notifier | None = None,
         entry_decisions: EntryDecisionStore | None = None,
         trade_journal: TradeJournalStore | None = None,
+        trade_alerts: Any | None = None,
         *,
         poll_interval_seconds: float = 2.0,
     ):
@@ -135,6 +137,7 @@ class OrderExecutor:
         self.notifier = notifier
         self.entry_decisions = entry_decisions
         self.trade_journal = trade_journal
+        self.trade_alerts = trade_alerts
         self.poll_interval = poll_interval_seconds
 
     async def execute_close(
@@ -255,6 +258,7 @@ class OrderExecutor:
                 decision_id=decision.id, order_id=final.id,
             )
             self._journal_outcome(position, final, decision.rule_name)
+            self._alert_close(position, final)
             tag = "(paper)" if final.is_paper else "(LIVE)"
             await self._notify(
                 f"Closed {position.underlying} {tag}",
@@ -403,6 +407,7 @@ class OrderExecutor:
                  "avg_fill_price": final.avg_fill_price, "is_paper": final.is_paper},
                 source="executor", decision_id=decision.id, order_id=final.id,
             )
+            self._alert_open(decision, final)
             tag = "(paper)" if final.is_paper else "(LIVE)"
             await self._notify(
                 f"Opened CSP {decision.underlying} {tag}",
@@ -428,6 +433,7 @@ class OrderExecutor:
                     {"open": True, "occ": decision.occ_symbol, "confirmed_via": "position_read"},
                     source="executor", decision_id=decision.id, order_id=final.id,
                 )
+                self._alert_open(decision, final)
                 await self._notify(
                     f"Opened CSP {decision.underlying} (LIVE)",
                     f"{decision.occ_symbol}: fill confirmed via position read (order-state lagged).",
@@ -722,6 +728,30 @@ class OrderExecutor:
     async def _notify(self, title: str, message: str, *, priority: str = "normal") -> None:
         if self.notifier is not None:
             await self.notifier.send(title, message, priority=priority)
+
+    def _alert_open(self, decision: EntryDecision, order: Order) -> None:
+        """Post-fill hook: never raises, never blocks the trading path."""
+        if self.trade_alerts is None:
+            return
+        try:
+            from ..notify.trade_alerts import build_open_payload
+            self.trade_alerts.notify_fill(
+                build_open_payload(decision, order, mode=self.settings.mode)
+            )
+        except Exception:  # noqa: BLE001 — alerts must never break a fill
+            log.warning("trade alert hook failed")
+
+    def _alert_close(self, position: Position, order: Order) -> None:
+        """Post-fill hook: never raises, never blocks the trading path."""
+        if self.trade_alerts is None:
+            return
+        try:
+            from ..notify.trade_alerts import build_close_payload
+            self.trade_alerts.notify_fill(
+                build_close_payload(position, order, mode=self.settings.mode)
+            )
+        except Exception:  # noqa: BLE001 — alerts must never break a fill
+            log.warning("trade alert hook failed")
 
     def _journal_outcome(self, position: Position, close_order: Order, exit_reason: str) -> None:
         """Backfill the open trade-journal row for this position with realized outcome."""

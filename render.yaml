@@ -41,6 +41,8 @@ services:
         generateValue: true
       - key: PAUSE_TOKEN
         sync: false
+      - key: TRADE_ALERT_URL
+        sync: false
       - key: RH_OAUTH_JSON
         sync: false
       - key: PUSHOVER_TOKEN

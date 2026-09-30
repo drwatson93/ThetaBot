@@ -52,6 +52,7 @@ class WebDeps:
     tax_reserve: Any | None = None   # services.tax_reserve.TaxReserveLoop (status for the dashboard)
     tax_reserve_store: Any | None = None  # store.tax_reserve.TaxReserveStore
     practice: dict | None = None     # paper-runtime snapshot (data source + RH connect)
+    trade_alerts: Any | None = None  # notify.trade_alerts.TradeAlerts
 
 
 def create_app(deps: WebDeps) -> FastAPI:
