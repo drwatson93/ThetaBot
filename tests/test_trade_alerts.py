@@ -17,8 +17,8 @@ from agentic.domain.enums import (
 from agentic.domain.models import EntryDecision, Order, Position
 from agentic.notify import trade_alerts as ta_mod
 from agentic.notify.trade_alerts import (
-    TradeAlerts, build_close_payload, build_open_payload, format_close_line,
-    format_open_line, sanitize_error,
+    INVALID_HEADER_NAME_ERROR, TradeAlerts, build_close_payload,
+    build_open_payload, format_close_line, format_open_line, sanitize_error,
 )
 from agentic.services.executor import OrderExecutor
 from agentic.services.killswitch import KillSwitch
@@ -565,3 +565,78 @@ def test_auth_header_never_in_status_output(tmp_path, monkeypatch):
         assert HOOK not in blob
     assert HEADER_VALUE not in json.dumps(st)
     assert HEADER_NAME not in json.dumps(st)
+
+
+FULL_HEADER_LINE_KEY = "rh_whsec_prod_abc123XYZ"
+FULL_HEADER_LINE = f"Authorization: Bearer {FULL_HEADER_LINE_KEY}"
+
+
+def test_invalid_header_name_full_line_does_not_send(tmp_path, monkeypatch):
+    """Owner pasted 'Authorization: Bearer <key>' into TRADE_ALERT_HEADER_NAME."""
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", FULL_HEADER_LINE)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
+    captured = _capture_urlopen(monkeypatch)
+    alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
+    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert captured == []
+    st = alerts.status()
+    assert st["auth_header_configured"] is False
+    assert st["last_status"] == "error"
+    assert st["last_error"] == INVALID_HEADER_NAME_ERROR
+    assert FULL_HEADER_LINE_KEY not in (st["last_error"] or "")
+    assert FULL_HEADER_LINE not in (st["last_error"] or "")
+    assert "Bearer" not in (st["last_error"] or "")
+
+
+def test_invalid_header_name_error_never_on_ops(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADE_ALERT_URL", HOOK)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", FULL_HEADER_LINE)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
+    client, alerts, _ = _client(tmp_path, monkeypatch)
+    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    for path in ("/api/ops", "/control/status"):
+        body = client.get(path).json()
+        assert body["alerts"]["auth_header_configured"] is False
+        assert body["alerts"]["last_error"] == INVALID_HEADER_NAME_ERROR
+        blob = json.dumps(body)
+        assert FULL_HEADER_LINE_KEY not in blob
+        assert FULL_HEADER_LINE not in blob
+        assert HEADER_VALUE not in blob
+
+
+def test_sanitize_error_redacts_header_name_and_urllib_valueerror(monkeypatch):
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", FULL_HEADER_LINE)
+    monkeypatch.delenv("TRADE_ALERT_HEADER_VALUE", raising=False)
+    urllib_exc = ValueError(f"Invalid header name b'{FULL_HEADER_LINE}'")
+    err = sanitize_error(urllib_exc)
+    assert FULL_HEADER_LINE_KEY not in err
+    assert FULL_HEADER_LINE not in err
+    assert "rh_whsec_prod" not in err
+    assert "[redacted]" in err
+
+
+def test_sanitize_error_redacts_bearer_and_colon_tokens_without_env(monkeypatch):
+    monkeypatch.delenv("TRADE_ALERT_HEADER_NAME", raising=False)
+    monkeypatch.delenv("TRADE_ALERT_HEADER_VALUE", raising=False)
+    secret = "sk_live_orphan_token_should_never_leak"
+    err = sanitize_error(
+        ValueError(f"Invalid header name b'Authorization: Bearer {secret}'")
+    )
+    assert secret not in err
+    assert "sk_live_orphan" not in err
+    colon_err = sanitize_error(ValueError(f"Invalid header name b'X-Api-Key: {secret}'"))
+    assert secret not in colon_err
+    assert "sk_live_orphan" not in colon_err
+
+
+@pytest.mark.asyncio
+async def test_invalid_header_name_blocks_test_alert(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", FULL_HEADER_LINE)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
+    captured = _capture_urlopen(monkeypatch)
+    alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
+    result = await alerts.send_test()
+    assert captured == []
+    assert result["ok"] is False
+    assert result["error"] == INVALID_HEADER_NAME_ERROR
+    assert FULL_HEADER_LINE_KEY not in json.dumps(result)

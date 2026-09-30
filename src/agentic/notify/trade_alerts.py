@@ -27,7 +27,15 @@ log = logging.getLogger("agentic.notify.trade_alerts")
 VALID_MODES = ("instant", "regular", "off")
 DEFAULT_MODE = "instant"
 HTTP_TIMEOUT_S = 3.0
+INVALID_HEADER_NAME_ERROR = (
+    "TRADE_ALERT_HEADER_NAME is not a valid header name "
+    "(use just the name, e.g. Authorization)"
+)
+# RFC 7230 §3.2.6 token / tchar — header names only; no colon, space, or controls.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+\S+")
+_COLON_TOKEN_RE = re.compile(r":\s*\S+")
 _SIDES = {
     "SELL_TO_OPEN": "STO",
     "BUY_TO_CLOSE": "BTC",
@@ -71,30 +79,57 @@ def _header_secret() -> str | None:
     return raw.strip()
 
 
+def _is_rfc7230_token(name: str) -> bool:
+    return bool(name) and _HEADER_NAME_RE.fullmatch(name) is not None
+
+
+def _invalid_header_name_error() -> str | None:
+    """Fixed, secret-free error when NAME is set but is not an RFC 7230 token."""
+    name_raw = get_secret("TRADE_ALERT_HEADER_NAME")
+    if not is_usable_secret(name_raw):
+        return None
+    if _is_rfc7230_token(name_raw.strip()):
+        return None
+    return INVALID_HEADER_NAME_ERROR
+
+
 def _auth_header() -> tuple[str, str] | None:
-    """(name, value) when both env vars are set; otherwise None. Never log the value."""
+    """(name, value) when both env vars are set and NAME is valid. Never log the value."""
     name_raw = get_secret("TRADE_ALERT_HEADER_NAME")
     value = _header_secret()
     if not is_usable_secret(name_raw) or value is None:
         return None
-    return name_raw.strip(), value
+    name = name_raw.strip()
+    if not _is_rfc7230_token(name):
+        return None
+    return name, value
 
 
 def auth_header_configured() -> bool:
-    """True when both sender-key header env vars are set. Never returns the value."""
+    """True when both sender-key header env vars are set and NAME is valid."""
     return _auth_header() is not None
 
 
+def _redact_env_value(detail: str, raw: str | None) -> str:
+    if not raw:
+        return detail
+    if raw in detail:
+        detail = detail.replace(raw, "[redacted]")
+    stripped = raw.strip()
+    if stripped and stripped != raw:
+        detail = detail.replace(stripped, "[redacted]")
+    return detail
+
+
 def sanitize_error(exc: BaseException, url: str | None = None) -> str:
-    """Exception text with any URL (including the webhook) and header value stripped."""
+    """Exception text with webhook URL, header name/value, and key-like tokens stripped."""
     detail = str(exc) or ""
     if url:
         detail = detail.replace(url, "[redacted]")
-    raw_header = get_secret("TRADE_ALERT_HEADER_VALUE")
-    if is_usable_secret(raw_header):
-        for piece in {raw_header, raw_header.strip()}:
-            if piece:
-                detail = detail.replace(piece, "[redacted]")
+    detail = _redact_env_value(detail, get_secret("TRADE_ALERT_HEADER_VALUE"))
+    detail = _redact_env_value(detail, get_secret("TRADE_ALERT_HEADER_NAME"))
+    detail = _BEARER_TOKEN_RE.sub("Bearer [redacted]", detail)
+    detail = _COLON_TOKEN_RE.sub(": [redacted]", detail)
     detail = _URL_RE.sub("[redacted]", detail).strip()
     msg = type(exc).__name__ if not detail else f"{type(exc).__name__}: {detail}"
     return msg[:400]
@@ -322,6 +357,9 @@ def _http_post(url: str, payload: dict[str, Any], timeout: float = HTTP_TIMEOUT_
 
 def _deliver(url: str, payload: dict[str, Any]) -> tuple[bool, str | None]:
     """POST once, then one retry. Returns (ok, sanitized_error). Never raises."""
+    header_err = _invalid_header_name_error()
+    if header_err:
+        return False, header_err
     last_err: str | None = None
     for _attempt in range(2):
         try:
