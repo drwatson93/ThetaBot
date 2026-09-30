@@ -43,6 +43,10 @@ services:
         sync: false
       - key: TRADE_ALERT_URL
         sync: false
+      - key: TRADE_ALERT_HEADER_NAME
+        sync: false
+      - key: TRADE_ALERT_HEADER_VALUE
+        sync: false
       - key: RH_OAUTH_JSON
         sync: false
       - key: PUSHOVER_TOKEN

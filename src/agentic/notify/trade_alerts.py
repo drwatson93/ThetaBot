@@ -2,7 +2,8 @@
 
 Fires after ThetaBot records an open/close fill. Never on the trading path:
 background thread, ~3s timeout, one retry, all failures swallowed/logged.
-The webhook URL (TRADE_ALERT_URL) is never logged, printed, or returned.
+The webhook URL (TRADE_ALERT_URL) and optional sender-key header value
+(TRADE_ALERT_HEADER_VALUE) are never logged, printed, or returned.
 """
 from __future__ import annotations
 
@@ -63,11 +64,37 @@ def _webhook_url() -> str | None:
     return raw.strip()
 
 
+def _header_secret() -> str | None:
+    raw = get_secret("TRADE_ALERT_HEADER_VALUE")
+    if not is_usable_secret(raw):
+        return None
+    return raw.strip()
+
+
+def _auth_header() -> tuple[str, str] | None:
+    """(name, value) when both env vars are set; otherwise None. Never log the value."""
+    name_raw = get_secret("TRADE_ALERT_HEADER_NAME")
+    value = _header_secret()
+    if not is_usable_secret(name_raw) or value is None:
+        return None
+    return name_raw.strip(), value
+
+
+def auth_header_configured() -> bool:
+    """True when both sender-key header env vars are set. Never returns the value."""
+    return _auth_header() is not None
+
+
 def sanitize_error(exc: BaseException, url: str | None = None) -> str:
-    """Exception text with any URL (including the webhook) stripped."""
+    """Exception text with any URL (including the webhook) and header value stripped."""
     detail = str(exc) or ""
     if url:
         detail = detail.replace(url, "[redacted]")
+    raw_header = get_secret("TRADE_ALERT_HEADER_VALUE")
+    if is_usable_secret(raw_header):
+        for piece in {raw_header, raw_header.strip()}:
+            if piece:
+                detail = detail.replace(piece, "[redacted]")
     detail = _URL_RE.sub("[redacted]", detail).strip()
     msg = type(exc).__name__ if not detail else f"{type(exc).__name__}: {detail}"
     return msg[:400]
@@ -282,6 +309,11 @@ def _http_post(url: str, payload: dict[str, Any], timeout: float = HTTP_TIMEOUT_
         },
         method="POST",
     )
+    extra = _auth_header()
+    if extra:
+        # Set after construction so the configured name is sent verbatim
+        # (Request.add_header would .capitalize() it).
+        req.headers[extra[0]] = extra[1]
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         status = getattr(resp, "status", None)
         if status is not None and int(status) >= 400:
@@ -338,6 +370,7 @@ class TradeAlerts:
             "mode": (row["alerts_mode"] if row and row["alerts_mode"] in VALID_MODES
                      else DEFAULT_MODE),
             "webhook_configured": self.webhook_configured(),
+            "auth_header_configured": auth_header_configured(),
             "last_sent_at": row["alerts_last_sent_at"] if row else None,
             "last_status": row["alerts_last_status"] if row else None,
             "last_error": row["alerts_last_error"] if row else None,
