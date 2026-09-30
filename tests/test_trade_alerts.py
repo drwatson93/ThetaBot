@@ -1,7 +1,9 @@
 """Instant trade alerts: payload format, send gates, persistence, and owner-only auth."""
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from datetime import date
 from types import SimpleNamespace
 
@@ -363,3 +365,81 @@ def test_ops_last_error_untouched_by_alert_failure(tmp_path, monkeypatch):
     assert ops["last_error"] is None
     assert ops["alerts"]["last_status"] == "error"
     assert ops["alerts"]["last_error"]
+
+
+def _stamp_updated_at(db, stamp="2026-01-01T00:00:00+00:00"):
+    db.conn.execute("UPDATE control SET updated_at = ? WHERE id = 1", (stamp,))
+    db.conn.commit()
+    return stamp
+
+
+def test_set_mode_does_not_touch_updated_at(tmp_path, monkeypatch):
+    alerts, db, *_ = _alerts(tmp_path, monkeypatch)
+    stamp = _stamp_updated_at(db)
+    alerts.set_mode("off")
+    row = db.conn.execute("SELECT updated_at, alerts_mode FROM control WHERE id = 1").fetchone()
+    assert row["alerts_mode"] == "off"
+    assert row["updated_at"] == stamp
+
+
+def test_record_delivery_does_not_touch_updated_at(tmp_path, monkeypatch):
+    monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: None)
+    alerts, db, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
+    stamp = _stamp_updated_at(db)
+    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    row = db.conn.execute(
+        "SELECT updated_at, alerts_last_status FROM control WHERE id = 1"
+    ).fetchone()
+    assert row["alerts_last_status"] == "ok"
+    assert row["updated_at"] == stamp
+
+
+@pytest.mark.asyncio
+async def test_background_path_does_no_db_writes_off_loop_thread(tmp_path, monkeypatch):
+    """The HTTP worker must not execute/commit on the shared sqlite connection."""
+    bg_threads: set[int] = set()
+    db_threads: list[int] = []
+    started: list[threading.Thread] = []
+
+    alerts, db, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=True)
+    inner = db.conn
+
+    class TrackingConn:
+        def execute(self, *a, **k):
+            db_threads.append(threading.get_ident())
+            return inner.execute(*a, **k)
+
+        def commit(self):
+            db_threads.append(threading.get_ident())
+            return inner.commit()
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    db.conn = TrackingConn()
+
+    real_thread = ta_mod.threading.Thread
+
+    def capturing_thread(*a, **k):
+        t = real_thread(*a, **k)
+        started.append(t)
+        return t
+
+    monkeypatch.setattr(ta_mod.threading, "Thread", capturing_thread)
+    monkeypatch.setattr(
+        ta_mod, "_http_post",
+        lambda *a, **k: bg_threads.add(threading.get_ident()),
+    )
+
+    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert started
+    for t in started:
+        t.join(timeout=2)
+        assert not t.is_alive()
+    assert bg_threads
+    assert set(db_threads).isdisjoint(bg_threads)
+
+    await asyncio.sleep(0)  # run call_soon_threadsafe persist on the loop thread
+    assert alerts.status()["last_status"] == "ok"
+    assert set(db_threads).isdisjoint(bg_threads)
+    assert threading.get_ident() in db_threads

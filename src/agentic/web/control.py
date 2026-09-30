@@ -161,7 +161,7 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
         from ..notify.trade_alerts import alerts_from_deps
         al = alerts_from_deps(deps)
-        result = al.send_test()
+        result = await al.send_test()
         body = {"ok": result["ok"], "alerts": al.status()}
         if result.get("error"):
             body["error"] = result["error"]
