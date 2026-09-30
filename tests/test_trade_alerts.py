@@ -235,8 +235,10 @@ def test_alerts_status_on_ops_and_control(tmp_path, monkeypatch):
         assert body["alerts"]["mode"] == "instant"
         assert body["alerts"]["webhook_configured"] is True
         assert set(body["alerts"]) == {
-            "mode", "webhook_configured", "last_sent_at", "last_status", "last_error",
+            "mode", "webhook_configured", "auth_header_configured",
+            "last_sent_at", "last_status", "last_error",
         }
+        assert body["alerts"]["auth_header_configured"] is False
         blob = json.dumps(body)
         assert HOOK not in blob
         assert "secret.example" not in blob
@@ -443,3 +445,123 @@ async def test_background_path_does_no_db_writes_off_loop_thread(tmp_path, monke
     assert alerts.status()["last_status"] == "ok"
     assert set(db_threads).isdisjoint(bg_threads)
     assert threading.get_ident() in db_threads
+
+
+HEADER_NAME = "X-Webhook-Key"
+HEADER_VALUE = "Bearer super-secret-alert-key-xyz"
+
+
+def _capture_urlopen(monkeypatch):
+    captured: list = []
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _Resp()
+
+    monkeypatch.setattr(ta_mod.urllib.request, "urlopen", fake_urlopen)
+    return captured
+
+
+def _req_headers(req) -> dict[str, str]:
+    return dict(req.header_items())
+
+
+@pytest.mark.asyncio
+async def test_auth_header_sent_when_both_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", HEADER_NAME)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
+    captured = _capture_urlopen(monkeypatch)
+    alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
+    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    alerts.notify_fill(build_close_payload(*_close_position_order(), mode="paper"))
+    await alerts.send_test()
+    assert len(captured) == 3
+    events = []
+    for req in captured:
+        hdrs = _req_headers(req)
+        assert hdrs.get(HEADER_NAME) == HEADER_VALUE
+        events.append(json.loads(req.data.decode("utf-8"))["event"])
+    assert events == ["trade_open", "trade_close", "test"]
+
+
+@pytest.mark.parametrize("name,value", [
+    (None, None),
+    (HEADER_NAME, None),
+    (None, HEADER_VALUE),
+    ("", HEADER_VALUE),
+    (HEADER_NAME, ""),
+])
+def test_auth_header_not_sent_when_either_missing(tmp_path, monkeypatch, name, value):
+    if name is None:
+        monkeypatch.delenv("TRADE_ALERT_HEADER_NAME", raising=False)
+    else:
+        monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", name)
+    if value is None:
+        monkeypatch.delenv("TRADE_ALERT_HEADER_VALUE", raising=False)
+    else:
+        monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", value)
+    captured = _capture_urlopen(monkeypatch)
+    alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
+    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert len(captured) == 1
+    hdrs = _req_headers(captured[0])
+    assert HEADER_NAME not in hdrs
+    assert HEADER_VALUE not in hdrs.values()
+    assert alerts.status()["auth_header_configured"] is False
+
+
+def test_sanitize_error_redacts_header_value(monkeypatch):
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", HEADER_NAME)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
+    err = sanitize_error(OSError(f"401 invalid {HEADER_VALUE} for {HOOK}"), HOOK)
+    assert HEADER_VALUE not in err
+    assert "super-secret-alert-key" not in err
+    assert HOOK not in err
+    assert "[redacted]" in err
+
+
+def test_header_value_redacted_from_delivery_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", HEADER_NAME)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
+    monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: (_ for _ in ()).throw(
+        OSError(f"rejected key {HEADER_VALUE} at {HOOK}")
+    ))
+    alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
+    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    st = alerts.status()
+    assert st["last_status"] == "error"
+    assert HEADER_VALUE not in (st["last_error"] or "")
+    assert "super-secret-alert-key" not in (st["last_error"] or "")
+    assert HOOK not in (st["last_error"] or "")
+
+
+def test_auth_header_never_in_status_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADE_ALERT_URL", HOOK)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", HEADER_NAME)
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
+    client, alerts, _ = _client(tmp_path, monkeypatch)
+    st = alerts.status()
+    assert st["auth_header_configured"] is True
+    assert set(st) == {
+        "mode", "webhook_configured", "auth_header_configured",
+        "last_sent_at", "last_status", "last_error",
+    }
+    for path in ("/api/ops", "/control/status"):
+        body = client.get(path).json()
+        assert body["alerts"]["auth_header_configured"] is True
+        blob = json.dumps(body)
+        assert HEADER_VALUE not in blob
+        assert "super-secret-alert-key" not in blob
+        assert HEADER_NAME not in blob
+        assert HOOK not in blob
+    assert HEADER_VALUE not in json.dumps(st)
+    assert HEADER_NAME not in json.dumps(st)
