@@ -1,8 +1,12 @@
 """Stage 2 Increment 1: in-app settings editor — overlay persistence, hot-apply, guardrails."""
+import json
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
 from agentic.config import Settings, load_config, load_overlay, save_overlay
+from agentic.domain.enums import AuditEventType
 from agentic.entry.risk import RiskSizer
 from agentic.services.approval import ApprovalGate
 from agentic.services.executor import OrderExecutor
@@ -17,6 +21,9 @@ from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
 from agentic.web.settings import SettingsEditError, apply_patch
+
+CONTROL = "test-control-token-ok-long"
+PAUSE = "test-pause-token-ok-long"
 
 
 # --- apply_patch unit tests (the core logic) ---------------------------------------------------
@@ -137,18 +144,20 @@ def client(tmp_path, monkeypatch):
     signals = SignalStore(db)
     killswitch = KillSwitch(db, audit)
     settings = Settings(mode="paper", broker="paper", market_data="paper")
+    scanner = SimpleNamespace(settings=settings)  # same object the live scanner reads
     broker = PaperBroker(seed_positions=[])
     executor = OrderExecutor(settings, broker, PaperMarketData(), positions, orders,
                              decisions, audit, killswitch, poll_interval_seconds=0.001)
     approval_gate = ApprovalGate(settings, decisions, positions, executor, audit)
     deps = WebDeps(settings=settings, signals=signals, killswitch=killswitch,
                    approval_gate=approval_gate, audit=audit,
-                   positions=positions, orders=orders, decisions=decisions)
-    return TestClient(create_app(deps)), settings
+                   positions=positions, orders=orders, decisions=decisions,
+                   scanner=scanner)
+    return TestClient(create_app(deps)), settings, audit, scanner
 
 
 def test_get_config_returns_editable_and_readonly(client):
-    c, _ = client
+    c, *_ = client
     r = c.get("/api/config")
     assert r.status_code == 200
     body = r.json()
@@ -157,19 +166,72 @@ def test_get_config_returns_editable_and_readonly(client):
     assert body["readonly"]["live_armed"] is False
     # The dangerous knobs are reported read-only, never in the editable set.
     assert "mode" not in body["editable"]
+    assert body["from_overlay"] == []
+    assert body["overlay"] == {}
 
 
-def test_post_config_is_read_only(client):
-    c, settings = client
+def test_post_config_requires_control_token(client):
+    c, settings, *_ = client
     r = c.post("/api/config", json={"entry": {"watchlist": ["F", "SOFI", "T"]}})
-    assert r.status_code == 403
+    assert r.status_code == 401
+    assert r.json()["ok"] is False
+    assert r.json().get("status") == "unauthorized"
+    assert settings.entry.watchlist == []
+
+
+def test_post_config_rejects_pause_token(client, monkeypatch):
+    monkeypatch.setenv("PAUSE_TOKEN", PAUSE)
+    c, settings, *_ = client
+    r = c.post(f"/api/config?token={PAUSE}", json={"entry": {"watchlist": ["F"]}})
+    assert r.status_code == 401
     assert r.json()["ok"] is False
     assert settings.entry.watchlist == []
 
 
-def test_post_protected_edit_rejected(client):
-    c, settings = client
-    r = c.post("/api/config", json={"mode": "live"})
-    assert r.status_code == 403
+def test_post_config_owner_adds_ticker(client):
+    """Valid CONTROL_TOKEN hot-applies watchlist to the live scanner object and persists overlay."""
+    c, settings, audit, scanner = client
+    r = c.post(
+        f"/api/config?token={CONTROL}",
+        json={"entry": {"watchlist": ["AAPL"]}},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert settings.entry.watchlist == ["AAPL"]
+    assert scanner.settings.entry.watchlist == ["AAPL"]  # same Settings the scanner reads each cycle
+    saved = load_overlay()
+    assert saved["entry"]["watchlist"] == ["AAPL"]
+    assert "entry.watchlist" in body["from_overlay"]
+    assert body["overlay"]["entry"]["watchlist"] == ["AAPL"]
+    row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
+    assert row is not None
+    assert row["payload"]["changed"] == ["entry"]
+    assert row["payload"]["watchlist"] == {"old": [], "new": ["AAPL"]}
+    blob = json.dumps(row)
+    assert CONTROL not in blob
+    assert PAUSE not in blob
+
+
+@pytest.mark.parametrize("patch", [
+    {"mode": "live"},
+    {"broker": "robinhood_mcp"},
+])
+def test_post_protected_edit_rejected_even_with_control_token(client, patch):
+    c, settings, *_ = client
+    r = c.post(f"/api/config?token={CONTROL}", json=patch)
+    assert r.status_code == 400
     assert r.json()["ok"] is False
     assert settings.mode == "paper"
+    assert settings.broker == "paper"
+
+
+def test_dashboard_settings_use_control_token(client):
+    c, *_ = client
+    html = c.get("/").text
+    assert 'id="wl-token"' in html
+    assert 'id="tn-token"' in html
+    assert "Wrong CONTROL_TOKEN (unauthorized)." in html
+    assert "/api/config?token=" in html
+    assert "Dashboard is read-only. Edit config.yaml and restart." not in html
+    assert "from_overlay" in html

@@ -1217,8 +1217,13 @@ _PAGE = """<!doctype html>
           autocapitalize="characters" autocomplete="off"/>
         <button class="go" id="wl-add">Add</button>
       </div>
-      <div class="hint">Aim for 10–25 names you'd be happy to own. Changes apply live.</div>
-      <div class="say" id="wl-say"></div>
+          <div class="hint">Aim for 10–25 names you'd be happy to own. Changes apply live. Owner-only (CONTROL_TOKEN); pause token cannot change this. Overlay values on the data disk override config.yaml.</div>
+          <div class="ctl-lab" style="margin-top:12px">Owner token</div>
+          <div class="row">
+            <input class="f" id="wl-token" type="password" placeholder="CONTROL_TOKEN" autocomplete="off"/>
+          </div>
+          <div class="hint ov-note" id="wl-ov-note"></div>
+          <div class="say" id="wl-say"></div>
 
       <div class="ctl-lab" style="margin-top:16px">Weekly premium target</div>
       <div class="row">
@@ -1301,9 +1306,14 @@ _PAGE = """<!doctype html>
 
   <div class="tabpane" id="pane-tuning" hidden>
   <section class="card2">
-    <div class="card-h"><h2>Tuning</h2><span class="count">read-only</span></div>
-    <div class="hint">The dashboard no longer changes trading limits. See the <a href="/rules">Rules</a> page for the live values. Edits belong in <code>config.yaml</code>.</div>
+    <div class="card-h"><h2>Tuning</h2><span class="count">owner-only</span></div>
+    <div class="hint">Strategy knobs apply live and persist on the data-disk overlay (which overrides config.yaml). Owner-only: dashboard login + CONTROL_TOKEN. Pause token cannot change these. Mode, live-arming, and broker stay file-only.</div>
     <div class="ctl">
+      <div class="ctl-lab">Owner token</div>
+      <div class="row">
+        <input class="f" id="tn-token" type="password" placeholder="CONTROL_TOKEN" autocomplete="off"/>
+      </div>
+      <div class="hint ov-note" id="tn-ov-note"></div>
       <div class="ctl-lab">Tax reserve / gains sweep</div>
       <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-on"/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
       <div class="scr-filters">
@@ -1529,13 +1539,32 @@ async function loadConn(){
 }
 
 function ownerToken(){
-  const el = $("al-token");
-  const typed = el && el.value ? el.value.trim() : "";
-  if(typed){
-    try{ sessionStorage.setItem("tb_control_token", typed); }catch(e){}
-    return typed;
+  const ids = ["al-token","wl-token","tn-token"];
+  for(const id of ids){
+    const el = $(id);
+    const typed = el && el.value ? el.value.trim() : "";
+    if(typed){
+      try{ sessionStorage.setItem("tb_control_token", typed); }catch(e){}
+      ids.forEach(other => { const o=$(other); if(o && !o.value) o.value = typed; });
+      return typed;
+    }
   }
   try{ return sessionStorage.getItem("tb_control_token") || ""; }catch(e){ return ""; }
+}
+function fillOwnerTokenFields(){
+  let saved = "";
+  try{ saved = sessionStorage.getItem("tb_control_token") || ""; }catch(e){}
+  ["al-token","wl-token","tn-token"].forEach(id => {
+    const el = $(id);
+    if(el && !el.value && saved) el.value = saved;
+  });
+}
+function renderOverlaySource(cfg){
+  const paths = (cfg && cfg.from_overlay) || [];
+  const html = paths.length
+    ? ("Data-disk overlay overrides config.yaml for: <b>"+paths.map(esc).join(", ")+"</b>. Editing those keys in the Secret File will not apply until the overlay is cleared.")
+    : "No overlay yet — values come from config.yaml.";
+  document.querySelectorAll(".ov-note").forEach(el => { el.innerHTML = html; });
 }
 function renderAlerts(a){
   if(!a) return;
@@ -1551,10 +1580,7 @@ function renderAlerts(a){
   }
 }
 async function loadAlerts(){
-  const tokEl = $("al-token");
-  if(tokEl && !tokEl.value){
-    try{ const saved = sessionStorage.getItem("tb_control_token"); if(saved) tokEl.value = saved; }catch(e){}
-  }
+  fillOwnerTokenFields();
   try {
     const st = await getJSON("/control/status");
     renderAlerts(st.alerts || {});
@@ -1839,7 +1865,9 @@ async function runScan(){
   finally{ $("scr-scan").disabled=false; }
 }
 async function loadControls(){
+  fillOwnerTokenFields();
   const cfg = await getJSON("/api/config");
+  renderOverlaySource(cfg);
   const e = cfg.editable.entry || {};
   watchlist = (e.watchlist || []).slice();
   renderWatchlist();
@@ -1948,7 +1976,17 @@ function renderWatchlist(){
 }
 function say(id, msg, ok){ const e=$(id); e.textContent=msg; e.className="say "+(ok?"ok":"err"); if(ok) setTimeout(()=>{if(e.textContent===msg)e.textContent="";},4000); }
 async function postConfig(patch){
-  throw new Error("Dashboard is read-only. Edit config.yaml and restart.");
+  const tok = ownerToken();
+  if(!tok) throw new Error("Enter CONTROL_TOKEN to save settings.");
+  const r = await fetch("/api/config?token="+encodeURIComponent(tok), {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    credentials:"same-origin", body:JSON.stringify(patch)
+  });
+  const d = await r.json().catch(()=>({}));
+  if(r.status === 401) throw new Error("Wrong CONTROL_TOKEN (unauthorized).");
+  if(!r.ok || d.ok === false) throw new Error(d.error || ("HTTP "+r.status));
+  renderOverlaySource(d);
+  return d;
 }
 async function saveWatchlist(next, okmsg){
   try { const j = await postConfig({entry:{watchlist:next}});

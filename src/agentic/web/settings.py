@@ -1,7 +1,7 @@
 """In-app settings editor — read and safely edit strategy/paper params from the dashboard.
 
-  GET  /api/config   -> current effective config (editable knobs + a read-only summary)
-  POST /api/config   -> validate a patch, hot-apply it, and persist it to the overlay
+  GET  /api/config   -> current effective config, plus which knobs come from the overlay
+  POST /api/config   -> owner-only (Basic + CONTROL_TOKEN): validate, hot-apply, persist overlay
 
 Design constraints (see docs/STAGE2_PLAN.md):
 
@@ -17,14 +17,16 @@ Design constraints (see docs/STAGE2_PLAN.md):
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from ..config import Settings, load_overlay, save_overlay
+from ..config import Settings, get_secret, is_usable_secret, load_overlay, save_overlay
+from ..domain.enums import AuditEventType
 from .auth import require_auth
 
 if TYPE_CHECKING:
@@ -110,6 +112,52 @@ def apply_patch(settings: Settings, patch: dict, *, overlay_path=None) -> list[s
     return sorted(patch)
 
 
+def _control_authorized(token: str | None) -> bool:
+    expected = get_secret("CONTROL_TOKEN")
+    if not is_usable_secret(expected):
+        return False
+    return bool(token) and hmac.compare_digest(token, expected)
+
+
+def overlay_source_paths(overlay: dict | None = None) -> list[str]:
+    """Dotted paths of values that come from the data-disk overlay (override config.yaml)."""
+    ov = load_overlay() if overlay is None else overlay
+    return _overlay_leaf_paths(ov)
+
+
+def _overlay_leaf_paths(obj: Any, prefix: str = "") -> list[str]:
+    if not isinstance(obj, dict):
+        return [prefix] if prefix else []
+    if not obj:
+        return [prefix] if prefix else []
+    out: list[str] = []
+    for key, val in obj.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(val, dict):
+            out.extend(_overlay_leaf_paths(val, path))
+        else:
+            out.append(path)
+    return out
+
+
+def _config_payload(settings: Settings) -> dict[str, Any]:
+    overlay = load_overlay()
+    return {
+        "editable": _editable_view(settings),
+        # Read-only context so the UI can SHOW (never edit) the safety-critical state.
+        "readonly": {
+            "mode": settings.mode,
+            "live_armed": settings.is_live,
+            "broker": settings.broker,
+            "broker_fallback": settings.broker_fallback,
+            "market_data": settings.market_data,
+            "account_number": settings.robinhood.account_number,
+        },
+        "from_overlay": overlay_source_paths(overlay),
+        "overlay": overlay,
+    }
+
+
 def _editable_view(settings: Settings) -> dict[str, Any]:
     dump = settings.model_dump(mode="json")
     return {k: dump[k] for k in EDITABLE_TOP_LEVEL if k in dump}
@@ -120,25 +168,33 @@ def make_settings_router(deps: "WebDeps") -> APIRouter:
 
     @router.get("/config", dependencies=[Depends(require_auth)])
     async def get_config() -> dict:
-        s = deps.settings
-        return {
-            "editable": _editable_view(s),
-            # Read-only context so the UI can SHOW (never edit) the safety-critical state.
-            "readonly": {
-                "mode": s.mode,
-                "live_armed": s.is_live,
-                "broker": s.broker,
-                "broker_fallback": s.broker_fallback,
-                "market_data": s.market_data,
-                "account_number": s.robinhood.account_number,
-            },
-        }
+        return _config_payload(deps.settings)
 
     @router.post("/config", dependencies=[Depends(require_auth)])
-    async def post_config(patch: dict = Body(...)) -> JSONResponse:
-        return JSONResponse(
-            {"ok": False, "error": "Dashboard is read-only. Edit config.yaml (or env vars) and restart."},
-            status_code=403,
-        )
+    async def post_config(
+        patch: dict = Body(...),
+        token: str | None = Query(default=None),
+    ) -> JSONResponse:
+        """Owner-only: Basic auth + CONTROL_TOKEN. PAUSE_TOKEN cannot change settings."""
+        if not _control_authorized(token):
+            return JSONResponse(
+                {"ok": False, "error": "unauthorized", "status": "unauthorized"},
+                status_code=401,
+            )
+        try:
+            old_watchlist = list(deps.settings.entry.watchlist or [])
+            changed = apply_patch(deps.settings, patch)
+            new_watchlist = list(deps.settings.entry.watchlist or [])
+            deps.audit.record(
+                AuditEventType.CONFIG_EDIT,
+                {"changed": changed, "watchlist": {"old": old_watchlist, "new": new_watchlist}},
+                source="dashboard",
+            )
+            body = _config_payload(deps.settings)
+            body["ok"] = True
+            body["changed"] = changed
+            return JSONResponse(body)
+        except SettingsEditError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     return router

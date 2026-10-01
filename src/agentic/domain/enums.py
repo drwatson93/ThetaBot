@@ -79,5 +79,6 @@ class AuditEventType(str, Enum):
     RECONCILE = "RECONCILE"
     KILLSWITCH = "KILLSWITCH"
     ALERTS = "ALERTS"
+    CONFIG_EDIT = "CONFIG_EDIT"
     SIGNAL = "SIGNAL"
     ERROR = "ERROR"
