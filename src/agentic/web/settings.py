@@ -39,8 +39,8 @@ log = logging.getLogger("agentic.web.settings")
 
 # Allowlist (default-deny): only these top-level keys may be edited via the API. Everything else —
 # notably mode, i_understand_live_trading, broker, broker_fallback, market_data, robinhood, web,
-# tax_reserve — is immutable at runtime. Nested enable/feed flags under entry/roll are also locked
-# (LOCKED_RUNTIME_PATHS).
+# tax_reserve, trading_start — is immutable at runtime. Nested enable/feed flags under entry/roll
+# and house-rule leaves under execution are also locked (LOCKED_RUNTIME_PATHS).
 EDITABLE_TOP_LEVEL = frozenset({
     "paper_buying_power",
     "paper_seed_positions",
@@ -87,8 +87,8 @@ def _reject_protected(patch: dict) -> None:
     if blocked:
         raise SettingsEditError(
             f"These settings are not editable at runtime: {', '.join(blocked)}. "
-            "mode / live-arming / broker / tax_reserve / account changes must be made "
-            "deliberately in the mounted config or environment."
+            "mode / live-arming / broker / tax_reserve / trading window / house-rule / "
+            "account changes must be made deliberately in the mounted config or environment."
         )
 
 
@@ -134,6 +134,19 @@ def apply_patch(settings: Settings, patch: dict, *, overlay_path=None) -> list[s
     return sorted(patch)
 
 
+def _leaf_diff(before: Any, after: Any, prefix: str = "") -> dict[str, dict[str, Any]]:
+    """Dotted-path map of {old, new} for leaves that actually changed."""
+    if isinstance(before, dict) and isinstance(after, dict):
+        out: dict[str, dict[str, Any]] = {}
+        for key in set(before) | set(after):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            out.update(_leaf_diff(before.get(key), after.get(key), path))
+        return out
+    if before != after:
+        return {prefix: {"old": before, "new": after}}
+    return {}
+
+
 def _control_authorized(token: str | None) -> bool:
     expected = get_secret("CONTROL_TOKEN")
     if not is_usable_secret(expected):
@@ -176,6 +189,7 @@ def _config_payload(settings: Settings) -> dict[str, Any]:
             "market_data": settings.market_data,
             "account_number": settings.robinhood.account_number,
             "tax_reserve": settings.tax_reserve.model_dump(mode="json"),
+            "trading_start": settings.trading_start,
         },
         "from_overlay": overlay_source_paths(overlay),
         "overlay": overlay,
@@ -206,12 +220,18 @@ def make_settings_router(deps: "WebDeps") -> APIRouter:
                 status_code=401,
             )
         try:
+            before = deps.settings.model_dump(mode="json")
             old_watchlist = list(deps.settings.entry.watchlist or [])
             changed = apply_patch(deps.settings, patch)
+            after = deps.settings.model_dump(mode="json")
             new_watchlist = list(deps.settings.entry.watchlist or [])
             deps.audit.record(
                 AuditEventType.CONFIG_EDIT,
-                {"changed": changed, "watchlist": {"old": old_watchlist, "new": new_watchlist}},
+                {
+                    "changed": changed,
+                    "values": _leaf_diff(before, after),
+                    "watchlist": {"old": old_watchlist, "new": new_watchlist},
+                },
                 source="dashboard",
             )
             body = _config_payload(deps.settings)

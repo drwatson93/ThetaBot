@@ -93,6 +93,12 @@ def test_edit_persists_and_merges_overlay(tmp_path):
     {"entry": {"enabled": True}},
     {"entry": {"feed": "opra"}},
     {"roll": {"enabled": True}},
+    {"trading_start": "09:30"},
+    {"trading_end": "17:00"},
+    {"execution": {"order_type": "market"}},
+    {"execution": {"limit_only": False}},
+    {"execution": {"session_open": "08:00"}},
+    {"nyse_holidays": []},
 ])
 def test_protected_keys_rejected(tmp_path, patch):
     settings = Settings(broker="paper", market_data="paper")
@@ -103,6 +109,7 @@ def test_protected_keys_rejected(tmp_path, patch):
     assert settings.tax_reserve.dry_run is True
     assert settings.entry.enabled is False
     assert settings.roll.enabled is False
+    assert settings.trading_start == "10:00"
     assert not (tmp_path / "o.yaml").exists()
 
 
@@ -176,6 +183,66 @@ def test_overlay_tax_reserve_dry_run_has_no_effect(tmp_path, monkeypatch, caplog
     assert "tax_reserve" in caplog.text
 
 
+def test_trading_window_patch_rejected(tmp_path):
+    """House rule: no entries before 10:00 ET — trading_start is file/env only."""
+    settings = Settings(broker="paper", market_data="paper")
+    with pytest.raises(SettingsEditError, match="trading_start"):
+        apply_patch(settings, {"trading_start": "09:30"}, overlay_path=tmp_path / "o.yaml")
+    assert settings.trading_start == "10:00"
+    assert not (tmp_path / "o.yaml").exists()
+
+
+def test_limit_only_patch_rejected(tmp_path):
+    """House rule: limit-only / never-market — not a dashboard knob."""
+    settings = Settings(broker="paper", market_data="paper")
+    ov = tmp_path / "o.yaml"
+    with pytest.raises(SettingsEditError, match="execution.order_type"):
+        apply_patch(settings, {"execution": {"order_type": "market"}}, overlay_path=ov)
+    with pytest.raises(SettingsEditError, match="execution.limit_only"):
+        apply_patch(settings, {"execution": {"limit_only": False}}, overlay_path=ov)
+    assert settings.execution.limit_buffer_pct == 0.02
+    assert not ov.exists()
+
+
+def test_execution_non_house_rule_leaves_still_editable(tmp_path):
+    """Parent `execution` stays editable; only order-type / session leaves are locked."""
+    settings = Settings(broker="paper", market_data="paper")
+    apply_patch(settings, {"execution": {"limit_buffer_pct": 0.03}}, overlay_path=tmp_path / "o.yaml")
+    assert settings.execution.limit_buffer_pct == 0.03
+    saved = load_overlay(tmp_path / "o.yaml")
+    assert saved["execution"]["limit_buffer_pct"] == 0.03
+    assert "order_type" not in saved["execution"]
+    assert "limit_only" not in saved["execution"]
+
+
+def test_overlay_trading_start_has_no_effect(tmp_path, monkeypatch, caplog):
+    """An old overlay must not move the 10:00 ET entry window."""
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        "mode: paper\n"
+        "trading_start: '10:00'\n"
+        "paper_buying_power: 1500\n"
+        "entry:\n"
+        "  watchlist: [AAPL]\n"
+    )
+    ov = tmp_path / "overlay.yaml"
+    monkeypatch.setattr("agentic.config.OVERLAY_PATH", ov)
+    save_overlay({
+        "trading_start": "09:30",
+        "trading_end": "17:00",
+        "execution": {"order_type": "market", "limit_only": False, "limit_buffer_pct": 0.03},
+        "nyse_holidays": ["2026-01-01"],
+        "paper_buying_power": 25000,
+    }, ov)
+    with caplog.at_level(logging.WARNING, logger="agentic.config"):
+        s = load_config(base)
+    assert s.trading_start == "10:00"
+    assert s.paper_buying_power == 25000
+    assert s.execution.limit_buffer_pct == 0.03
+    assert not hasattr(s.execution, "order_type")
+    assert "trading_start" in caplog.text
+
+
 # --- endpoint tests ----------------------------------------------------------------------------
 
 @pytest.fixture()
@@ -216,6 +283,8 @@ def test_get_config_returns_editable_and_readonly(client):
     assert body["overlay"] == {}
     assert "tax_reserve" in body["readonly"]
     assert body["readonly"]["tax_reserve"]["dry_run"] is True
+    assert body["readonly"]["trading_start"] == "10:00"
+    assert "trading_start" not in body["editable"]
 
 
 def test_post_config_requires_control_token(client):
@@ -256,9 +325,11 @@ def test_post_config_owner_adds_ticker(client):
     assert row is not None
     assert row["payload"]["changed"] == ["entry"]
     assert row["payload"]["watchlist"] == {"old": [], "new": ["AAPL"]}
+    assert row["payload"]["values"]["entry.watchlist"] == {"old": [], "new": ["AAPL"]}
     blob = json.dumps(row)
     assert CONTROL not in blob
     assert PAUSE not in blob
+    assert "token" not in json.dumps(row["payload"])
 
 
 @pytest.mark.parametrize("patch", [
@@ -268,6 +339,9 @@ def test_post_config_owner_adds_ticker(client):
     {"tax_reserve": {"pct": 0.5, "allow_sgov_test_buy": True}},
     {"entry": {"enabled": True}},
     {"roll": {"enabled": True}},
+    {"trading_start": "09:30"},
+    {"execution": {"order_type": "market"}},
+    {"execution": {"limit_only": False}},
 ])
 def test_post_protected_edit_rejected_even_with_control_token(client, patch):
     c, settings, *_ = client
@@ -279,6 +353,48 @@ def test_post_protected_edit_rejected_even_with_control_token(client, patch):
     assert settings.tax_reserve.dry_run is True
     assert settings.entry.enabled is False
     assert settings.roll.enabled is False
+    assert settings.trading_start == "10:00"
+
+
+def test_post_trading_window_patch_rejected(client):
+    c, settings, audit, _ = client
+    r = c.post(f"/api/config?token={CONTROL}", json={"trading_start": "09:30"})
+    assert r.status_code == 400
+    assert r.json()["ok"] is False
+    assert "trading_start" in r.json()["error"]
+    assert settings.trading_start == "10:00"
+    assert audit.latest(AuditEventType.CONFIG_EDIT) is None
+
+
+def test_post_limit_only_patch_rejected(client):
+    c, settings, audit, _ = client
+    r = c.post(
+        f"/api/config?token={CONTROL}",
+        json={"execution": {"order_type": "market", "limit_only": False}},
+    )
+    assert r.status_code == 400
+    assert r.json()["ok"] is False
+    assert "execution.order_type" in r.json()["error"]
+    assert "execution.limit_only" in r.json()["error"]
+    assert settings.execution.limit_buffer_pct == 0.02
+    assert audit.latest(AuditEventType.CONFIG_EDIT) is None
+
+
+def test_post_config_audits_leaf_old_new(client):
+    """CONFIG_EDIT records every changed leaf as old→new, never the token."""
+    c, settings, audit, _ = client
+    r = c.post(
+        f"/api/config?token={CONTROL}",
+        json={"execution": {"limit_buffer_pct": 0.03}},
+    )
+    assert r.status_code == 200
+    row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
+    assert row is not None
+    assert row["payload"]["changed"] == ["execution"]
+    assert row["payload"]["values"]["execution.limit_buffer_pct"] == {"old": 0.02, "new": 0.03}
+    blob = json.dumps(row)
+    assert CONTROL not in blob
+    assert PAUSE not in blob
 
 
 def test_dashboard_settings_use_control_token(client):
