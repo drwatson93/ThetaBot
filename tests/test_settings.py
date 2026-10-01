@@ -1,5 +1,6 @@
 """Stage 2 Increment 1: in-app settings editor — overlay persistence, hot-apply, guardrails."""
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -87,6 +88,11 @@ def test_edit_persists_and_merges_overlay(tmp_path):
     {"broker": "robinhood_mcp"},
     {"robinhood": {"account_number": "999"}},
     {"market_data": "alpaca"},
+    {"tax_reserve": {"dry_run": False}},
+    {"tax_reserve": {"allow_sgov_test_buy": True, "pct": 0.5}},
+    {"entry": {"enabled": True}},
+    {"entry": {"feed": "opra"}},
+    {"roll": {"enabled": True}},
 ])
 def test_protected_keys_rejected(tmp_path, patch):
     settings = Settings(broker="paper", market_data="paper")
@@ -94,6 +100,9 @@ def test_protected_keys_rejected(tmp_path, patch):
         apply_patch(settings, patch, overlay_path=tmp_path / "o.yaml")
     # Nothing changed and nothing persisted.
     assert settings.mode == "paper"
+    assert settings.tax_reserve.dry_run is True
+    assert settings.entry.enabled is False
+    assert settings.roll.enabled is False
     assert not (tmp_path / "o.yaml").exists()
 
 
@@ -131,6 +140,42 @@ def test_load_config_merges_overlay(tmp_path, monkeypatch):
     assert s.mode == "paper"
 
 
+def test_overlay_tax_reserve_dry_run_has_no_effect(tmp_path, monkeypatch, caplog):
+    """An old overlay must not flip tax_reserve.dry_run (or other locked buy-path keys)."""
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        "mode: paper\n"
+        "tax_reserve:\n"
+        "  enabled: true\n"
+        "  dry_run: true\n"
+        "  allow_sgov_test_buy: false\n"
+        "  pct: 0.20\n"
+        "entry:\n"
+        "  enabled: false\n"
+        "  feed: indicative\n"
+        "  watchlist: [AAPL]\n"
+        "roll:\n"
+        "  enabled: false\n"
+    )
+    ov = tmp_path / "overlay.yaml"
+    monkeypatch.setattr("agentic.config.OVERLAY_PATH", ov)
+    save_overlay({
+        "tax_reserve": {"dry_run": False, "allow_sgov_test_buy": True, "pct": 0.99},
+        "entry": {"enabled": True, "feed": "opra", "watchlist": ["F"]},
+        "roll": {"enabled": True},
+    }, ov)
+    with caplog.at_level(logging.WARNING, logger="agentic.config"):
+        s = load_config(base)
+    assert s.tax_reserve.dry_run is True
+    assert s.tax_reserve.allow_sgov_test_buy is False
+    assert s.tax_reserve.pct == 0.20
+    assert s.entry.enabled is False
+    assert s.entry.feed == "indicative"
+    assert s.entry.watchlist == ["F"]  # non-locked overlay still applies
+    assert s.roll.enabled is False
+    assert "tax_reserve" in caplog.text
+
+
 # --- endpoint tests ----------------------------------------------------------------------------
 
 @pytest.fixture()
@@ -166,8 +211,11 @@ def test_get_config_returns_editable_and_readonly(client):
     assert body["readonly"]["live_armed"] is False
     # The dangerous knobs are reported read-only, never in the editable set.
     assert "mode" not in body["editable"]
+    assert "tax_reserve" not in body["editable"]
     assert body["from_overlay"] == []
     assert body["overlay"] == {}
+    assert "tax_reserve" in body["readonly"]
+    assert body["readonly"]["tax_reserve"]["dry_run"] is True
 
 
 def test_post_config_requires_control_token(client):
@@ -216,6 +264,10 @@ def test_post_config_owner_adds_ticker(client):
 @pytest.mark.parametrize("patch", [
     {"mode": "live"},
     {"broker": "robinhood_mcp"},
+    {"tax_reserve": {"dry_run": False}},
+    {"tax_reserve": {"pct": 0.5, "allow_sgov_test_buy": True}},
+    {"entry": {"enabled": True}},
+    {"roll": {"enabled": True}},
 ])
 def test_post_protected_edit_rejected_even_with_control_token(client, patch):
     c, settings, *_ = client
@@ -224,6 +276,9 @@ def test_post_protected_edit_rejected_even_with_control_token(client, patch):
     assert r.json()["ok"] is False
     assert settings.mode == "paper"
     assert settings.broker == "paper"
+    assert settings.tax_reserve.dry_run is True
+    assert settings.entry.enabled is False
+    assert settings.roll.enabled is False
 
 
 def test_dashboard_settings_use_control_token(client):
@@ -235,3 +290,5 @@ def test_dashboard_settings_use_control_token(client):
     assert "/api/config?token=" in html
     assert "Dashboard is read-only. Edit config.yaml and restart." not in html
     assert "from_overlay" in html
+    assert "Tax reserve is file-only" in html or "File-only, same as mode" in html
+    assert "postConfig({tax_reserve" not in html

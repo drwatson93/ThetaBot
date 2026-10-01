@@ -1315,16 +1315,15 @@ _PAGE = """<!doctype html>
       </div>
       <div class="hint ov-note" id="tn-ov-note"></div>
       <div class="ctl-lab">Tax reserve / gains sweep</div>
-      <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-on"/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
+      <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="tn-tr-on" disabled/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
       <div class="scr-filters">
-        <label>% of net gains<input class="f scrn" id="tn-tr-pct" inputmode="decimal" placeholder="20"/></label>
-        <label>Symbol<input class="f scrn" id="tn-tr-sym" placeholder="SGOV" maxlength="6" autocapitalize="characters"/></label>
-        <label>Day<select class="f" id="tn-tr-day"><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option></select></label>
-        <label>Time (ET)<input class="f scrn" id="tn-tr-time" placeholder="15:40"/></label>
-        <button class="go" id="tn-tr-save">Save</button>
+        <label>% of net gains<input class="f scrn" id="tn-tr-pct" inputmode="decimal" placeholder="20" disabled/></label>
+        <label>Symbol<input class="f scrn" id="tn-tr-sym" placeholder="SGOV" maxlength="6" autocapitalize="characters" disabled/></label>
+        <label>Day<select class="f" id="tn-tr-day" disabled><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option></select></label>
+        <label>Time (ET)<input class="f scrn" id="tn-tr-time" placeholder="15:40" disabled/></label>
       </div>
-      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-dry"/> Dry run (log what it would buy, place nothing)</label></div>
-      <div class="hint">Each week at the set time (inside market hours, since share market orders only fill then) the bot adds up the realized P&amp;L closed since the last sweep, carries any loss forward, and buys that share of a positive net in the ETF. The reserve is walled off: it never counts as trading capital, never gets calls written on it, and the bot never sells it. Withdraw it yourself when taxes are due.</div>
+      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="tn-tr-dry" disabled/> Dry run (log what it would buy, place nothing)</label></div>
+      <div class="hint">File-only, same as mode: pct, dry-run, and the SGOV test-buy switch live in config.yaml. Overlay cannot flip them.</div>
       <div class="say" id="tn-tr-say"></div>
 
       <div class="ctl-lab" style="margin-top:18px">Market regime</div>
@@ -1738,17 +1737,6 @@ function fillReserve(tr){
   _setIf("tn-tr-day", tr.weekday != null ? String(tr.weekday) : "4");
   _setIf("tn-tr-time", (tr.hour != null ? String(tr.hour).padStart(2,"0") : "15") + ":" + (tr.minute != null ? String(tr.minute).padStart(2,"0") : "40"));
 }
-async function saveReserve(){
-  const pct = parseFloat(($("tn-tr-pct").value||"").trim()); const sym = ($("tn-tr-sym").value||"").trim().toUpperCase();
-  const tm = ($("tn-tr-time").value||"15:40").trim().split(":"); const hh = parseInt(tm[0],10), mm = parseInt(tm[1]||"0",10);
-  if(isNaN(pct) || pct <= 0 || pct > 60){ say("tn-tr-say","Enter a percent between 1 and 60.",false); return; }
-  if(!/^[A-Z]{1,6}$/.test(sym)){ say("tn-tr-say","Enter a stock or ETF ticker, e.g. SGOV.",false); return; }
-  if(isNaN(hh) || isNaN(mm) || hh < 9 || hh > 15 || (hh === 9 && mm < 35)){ say("tn-tr-say","Time must be inside market hours (09:35 to 15:55 ET).",false); return; }
-  try { await postConfig({tax_reserve:{enabled:$("tn-tr-on").checked, dry_run:$("tn-tr-dry").checked, pct: pct/100, symbol: sym, weekday: parseInt($("tn-tr-day").value,10), hour: hh, minute: mm}});
-    say("tn-tr-say", $("tn-tr-on").checked ? (($("tn-tr-dry").checked ? "On (dry run): " : "On: ") + pct + "% of net gains into " + sym + " every " + dayName(parseInt($("tn-tr-day").value,10)) + ".") : "Off.", true);
-    await loadReserve();
-  } catch(e){ say("tn-tr-say","Couldn't save: "+e.message,false); }
-}
 
 /* ---- activity ---- */
 const RULE_LABEL = {"profit-trail":"Took profit","profit-target":"Took profit","profit-50":"Took profit",
@@ -1875,7 +1863,7 @@ async function loadControls(){
   if(document.activeElement !== $("wk-in")) $("wk-in").value = wt ? (wt*100).toFixed(wt*100 % 1 ? 1 : 0) : "0";
   fillTuning(e);
   fillMacro(cfg.editable.macro || {});
-  fillReserve(cfg.editable.tax_reserve || {});
+  fillReserve((cfg.readonly && cfg.readonly.tax_reserve) || {});
 }
 function fillMacro(m){
   if(document.activeElement !== $("tn-skip-dt")) $("tn-skip-dt").checked = !!m.skip_confirmed_downtrend;
@@ -2321,7 +2309,6 @@ $("wk-save").onclick = saveWeekly;
 $("wk-in").addEventListener("keydown", e => { if(e.key==="Enter") saveWeekly(); });
 $("tn-uc-save").onclick = saveMulti;
 $("tn-dt-save").onclick = saveDowntrend;
-$("tn-tr-save").onclick = saveReserve;
 $("tn-gates-save").onclick = saveGates;
 $("tn-global-save").onclick = saveGlobal;
 $("tn-pt-save").onclick = savePerTicker;

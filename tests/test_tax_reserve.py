@@ -284,7 +284,7 @@ def test_endpoints_and_page_markers(tmp_path):
     t = c.get("/api/tiers").json()
     assert t["ready"] == [] and "tiers" in t
     page = c.get("/dashboard").text
-    for m in ('id="reserve-card"', 'id="tiers-card"', 'id="tn-tr-on"', 'id="tn-tr-save"', "loadReserve", "loadTiers",
+    for m in ('id="reserve-card"', 'id="tiers-card"', 'id="tn-tr-on"', 'id="tn-tr-dry"', "loadReserve", "loadTiers",
               "Tax reserve", "Ready to add", "<th>Note</th>"):
         assert m in page, m
     assert c.get("/api/holdings").json() == {"holdings": []}

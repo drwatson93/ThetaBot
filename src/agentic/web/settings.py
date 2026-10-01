@@ -25,7 +25,10 @@ from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from ..config import Settings, get_secret, is_usable_secret, load_overlay, save_overlay
+from ..config import (
+    LOCKED_RUNTIME_PATHS, Settings, get_secret, is_usable_secret, load_overlay,
+    save_overlay, strip_locked_overlay,
+)
 from ..domain.enums import AuditEventType
 from .auth import require_auth
 
@@ -35,8 +38,9 @@ if TYPE_CHECKING:
 log = logging.getLogger("agentic.web.settings")
 
 # Allowlist (default-deny): only these top-level keys may be edited via the API. Everything else —
-# notably mode, i_understand_live_trading, broker, broker_fallback, market_data, robinhood, web —
-# is immutable at runtime.
+# notably mode, i_understand_live_trading, broker, broker_fallback, market_data, robinhood, web,
+# tax_reserve — is immutable at runtime. Nested enable/feed flags under entry/roll are also locked
+# (LOCKED_RUNTIME_PATHS).
 EDITABLE_TOP_LEVEL = frozenset({
     "paper_buying_power",
     "paper_seed_positions",
@@ -53,7 +57,6 @@ EDITABLE_TOP_LEVEL = frozenset({
     "news",
     "roll",
     "reporting",
-    "tax_reserve",
     "notify",
     "rules",
 })
@@ -63,13 +66,29 @@ class SettingsEditError(ValueError):
     """Raised when a patch is rejected (protected key or invalid value)."""
 
 
+def _locked_paths_in(obj: Any, prefix: str = "") -> list[str]:
+    found: list[str] = []
+    if not isinstance(obj, dict):
+        return found
+    for key, val in obj.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if any(path == locked or path.startswith(locked + ".") for locked in LOCKED_RUNTIME_PATHS):
+            found.append(path)
+            continue
+        if isinstance(val, dict):
+            found.extend(_locked_paths_in(val, path))
+    return found
+
+
 def _reject_protected(patch: dict) -> None:
     bad = [k for k in patch if k not in EDITABLE_TOP_LEVEL]
-    if bad:
+    locked = _locked_paths_in(patch)
+    blocked = sorted(set(bad) | set(locked))
+    if blocked:
         raise SettingsEditError(
-            f"These settings are not editable at runtime: {', '.join(sorted(bad))}. "
-            "mode / live-arming / broker / account changes must be made deliberately in the "
-            "mounted config or environment."
+            f"These settings are not editable at runtime: {', '.join(blocked)}. "
+            "mode / live-arming / broker / tax_reserve / account changes must be made "
+            "deliberately in the mounted config or environment."
         )
 
 
@@ -107,6 +126,9 @@ def apply_patch(settings: Settings, patch: dict, *, overlay_path=None) -> list[s
     _apply_in_place(settings, validated, patch)
 
     overlay = _deep_merge(load_overlay(overlay_path), patch)
+    overlay, stripped = strip_locked_overlay(overlay)
+    if stripped:
+        log.warning("Dropped locked overlay keys on save: %s", ", ".join(stripped))
     save_overlay(overlay, overlay_path)
     log.info("Settings edited via API: %s", sorted(patch))
     return sorted(patch)
@@ -122,6 +144,7 @@ def _control_authorized(token: str | None) -> bool:
 def overlay_source_paths(overlay: dict | None = None) -> list[str]:
     """Dotted paths of values that come from the data-disk overlay (override config.yaml)."""
     ov = load_overlay() if overlay is None else overlay
+    ov, _ = strip_locked_overlay(ov)
     return _overlay_leaf_paths(ov)
 
 
@@ -141,7 +164,7 @@ def _overlay_leaf_paths(obj: Any, prefix: str = "") -> list[str]:
 
 
 def _config_payload(settings: Settings) -> dict[str, Any]:
-    overlay = load_overlay()
+    overlay, _ = strip_locked_overlay(load_overlay())
     return {
         "editable": _editable_view(settings),
         # Read-only context so the UI can SHOW (never edit) the safety-critical state.
@@ -152,6 +175,7 @@ def _config_payload(settings: Settings) -> dict[str, Any]:
             "broker_fallback": settings.broker_fallback,
             "market_data": settings.market_data,
             "account_number": settings.robinhood.account_number,
+            "tax_reserve": settings.tax_reserve.model_dump(mode="json"),
         },
         "from_overlay": overlay_source_paths(overlay),
         "overlay": overlay,
