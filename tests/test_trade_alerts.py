@@ -246,16 +246,20 @@ def test_alerts_status_on_ops_and_control(tmp_path, monkeypatch):
     assert "last_error" in ops  # engine field is separate from alerts.last_error
 
 
-def test_alerts_mode_requires_control_token(tmp_path, monkeypatch):
+def test_alerts_mode_owner_or_control_token(tmp_path, monkeypatch):
     client, alerts, audit = _client(tmp_path, monkeypatch, pause=PAUSE)
-    assert client.post("/control/alerts-mode?mode=off").status_code == 401
-    assert client.post(f"/control/alerts-mode?token={PAUSE}&mode=off").status_code == 401
+    assert client.post("/control/alerts-mode?mode=off", auth=None).status_code == 401
     assert client.post(
         f"/control/alerts-mode?token={PAUSE}&mode=off", auth=None
     ).status_code == 401
     assert alerts.mode() == "instant"
 
-    ok = client.post(f"/control/alerts-mode?token={CONTROL}&mode=regular")
+    as_owner = client.post("/control/alerts-mode?mode=off")
+    assert as_owner.status_code == 200
+    assert as_owner.json()["ok"] is True
+    assert alerts.mode() == "off"
+
+    ok = client.post(f"/control/alerts-mode?token={CONTROL}&mode=regular", auth=None)
     assert ok.status_code == 200
     assert ok.json()["ok"] is True
     assert ok.json()["alerts"]["mode"] == "regular"
@@ -263,19 +267,19 @@ def test_alerts_mode_requires_control_token(tmp_path, monkeypatch):
     row = audit.latest(AuditEventType.ALERTS, source="control")
     assert row["payload"]["mode"] == "regular"
 
-    bad = client.post(f"/control/alerts-mode?token={CONTROL}&mode=loud")
+    bad = client.post("/control/alerts-mode?mode=loud")
     assert bad.status_code == 400
     assert alerts.mode() == "regular"
 
 
-def test_test_alert_requires_control_token(tmp_path, monkeypatch):
+def test_test_alert_owner_or_control_token(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(ta_mod, "_http_post", lambda url, payload, timeout=3.0: sent.append(payload))
     monkeypatch.setenv("TRADE_ALERT_URL", HOOK)
     client, alerts, _ = _client(tmp_path, monkeypatch, pause=PAUSE)
-    assert client.post("/control/test-alert").status_code == 401
-    assert client.post(f"/control/test-alert?token={PAUSE}").status_code == 401
-    r = client.post(f"/control/test-alert?token={CONTROL}")
+    assert client.post("/control/test-alert", auth=None).status_code == 401
+    assert client.post(f"/control/test-alert?token={PAUSE}", auth=None).status_code == 401
+    r = client.post("/control/test-alert")
     assert r.status_code == 200
     assert r.json()["ok"] is True
     assert sent and sent[0]["event"] == "test"
@@ -285,7 +289,7 @@ def test_test_alert_requires_control_token(tmp_path, monkeypatch):
 
 def test_test_alert_reports_unconfigured(tmp_path, monkeypatch):
     client, _, _ = _client(tmp_path, monkeypatch)
-    r = client.post(f"/control/test-alert?token={CONTROL}")
+    r = client.post("/control/test-alert")
     assert r.status_code == 200
     assert r.json()["ok"] is False
     assert r.json()["error"] == "webhook not configured"

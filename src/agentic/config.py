@@ -7,12 +7,29 @@ live-mode arming gate lives here: live trading requires BOTH ``mode == "live"`` 
 """
 from __future__ import annotations
 
+import copy
+import logging
 import os
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
+
+log = logging.getLogger("agentic.config")
+
+# Dotted paths that must never be flipped by the data-disk overlay or POST /api/config.
+# Live-arming / execution-path only. Code-level locks (real-orders HARD DISABLED, limit-only
+# in the executor) are not Settings fields and cannot be changed by any login.
+LOCKED_RUNTIME_PATHS = frozenset({
+    "mode",
+    "i_understand_live_trading",
+    "broker",
+    "broker_fallback",
+    "market_data",
+    "robinhood",
+    "web",
+})
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
@@ -465,6 +482,35 @@ def load_overlay(path: str | Path | None = None) -> dict:
     return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
 
+def _path_is_locked(path: str) -> bool:
+    return any(path == locked or path.startswith(locked + ".") for locked in LOCKED_RUNTIME_PATHS)
+
+
+def strip_locked_overlay(overlay: dict | None) -> tuple[dict, list[str]]:
+    """Drop runtime-immutable keys from an overlay dict. Returns (cleaned, stripped paths)."""
+    if not overlay:
+        return {}, []
+    out = copy.deepcopy(overlay)
+    stripped: list[str] = []
+
+    def walk(obj: dict, prefix: str) -> None:
+        for key in list(obj.keys()):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            val = obj[key]
+            if _path_is_locked(path):
+                del obj[key]
+                stripped.append(path)
+                continue
+            if isinstance(val, dict):
+                walk(val, path)
+                if not val:
+                    del obj[key]
+
+    if isinstance(out, dict):
+        walk(out, "")
+    return out, stripped
+
+
 def save_overlay(overlay: dict, path: str | Path | None = None) -> None:
     """Persist the runtime settings overlay to the writable data volume."""
     p = Path(path) if path is not None else OVERLAY_PATH
@@ -502,7 +548,14 @@ def load_config(path: str | Path | None = None, *, apply_overlay: bool = True) -
     if apply_overlay:
         overlay = load_overlay()
         if overlay:
-            data = _deep_merge(data, overlay)
+            overlay, stripped = strip_locked_overlay(overlay)
+            if stripped:
+                log.warning(
+                    "Ignoring locked overlay keys (edit config.yaml/env instead): %s",
+                    ", ".join(stripped),
+                )
+            if overlay:
+                data = _deep_merge(data, overlay)
     return Settings.model_validate(data)
 
 
@@ -542,6 +595,14 @@ def require_runtime_secrets() -> None:
             "Refusing to start: " + " and ".join(missing)
             + " must be set to a real secret (not blank, not a placeholder). "
             "Supply them as environment variables."
+        )
+    owner = (get_secret("DASHBOARD_USER", "admin") or "admin").strip() or "admin"
+    viewer_user = (get_secret("VIEWER_USER") or "").strip()
+    viewer_pass = get_secret("VIEWER_PASSWORD")
+    if viewer_user and is_usable_secret(viewer_pass) and viewer_user == owner:
+        raise SystemExit(
+            "Refusing to start: VIEWER_USER must differ from DASHBOARD_USER "
+            "(one login cannot be both owner and viewer)."
         )
 
 

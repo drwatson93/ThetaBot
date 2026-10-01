@@ -9,11 +9,11 @@
   POST /control/test-alert               -> send one test webhook (Basic + CONTROL_TOKEN)
   GET  /control/status                   -> current control state
 
-These are POSTed by the notification action buttons. They are protected only by the
-unguessable decision id and (in production) by the tunnel; pause/resume take a
-``?token=`` matching CONTROL_TOKEN. ``/control/pause-only`` is the exception: it
-skips dashboard Basic auth so a monitoring bot can fail-closed pause with PAUSE_TOKEN,
-which cannot resume or approve anything.
+Owner mutations (pause/resume/alerts/…) accept owner Basic **or** CONTROL_TOKEN.
+``/control/pause-only`` is the exception: it skips dashboard login so a monitoring bot
+can fail-closed pause with PAUSE_TOKEN, which cannot resume or approve anything.
+View-only login gets 403 on every mutation. One-tap approve/reject still use a
+per-decision HMAC (viewers are 403).
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse
 
 from ..config import get_secret, is_usable_secret
 from ..domain.enums import AuditEventType
-from .auth import require_auth
+from .auth import deny_viewer, require_auth, require_owner
 
 if TYPE_CHECKING:
     from .app import WebDeps
@@ -65,12 +65,6 @@ def _record_pause_auth_fail(key: str) -> None:
 def make_control_router(deps: "WebDeps") -> APIRouter:
     router = APIRouter(prefix="/control")
 
-    def _control_authorized(token: str | None) -> bool:
-        expected = get_secret("CONTROL_TOKEN")
-        if not is_usable_secret(expected):
-            return False
-        return bool(token) and hmac.compare_digest(token, expected)
-
     def _close_action_authorized(decision_id: str, token: str | None) -> bool:
         # Buying to close a real position must not be unauthenticated: require the per-decision
         # token (refuse if no CONTROL_TOKEN or on mismatch).
@@ -79,8 +73,12 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         return bool(expected) and bool(token) and hmac.compare_digest(token, expected)
 
     @router.post("/approve/{decision_id}")
-    async def approve(decision_id: str, t: str | None = None) -> JSONResponse:
-        if not _close_action_authorized(decision_id, t):
+    async def approve(
+        decision_id: str,
+        t: str | None = None,
+        role: str | None = Depends(deny_viewer),
+    ) -> JSONResponse:
+        if role != "owner" and not _close_action_authorized(decision_id, t):
             return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
         result = await deps.approval_gate.approve(decision_id)
         return JSONResponse(
@@ -89,8 +87,12 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         )
 
     @router.post("/reject/{decision_id}")
-    async def reject(decision_id: str, t: str | None = None) -> JSONResponse:
-        if not _close_action_authorized(decision_id, t):
+    async def reject(
+        decision_id: str,
+        t: str | None = None,
+        role: str | None = Depends(deny_viewer),
+    ) -> JSONResponse:
+        if role != "owner" and not _close_action_authorized(decision_id, t):
             return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
         result = await deps.approval_gate.reject(decision_id)
         return JSONResponse(
@@ -98,10 +100,8 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             status_code=200 if result.ok else 409,
         )
 
-    @router.post("/pause", dependencies=[Depends(require_auth)])
-    async def pause(reason: str = "manual", token: str | None = None) -> JSONResponse:
-        if not _control_authorized(token):
-            return JSONResponse({"status": "unauthorized"}, status_code=401)
+    @router.post("/pause", dependencies=[Depends(require_owner)])
+    async def pause(reason: str = "manual") -> JSONResponse:
         deps.killswitch.pause(reason)
         return JSONResponse({"status": "paused", "reason": reason})
 
@@ -130,18 +130,14 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         deps.killswitch.pause(why, source="pause_token")
         return JSONResponse({"status": "paused", "reason": why, "already_paused": False})
 
-    @router.post("/resume", dependencies=[Depends(require_auth)])
-    async def resume(reason: str = "manual", token: str | None = None) -> JSONResponse:
-        if not _control_authorized(token):
-            return JSONResponse({"status": "unauthorized"}, status_code=401)
+    @router.post("/resume", dependencies=[Depends(require_owner)])
+    async def resume(reason: str = "manual") -> JSONResponse:
         deps.killswitch.resume(reason)
         return JSONResponse({"status": "resumed", "reason": reason})
 
-    @router.post("/alerts-mode", dependencies=[Depends(require_auth)])
-    async def alerts_mode(mode: str = "instant", token: str | None = None) -> JSONResponse:
-        """Owner-only: persist alerts mode (instant | regular | off). PAUSE_TOKEN cannot."""
-        if not _control_authorized(token):
-            return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
+    @router.post("/alerts-mode", dependencies=[Depends(require_owner)])
+    async def alerts_mode(mode: str = "instant") -> JSONResponse:
+        """Owner-only: persist alerts mode (instant | regular | off). Viewer / PAUSE_TOKEN cannot."""
         from ..notify.trade_alerts import VALID_MODES, alerts_from_deps
         wanted = (mode or "").strip().lower()
         if wanted not in VALID_MODES:
@@ -154,11 +150,9 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         al.set_mode(wanted, source="control")
         return JSONResponse({"ok": True, "alerts": al.status()})
 
-    @router.post("/test-alert", dependencies=[Depends(require_auth)])
-    async def test_alert(token: str | None = None) -> JSONResponse:
-        """Owner-only: send one clearly labeled test webhook. PAUSE_TOKEN cannot."""
-        if not _control_authorized(token):
-            return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
+    @router.post("/test-alert", dependencies=[Depends(require_owner)])
+    async def test_alert() -> JSONResponse:
+        """Owner-only: send one clearly labeled test webhook. Viewer / PAUSE_TOKEN cannot."""
         from ..notify.trade_alerts import alerts_from_deps
         al = alerts_from_deps(deps)
         result = await al.send_test()
@@ -167,7 +161,7 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             body["error"] = result["error"]
         return JSONResponse(body)
 
-    @router.post("/test-notify", dependencies=[Depends(require_auth)])
+    @router.post("/test-notify", dependencies=[Depends(require_owner)])
     async def test_notify() -> JSONResponse:
         """Send a test push through the bot's own notifier — verifies phone delivery end-to-end."""
         if deps.notifier is None:
@@ -182,12 +176,10 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
         return JSONResponse({"ok": True, "sent": True})
 
-    @router.post("/test-ai", dependencies=[Depends(require_auth)])
-    async def test_ai(token: str | None = None) -> JSONResponse:
+    @router.post("/test-ai", dependencies=[Depends(require_owner)])
+    async def test_ai() -> JSONResponse:
         """Verify the AI reviewer end-to-end: build a client from the CURRENT env and make one real
         Opus call on a synthetic candidate. Confirms ANTHROPIC_API_KEY loads + the model responds."""
-        if not _control_authorized(token):
-            return JSONResponse({"status": "unauthorized"}, status_code=401)
         from ..ai.client import build_reviewer_client
         from ..ai.reviewer import AIReviewer
 
@@ -210,12 +202,16 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         return bool(expected) and bool(token) and hmac.compare_digest(token, expected)
 
     @router.post("/approve-entry/{decision_id}")
-    async def approve_entry(decision_id: str, t: str | None = None) -> JSONResponse:
+    async def approve_entry(
+        decision_id: str,
+        t: str | None = None,
+        role: str | None = Depends(deny_viewer),
+    ) -> JSONResponse:
         """One-tap approve for an entry the weekly-premium throttle held back.
 
-        Authorized by a per-decision token (?t=), not the guessable/leakable decision id alone,
-        because approving places a REAL order. No CONTROL_TOKEN configured -> refuse."""
-        if not _entry_action_authorized(decision_id, t):
+        Authorized by owner login or a per-decision token (?t=), not the guessable/leakable
+        decision id alone, because approving places a REAL order."""
+        if role != "owner" and not _entry_action_authorized(decision_id, t):
             return JSONResponse({"ok": False, "status": "unauthorized"}, status_code=401)
         if deps.scanner is None:
             return JSONResponse({"ok": False, "status": "no_scanner"}, status_code=503)
@@ -223,15 +219,19 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
     @router.post("/reject-entry/{decision_id}")
-    async def reject_entry(decision_id: str, t: str | None = None) -> JSONResponse:
-        if not _entry_action_authorized(decision_id, t):
+    async def reject_entry(
+        decision_id: str,
+        t: str | None = None,
+        role: str | None = Depends(deny_viewer),
+    ) -> JSONResponse:
+        if role != "owner" and not _entry_action_authorized(decision_id, t):
             return JSONResponse({"ok": False, "status": "unauthorized"}, status_code=401)
         if deps.scanner is None:
             return JSONResponse({"ok": False, "status": "no_scanner"}, status_code=503)
         result = await deps.scanner.reject_parked_entry(decision_id)
         return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
-    @router.post("/preview-weekly", dependencies=[Depends(require_auth)])
+    @router.post("/preview-weekly", dependencies=[Depends(require_owner)])
     async def preview_weekly() -> JSONResponse:
         """Render the exact weekly report the Friday push would send (trailing 7-day window +
         cumulative + AI narrative) WITHOUT sending it — for previewing on demand."""
@@ -241,12 +241,10 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             deps.settings, deps.positions, deps.orders, deps.decisions)
         return JSONResponse({"title": title, "body": body})
 
-    @router.post("/purge-stale", dependencies=[Depends(require_auth)])
-    async def purge_stale(token: str | None = None) -> JSONResponse:
+    @router.post("/purge-stale", dependencies=[Depends(require_owner)])
+    async def purge_stale() -> JSONResponse:
         """One-time cleanup of P&L noise (reconcile-wipe / re-entry-overwrite artifacts + demo
         seeds). Safe + idempotent: only removes non-open rows with no real outcome."""
-        if not _control_authorized(token):
-            return JSONResponse({"status": "unauthorized"}, status_code=401)
         pos = deps.positions.purge_stale()
         jrn = deps.trade_journal.purge_incomplete() if deps.trade_journal is not None else 0
         deps.audit.record(
@@ -256,16 +254,12 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         )
         return JSONResponse({"ok": True, "purged_positions": pos, "purged_journal": jrn})
 
-    @router.post("/heal-decision/{decision_id}", dependencies=[Depends(require_auth)])
-    async def heal_decision(
-        decision_id: str, status: str = "DONE", token: str | None = None
-    ) -> JSONResponse:
+    @router.post("/heal-decision/{decision_id}", dependencies=[Depends(require_owner)])
+    async def heal_decision(decision_id: str, status: str = "DONE") -> JSONResponse:
         """Admin override for an entry decision's status. For records the reconcile self-heal
         can't reach — a false FAILED whose position already closed before the heal shipped
-        (e.g. ONDS260731P00007500). Flips the DB status only; never places an order. Auth: Basic
-        Auth + CONTROL_TOKEN (no per-decision token needed since nothing executes)."""
-        if not _control_authorized(token):
-            return JSONResponse({"ok": False, "status": "unauthorized"}, status_code=401)
+        (e.g. ONDS260731P00007500). Flips the DB status only; never places an order. Auth: owner
+        Basic or CONTROL_TOKEN (no per-decision token needed since nothing executes)."""
         if deps.entry_decisions is None:
             return JSONResponse({"ok": False, "error": "no entry_decisions store"}, status_code=503)
         try:

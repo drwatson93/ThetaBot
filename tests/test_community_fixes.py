@@ -287,6 +287,16 @@ def test_require_runtime_secrets_exits_when_unset(monkeypatch):
         require_runtime_secrets()
 
 
+def test_require_runtime_secrets_exits_when_viewer_user_matches_owner(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_USER", "admin")
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "a-real-long-secret")
+    monkeypatch.setenv("CONTROL_TOKEN", "a-real-long-secret-token")
+    monkeypatch.setenv("VIEWER_USER", "admin")
+    monkeypatch.setenv("VIEWER_PASSWORD", "a-different-real-secret")
+    with pytest.raises(SystemExit, match="VIEWER_USER"):
+        require_runtime_secrets()
+
+
 def test_rules_page_and_api(tmp_path):
     db = Database(tmp_path / "r.db")
     audit = AuditStore(db)

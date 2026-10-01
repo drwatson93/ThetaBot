@@ -61,7 +61,8 @@ def describe_active_rules(
     add("Hours", "Pause-only token", "PAUSE_TOKEN env (optional)",
         "A monitoring bot can POST /control/pause-only with this token to engage the kill "
         "switch. It cannot resume, approve trades, or change trade alerts. Resume and the "
-        "alerts switch still need CONTROL_TOKEN plus the dashboard login.")
+        "alerts switch still need the owner dashboard login (or CONTROL_TOKEN for scripts). "
+        "A view-only login cannot change anything.")
 
     hook = "configured" if webhook_configured else "not configured"
     mode_s = alerts_mode or "instant"
@@ -70,7 +71,7 @@ def describe_active_rules(
         "the moment a practice trade opens or closes (STO/BTC one-line summary plus "
         "structured fields). Regular and Off send nothing from ThetaBot; the watcher bot "
         "reads the mode and handles those. Changing mode or sending a test alert is "
-        "owner-only (dashboard login + CONTROL_TOKEN); PAUSE_TOKEN cannot. Unset "
+        "owner-only (owner dashboard login); PAUSE_TOKEN cannot. Unset "
         "TRADE_ALERT_URL or set mode Off to roll back. Delivery failures never stop trading "
         "and never write the engine last_error field.")
 

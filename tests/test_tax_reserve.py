@@ -284,13 +284,13 @@ def test_endpoints_and_page_markers(tmp_path):
     t = c.get("/api/tiers").json()
     assert t["ready"] == [] and "tiers" in t
     page = c.get("/dashboard").text
-    for m in ('id="reserve-card"', 'id="tiers-card"', 'id="tn-tr-on"', 'id="tn-tr-save"', "loadReserve", "loadTiers",
+    for m in ('id="reserve-card"', 'id="tiers-card"', 'id="tn-tr-on"', 'id="tn-tr-dry"', "loadReserve", "loadTiers",
               "Tax reserve", "Ready to add", "<th>Note</th>"):
         assert m in page, m
     assert c.get("/api/holdings").json() == {"holdings": []}
-    # tax_reserve is hot-editable
+    # tax_reserve is owner-editable (viewer is 403)
     r = c.post("/api/config", json={"tax_reserve": {"pct": 0.25, "dry_run": False}})
-    assert r.status_code == 403 and r.json()["ok"] is False
+    assert r.status_code == 200 and r.json()["ok"] is True
 
 
 def test_reserve_line_for_reports(tmp_path):

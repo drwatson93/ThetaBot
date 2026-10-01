@@ -37,6 +37,10 @@ services:
         value: admin
       - key: DASHBOARD_PASSWORD
         generateValue: true
+      - key: VIEWER_USER
+        sync: false
+      - key: VIEWER_PASSWORD
+        sync: false
       - key: CONTROL_TOKEN
         generateValue: true
       - key: PAUSE_TOKEN
