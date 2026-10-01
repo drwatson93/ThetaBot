@@ -288,9 +288,9 @@ def test_endpoints_and_page_markers(tmp_path):
               "Tax reserve", "Ready to add", "<th>Note</th>"):
         assert m in page, m
     assert c.get("/api/holdings").json() == {"holdings": []}
-    # tax_reserve edits require CONTROL_TOKEN (dashboard login alone is not enough)
+    # tax_reserve is owner-editable (viewer is 403)
     r = c.post("/api/config", json={"tax_reserve": {"pct": 0.25, "dry_run": False}})
-    assert r.status_code == 401 and r.json()["ok"] is False
+    assert r.status_code == 200 and r.json()["ok"] is True
 
 
 def test_reserve_line_for_reports(tmp_path):

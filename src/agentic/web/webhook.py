@@ -17,12 +17,13 @@ import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from ..config import get_secret
 from ..domain.enums import AuditEventType, SignalStatus
 from ..domain.models import Signal, utcnow
+from .auth import deny_viewer
 
 if TYPE_CHECKING:
     from .app import WebDeps
@@ -33,7 +34,7 @@ log = logging.getLogger("agentic.web.webhook")
 def make_webhook_router(deps: "WebDeps") -> APIRouter:
     router = APIRouter()
 
-    @router.post("/webhook/tradingview")
+    @router.post("/webhook/tradingview", dependencies=[Depends(deny_viewer)])
     async def tradingview(request: Request) -> JSONResponse:
         body = await request.body()
         try:

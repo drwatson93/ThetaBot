@@ -121,10 +121,8 @@ async def test_signal_to_approval_to_execution(ctx):
     decision_id = pending[0].id
 
     # 4. Approve via the control endpoint -> executes the paper close.
-    from agentic.config import close_action_token
-    tok = close_action_token(decision_id)
-    assert client.post(f"/control/approve/{decision_id}").status_code == 401  # no token -> refused
-    ra = client.post(f"/control/approve/{decision_id}?t={tok}")
+    assert client.post(f"/control/approve/{decision_id}", auth=None).status_code == 401
+    ra = client.post(f"/control/approve/{decision_id}")  # owner Basic, no per-decision token
     assert ra.status_code == 200
     assert ra.json()["status"] == "approved"
 
@@ -164,9 +162,8 @@ def _seed_failed_entry(ctx, occ="ONDS260731P00007500"):
 def test_heal_decision_flips_failed_to_done(ctx):
     d = _seed_failed_entry(ctx)
     client = ctx["client"]
-    # No token -> refused (CONTROL_TOKEN is set in the fixture env).
-    assert client.post(f"/control/heal-decision/{d.id}").status_code == 401
-    r = client.post(f"/control/heal-decision/{d.id}?token={CONTROL}")
+    # No token needed for owner Basic; CONTROL_TOKEN still works as an alternative.
+    r = client.post(f"/control/heal-decision/{d.id}")
     assert r.status_code == 200
     body = r.json()
     assert body == {"ok": True, "occ": "ONDS260731P00007500", "from": "FAILED", "to": "DONE"}
@@ -217,11 +214,13 @@ def test_mcp_tools_diagnostic(tmp_path):
 
 def test_pause_resume(ctx):
     client = ctx["client"]
-    assert client.post("/control/pause").status_code == 401             # CONTROL_TOKEN now required
-    assert client.post(f"/control/pause?token={CONTROL}").json()["status"] == "paused"
+    assert client.post("/control/pause", auth=None).status_code == 401
+    assert client.post("/control/pause").json()["status"] == "paused"
     assert ctx["killswitch"].is_paused() is True
-    assert client.post(f"/control/resume?token={CONTROL}").json()["status"] == "resumed"
+    assert client.post("/control/resume").json()["status"] == "resumed"
     assert ctx["killswitch"].is_paused() is False
+    # CONTROL_TOKEN still works without owner Basic.
+    assert client.post(f"/control/pause?token={CONTROL}", auth=None).json()["status"] == "paused"
 
 
 def test_api_quality_disabled_by_default(tmp_path):

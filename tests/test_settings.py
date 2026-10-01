@@ -88,17 +88,7 @@ def test_edit_persists_and_merges_overlay(tmp_path):
     {"broker": "robinhood_mcp"},
     {"robinhood": {"account_number": "999"}},
     {"market_data": "alpaca"},
-    {"tax_reserve": {"dry_run": False}},
-    {"tax_reserve": {"allow_sgov_test_buy": True, "pct": 0.5}},
-    {"entry": {"enabled": True}},
-    {"entry": {"feed": "opra"}},
-    {"roll": {"enabled": True}},
-    {"trading_start": "09:30"},
-    {"trading_end": "17:00"},
-    {"execution": {"order_type": "market"}},
-    {"execution": {"limit_only": False}},
-    {"execution": {"session_open": "08:00"}},
-    {"nyse_holidays": []},
+    {"web": {"port": 9999}},
 ])
 def test_protected_keys_rejected(tmp_path, patch):
     settings = Settings(broker="paper", market_data="paper")
@@ -106,11 +96,27 @@ def test_protected_keys_rejected(tmp_path, patch):
         apply_patch(settings, patch, overlay_path=tmp_path / "o.yaml")
     # Nothing changed and nothing persisted.
     assert settings.mode == "paper"
-    assert settings.tax_reserve.dry_run is True
-    assert settings.entry.enabled is False
-    assert settings.roll.enabled is False
-    assert settings.trading_start == "10:00"
+    assert settings.broker == "paper"
     assert not (tmp_path / "o.yaml").exists()
+
+
+def test_owner_can_edit_tax_reserve_and_trading_start(tmp_path):
+    settings = Settings(broker="paper", market_data="paper")
+    ov = tmp_path / "o.yaml"
+    apply_patch(settings, {
+        "tax_reserve": {"dry_run": False, "pct": 0.3},
+        "trading_start": "10:30",
+        "entry": {"enabled": True},
+        "roll": {"enabled": True},
+    }, overlay_path=ov)
+    assert settings.tax_reserve.dry_run is False
+    assert settings.tax_reserve.pct == 0.3
+    assert settings.trading_start == "10:30"
+    assert settings.entry.enabled is True
+    assert settings.roll.enabled is True
+    saved = load_overlay(ov)
+    assert saved["tax_reserve"]["dry_run"] is False
+    assert saved["trading_start"] == "10:30"
 
 
 def test_invalid_value_rejected_and_not_applied(tmp_path):
@@ -147,100 +153,50 @@ def test_load_config_merges_overlay(tmp_path, monkeypatch):
     assert s.mode == "paper"
 
 
-def test_overlay_tax_reserve_dry_run_has_no_effect(tmp_path, monkeypatch, caplog):
-    """An old overlay must not flip tax_reserve.dry_run (or other locked buy-path keys)."""
+def test_overlay_applies_strategy_keys_but_not_mode(tmp_path, monkeypatch, caplog):
+    """Overlay may change strategy knobs; mode / broker / live-arming stay file-only."""
     base = tmp_path / "config.yaml"
     base.write_text(
         "mode: paper\n"
+        "broker: paper\n"
         "tax_reserve:\n"
         "  enabled: true\n"
         "  dry_run: true\n"
-        "  allow_sgov_test_buy: false\n"
         "  pct: 0.20\n"
+        "trading_start: '10:00'\n"
         "entry:\n"
         "  enabled: false\n"
-        "  feed: indicative\n"
         "  watchlist: [AAPL]\n"
-        "roll:\n"
-        "  enabled: false\n"
     )
     ov = tmp_path / "overlay.yaml"
     monkeypatch.setattr("agentic.config.OVERLAY_PATH", ov)
     save_overlay({
-        "tax_reserve": {"dry_run": False, "allow_sgov_test_buy": True, "pct": 0.99},
-        "entry": {"enabled": True, "feed": "opra", "watchlist": ["F"]},
-        "roll": {"enabled": True},
+        "mode": "live",
+        "i_understand_live_trading": True,
+        "broker": "robinhood_mcp",
+        "tax_reserve": {"dry_run": False, "pct": 0.99},
+        "trading_start": "09:30",
+        "entry": {"enabled": True, "watchlist": ["F"]},
     }, ov)
     with caplog.at_level(logging.WARNING, logger="agentic.config"):
         s = load_config(base)
-    assert s.tax_reserve.dry_run is True
-    assert s.tax_reserve.allow_sgov_test_buy is False
-    assert s.tax_reserve.pct == 0.20
-    assert s.entry.enabled is False
-    assert s.entry.feed == "indicative"
-    assert s.entry.watchlist == ["F"]  # non-locked overlay still applies
-    assert s.roll.enabled is False
-    assert "tax_reserve" in caplog.text
+    assert s.mode == "paper"
+    assert s.broker == "paper"
+    assert s.is_live is False
+    assert s.tax_reserve.dry_run is False
+    assert s.tax_reserve.pct == 0.99
+    assert s.trading_start == "09:30"
+    assert s.entry.enabled is True
+    assert s.entry.watchlist == ["F"]
+    assert "mode" in caplog.text
 
 
-def test_trading_window_patch_rejected(tmp_path):
-    """House rule: no entries before 10:00 ET — trading_start is file/env only."""
-    settings = Settings(broker="paper", market_data="paper")
-    with pytest.raises(SettingsEditError, match="trading_start"):
-        apply_patch(settings, {"trading_start": "09:30"}, overlay_path=tmp_path / "o.yaml")
-    assert settings.trading_start == "10:00"
-    assert not (tmp_path / "o.yaml").exists()
-
-
-def test_limit_only_patch_rejected(tmp_path):
-    """House rule: limit-only / never-market — not a dashboard knob."""
-    settings = Settings(broker="paper", market_data="paper")
-    ov = tmp_path / "o.yaml"
-    with pytest.raises(SettingsEditError, match="execution.order_type"):
-        apply_patch(settings, {"execution": {"order_type": "market"}}, overlay_path=ov)
-    with pytest.raises(SettingsEditError, match="execution.limit_only"):
-        apply_patch(settings, {"execution": {"limit_only": False}}, overlay_path=ov)
-    assert settings.execution.limit_buffer_pct == 0.02
-    assert not ov.exists()
-
-
-def test_execution_non_house_rule_leaves_still_editable(tmp_path):
-    """Parent `execution` stays editable; only order-type / session leaves are locked."""
+def test_execution_leaves_still_editable(tmp_path):
     settings = Settings(broker="paper", market_data="paper")
     apply_patch(settings, {"execution": {"limit_buffer_pct": 0.03}}, overlay_path=tmp_path / "o.yaml")
     assert settings.execution.limit_buffer_pct == 0.03
     saved = load_overlay(tmp_path / "o.yaml")
     assert saved["execution"]["limit_buffer_pct"] == 0.03
-    assert "order_type" not in saved["execution"]
-    assert "limit_only" not in saved["execution"]
-
-
-def test_overlay_trading_start_has_no_effect(tmp_path, monkeypatch, caplog):
-    """An old overlay must not move the 10:00 ET entry window."""
-    base = tmp_path / "config.yaml"
-    base.write_text(
-        "mode: paper\n"
-        "trading_start: '10:00'\n"
-        "paper_buying_power: 1500\n"
-        "entry:\n"
-        "  watchlist: [AAPL]\n"
-    )
-    ov = tmp_path / "overlay.yaml"
-    monkeypatch.setattr("agentic.config.OVERLAY_PATH", ov)
-    save_overlay({
-        "trading_start": "09:30",
-        "trading_end": "17:00",
-        "execution": {"order_type": "market", "limit_only": False, "limit_buffer_pct": 0.03},
-        "nyse_holidays": ["2026-01-01"],
-        "paper_buying_power": 25000,
-    }, ov)
-    with caplog.at_level(logging.WARNING, logger="agentic.config"):
-        s = load_config(base)
-    assert s.trading_start == "10:00"
-    assert s.paper_buying_power == 25000
-    assert s.execution.limit_buffer_pct == 0.03
-    assert not hasattr(s.execution, "order_type")
-    assert "trading_start" in caplog.text
 
 
 # --- endpoint tests ----------------------------------------------------------------------------
@@ -276,53 +232,66 @@ def test_get_config_returns_editable_and_readonly(client):
     assert "entry" in body["editable"]
     assert body["readonly"]["mode"] == "paper"
     assert body["readonly"]["live_armed"] is False
+    assert body["role"] == "owner"
     # The dangerous knobs are reported read-only, never in the editable set.
     assert "mode" not in body["editable"]
-    assert "tax_reserve" not in body["editable"]
+    assert "broker" not in body["editable"]
+    assert "tax_reserve" in body["editable"]
+    assert "trading_start" in body["editable"]
     assert body["from_overlay"] == []
     assert body["overlay"] == {}
-    assert "tax_reserve" in body["readonly"]
-    assert body["readonly"]["tax_reserve"]["dry_run"] is True
-    assert body["readonly"]["trading_start"] == "10:00"
-    assert "trading_start" not in body["editable"]
+    assert "tax_reserve" not in body["readonly"]
 
 
-def test_post_config_requires_control_token(client):
-    c, settings, *_ = client
-    r = c.post("/api/config", json={"entry": {"watchlist": ["F", "SOFI", "T"]}})
-    assert r.status_code == 401
-    assert r.json()["ok"] is False
-    assert r.json().get("status") == "unauthorized"
-    assert settings.entry.watchlist == []
+def test_post_config_owner_basic_does_not_need_token(client):
+    c, settings, audit, scanner = client
+    r = c.post("/api/config", json={"entry": {"watchlist": ["AAPL"]}})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["role"] == "owner"
+    assert settings.entry.watchlist == ["AAPL"]
+    assert scanner.settings.entry.watchlist == ["AAPL"]
+    saved = load_overlay()
+    assert saved["entry"]["watchlist"] == ["AAPL"]
+    assert "entry.watchlist" in body["from_overlay"]
+    row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
+    assert row["payload"]["who"] == "owner"
+    assert row["payload"]["watchlist"] == {"old": [], "new": ["AAPL"]}
+    assert row["payload"]["values"]["entry.watchlist"] == {"old": [], "new": ["AAPL"]}
+    blob = json.dumps(row)
+    assert CONTROL not in blob
+    assert PAUSE not in blob
 
 
-def test_post_config_rejects_pause_token(client, monkeypatch):
+def test_post_config_rejects_pause_token_without_owner(client, monkeypatch):
     monkeypatch.setenv("PAUSE_TOKEN", PAUSE)
     c, settings, *_ = client
-    r = c.post(f"/api/config?token={PAUSE}", json={"entry": {"watchlist": ["F"]}})
+    r = c.post(f"/api/config?token={PAUSE}", json={"entry": {"watchlist": ["F"]}}, auth=None)
     assert r.status_code == 401
-    assert r.json()["ok"] is False
     assert settings.entry.watchlist == []
 
 
 def test_post_config_owner_adds_ticker(client):
-    """Valid CONTROL_TOKEN hot-applies watchlist to the live scanner object and persists overlay."""
+    """CONTROL_TOKEN still hot-applies watchlist as a scripted alternative."""
     c, settings, audit, scanner = client
     r = c.post(
         f"/api/config?token={CONTROL}",
         json={"entry": {"watchlist": ["AAPL"]}},
+        auth=None,
     )
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True
     assert settings.entry.watchlist == ["AAPL"]
-    assert scanner.settings.entry.watchlist == ["AAPL"]  # same Settings the scanner reads each cycle
+    assert scanner.settings.entry.watchlist == ["AAPL"]
     saved = load_overlay()
     assert saved["entry"]["watchlist"] == ["AAPL"]
     assert "entry.watchlist" in body["from_overlay"]
     assert body["overlay"]["entry"]["watchlist"] == ["AAPL"]
     row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
     assert row is not None
+    assert row["payload"]["who"] == "owner"
     assert row["payload"]["changed"] == ["entry"]
     assert row["payload"]["watchlist"] == {"old": [], "new": ["AAPL"]}
     assert row["payload"]["values"]["entry.watchlist"] == {"old": [], "new": ["AAPL"]}
@@ -335,13 +304,8 @@ def test_post_config_owner_adds_ticker(client):
 @pytest.mark.parametrize("patch", [
     {"mode": "live"},
     {"broker": "robinhood_mcp"},
-    {"tax_reserve": {"dry_run": False}},
-    {"tax_reserve": {"pct": 0.5, "allow_sgov_test_buy": True}},
-    {"entry": {"enabled": True}},
-    {"roll": {"enabled": True}},
-    {"trading_start": "09:30"},
-    {"execution": {"order_type": "market"}},
-    {"execution": {"limit_only": False}},
+    {"i_understand_live_trading": True},
+    {"web": {"enabled": False}},
 ])
 def test_post_protected_edit_rejected_even_with_control_token(client, patch):
     c, settings, *_ = client
@@ -350,46 +314,16 @@ def test_post_protected_edit_rejected_even_with_control_token(client, patch):
     assert r.json()["ok"] is False
     assert settings.mode == "paper"
     assert settings.broker == "paper"
-    assert settings.tax_reserve.dry_run is True
-    assert settings.entry.enabled is False
-    assert settings.roll.enabled is False
-    assert settings.trading_start == "10:00"
-
-
-def test_post_trading_window_patch_rejected(client):
-    c, settings, audit, _ = client
-    r = c.post(f"/api/config?token={CONTROL}", json={"trading_start": "09:30"})
-    assert r.status_code == 400
-    assert r.json()["ok"] is False
-    assert "trading_start" in r.json()["error"]
-    assert settings.trading_start == "10:00"
-    assert audit.latest(AuditEventType.CONFIG_EDIT) is None
-
-
-def test_post_limit_only_patch_rejected(client):
-    c, settings, audit, _ = client
-    r = c.post(
-        f"/api/config?token={CONTROL}",
-        json={"execution": {"order_type": "market", "limit_only": False}},
-    )
-    assert r.status_code == 400
-    assert r.json()["ok"] is False
-    assert "execution.order_type" in r.json()["error"]
-    assert "execution.limit_only" in r.json()["error"]
-    assert settings.execution.limit_buffer_pct == 0.02
-    assert audit.latest(AuditEventType.CONFIG_EDIT) is None
 
 
 def test_post_config_audits_leaf_old_new(client):
     """CONFIG_EDIT records every changed leaf as old→new, never the token."""
     c, settings, audit, _ = client
-    r = c.post(
-        f"/api/config?token={CONTROL}",
-        json={"execution": {"limit_buffer_pct": 0.03}},
-    )
+    r = c.post("/api/config", json={"execution": {"limit_buffer_pct": 0.03}})
     assert r.status_code == 200
     row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
     assert row is not None
+    assert row["payload"]["who"] == "owner"
     assert row["payload"]["changed"] == ["execution"]
     assert row["payload"]["values"]["execution.limit_buffer_pct"] == {"old": 0.02, "new": 0.03}
     blob = json.dumps(row)
@@ -397,14 +331,17 @@ def test_post_config_audits_leaf_old_new(client):
     assert PAUSE not in blob
 
 
-def test_dashboard_settings_use_control_token(client):
+def test_dashboard_settings_use_owner_login(client):
     c, *_ = client
     html = c.get("/").text
-    assert 'id="wl-token"' in html
-    assert 'id="tn-token"' in html
-    assert "Wrong CONTROL_TOKEN (unauthorized)." in html
-    assert "/api/config?token=" in html
+    assert 'const ROLE = "owner";' in html
+    assert 'id="wl-token"' not in html
+    assert 'id="tn-token"' not in html
+    assert 'id="al-token"' not in html
+    assert 'id="tn-tr-save"' in html
+    assert "Wrong CONTROL_TOKEN (unauthorized)." not in html
+    assert "/api/config?token=" not in html
     assert "Dashboard is read-only. Edit config.yaml and restart." not in html
     assert "from_overlay" in html
-    assert "Tax reserve is file-only" in html or "File-only, same as mode" in html
-    assert "postConfig({tax_reserve" not in html
+    assert "view-only login" in html
+    assert "postConfig({tax_reserve" in html

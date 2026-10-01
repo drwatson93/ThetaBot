@@ -19,23 +19,16 @@ from pydantic import BaseModel, Field
 log = logging.getLogger("agentic.config")
 
 # Dotted paths that must never be flipped by the data-disk overlay or POST /api/config.
-# Buy-path enables, plus house rules (limit-only, trading window, NYSE calendar).
+# Live-arming / execution-path only. Code-level locks (real-orders HARD DISABLED, limit-only
+# in the executor) are not Settings fields and cannot be changed by any login.
 LOCKED_RUNTIME_PATHS = frozenset({
-    "tax_reserve",              # pct, dry_run, allow_sgov_test_buy, enabled, symbol, schedule
-    "entry.enabled",            # scanner master switch (places CSPs)
-    "entry.feed",               # indicative vs opra; opra is required for live entry
-    "roll.enabled",             # buy-to-close + sell-to-open roll path
-    # House rules — file/env only. Session 09:30–16:00 and NYSE holidays are code
-    # (market_hours / nyse_calendar); the names below are still locked so an overlay
-    # or dashboard patch cannot sneak them in. trading_start is a real Settings leaf.
-    "trading_start",            # no entries/exits before this ET clock (default 10:00)
-    "trading_end",              # regular-session close (16:00 ET; early close 13:00)
-    "execution.order_type",     # limit only — never market
-    "execution.limit_only",
-    "execution.session_open",   # 09:30 ET quote session
-    "execution.session_close",  # 16:00 ET (or 13:00 early close)
-    "nyse_calendar",
-    "nyse_holidays",
+    "mode",
+    "i_understand_live_trading",
+    "broker",
+    "broker_fallback",
+    "market_data",
+    "robinhood",
+    "web",
 })
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -419,7 +412,6 @@ class Settings(BaseModel):
     approval_timeout_seconds: int = 900
     max_quote_age_seconds: int = 90
     # No new entries, exits, or stop-loss orders before this America/New_York clock time.
-    # File/env only — dashboard overlay cannot change it (LOCKED_RUNTIME_PATHS).
     trading_start: str = "10:00"
     auto_trip_after_errors: int = 0  # auto-engage kill switch after N consecutive errors (0=off)
 
@@ -603,6 +595,14 @@ def require_runtime_secrets() -> None:
             "Refusing to start: " + " and ".join(missing)
             + " must be set to a real secret (not blank, not a placeholder). "
             "Supply them as environment variables."
+        )
+    owner = (get_secret("DASHBOARD_USER", "admin") or "admin").strip() or "admin"
+    viewer_user = (get_secret("VIEWER_USER") or "").strip()
+    viewer_pass = get_secret("VIEWER_PASSWORD")
+    if viewer_user and is_usable_secret(viewer_pass) and viewer_user == owner:
+        raise SystemExit(
+            "Refusing to start: VIEWER_USER must differ from DASHBOARD_USER "
+            "(one login cannot be both owner and viewer)."
         )
 
 

@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from ..services.stats import compute_stats, position_rows
 from ..domain.order_pricing import public_close_pricing_fields, public_pricing_fields
-from .auth import require_auth
+from .auth import require_auth, require_owner
 from .calc_page import CALC_PAGE
 
 if TYPE_CHECKING:
@@ -168,7 +168,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                             "call_put_vol_ratio": round(call_vol / put_vol, 2) if put_vol else None},
                 "contracts": rows[:150]}
 
-    @router.post("/api/screen")
+    @router.post("/api/screen", dependencies=[Depends(require_owner)])
     async def api_screen(body: dict = Body(default={})) -> dict:
         """On-demand CSP screener over an arbitrary universe with adjustable filters. Body:
         {symbols?:[..], delta_min?, delta_max?, dte_min?, dte_max?, min_annualized_yield?,
@@ -198,7 +198,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             "volume": c.volume, "break_even": c.break_even,
         } for c in cands]}
 
-    @router.post("/api/opportunities")
+    @router.post("/api/opportunities", dependencies=[Depends(require_owner)])
     async def api_opportunities(body: dict = Body(default={})) -> dict:
         """Curated opportunity scan: discover Alpaca's most-active names in a price band, screen
         each for CSPs, rank by theta-efficiency. Body: {price_min?, price_max?, universe_size?,
@@ -815,12 +815,12 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         } for d in ds]}
 
     @router.get("/", response_class=HTMLResponse)
-    async def index() -> str:
-        return _PAGE
+    async def index(role: str = Depends(require_auth)) -> str:
+        return _page_for(role)
 
     @router.get("/dashboard", response_class=HTMLResponse)
-    async def dashboard() -> str:
-        return _PAGE
+    async def dashboard(role: str = Depends(require_auth)) -> str:
+        return _page_for(role)
 
     @router.get("/calculator", response_class=HTMLResponse)
     async def calculator() -> str:
@@ -841,6 +841,11 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         return _RULES_PAGE
 
     return router
+
+
+def _page_for(role: str) -> str:
+    shown = role if role in ("owner", "viewer") else "viewer"
+    return _PAGE.replace("__TB_ROLE__", shown)
 
 
 # --- self-contained page (vanilla JS, no dependencies) -----------------------------------
@@ -992,6 +997,11 @@ _PAGE = """<!doctype html>
   input.wk{width:74px;flex:none;text-align:right;font-family:var(--mono)}
   .go{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:7px 12px;cursor:pointer;font:inherit;font-weight:600;font-size:13px;flex:none}
   .go:hover{filter:brightness(1.06)} .go:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+  .go:disabled,.rbtn:disabled{opacity:.45;cursor:not-allowed;filter:none}
+  .view-badge{font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    background:var(--raise);border:1px solid var(--line);color:var(--muted);
+    padding:3px 8px;border-radius:999px;margin-right:8px;vertical-align:middle}
+  body.role-viewer .owner-only{display:none !important}
   .hint{font-size:11.5px;color:var(--faint);margin-top:7px}
   .say{font-size:12px;margin-top:7px;min-height:16px}
   .say.ok{color:var(--pos)} .say.err{color:var(--neg)}
@@ -1101,7 +1111,7 @@ _PAGE = """<!doctype html>
 
   <div class="masthead">
     <h1>Trader Cortex <span>· wheel bot</span></h1>
-    <div class="updated"><span id="ago">loading…</span>
+    <div class="updated"><span id="role-badge"></span><span id="ago">loading…</span>
       <a class="rbtn" href="/rules" style="text-decoration:none">Rules</a>
       <a class="rbtn" href="/calculator" style="text-decoration:none">Calculator</a>
       <button class="rbtn" onclick="loadAll()">Refresh now</button></div>
@@ -1150,12 +1160,8 @@ _PAGE = """<!doctype html>
             <button class="rbtn" type="button" data-mode="regular">Regular</button>
             <button class="rbtn" type="button" data-mode="off">Off</button>
           </div>
-          <div class="hint">Instant: ThetaBot POSTs each fill to TRADE_ALERT_URL the moment it records it. Regular and Off: ThetaBot sends nothing; the watcher bot reads this mode. Owner-only (CONTROL_TOKEN). Pause token cannot change this.</div>
-          <div class="ctl-lab" style="margin-top:12px">Owner token</div>
-          <div class="row">
-            <input class="f" id="al-token" type="password" placeholder="CONTROL_TOKEN" autocomplete="off"/>
-          </div>
-          <div class="row" style="margin-top:8px">
+          <div class="hint">Instant: ThetaBot POSTs each fill to TRADE_ALERT_URL the moment it records it. Regular and Off: ThetaBot sends nothing; the watcher bot reads this mode. Owner login can change this; view-only login cannot. Pause token cannot change this.</div>
+          <div class="row owner-only" style="margin-top:8px">
             <button class="go" type="button" id="al-test">Send test alert</button>
           </div>
           <div class="say" id="al-say"></div>
@@ -1212,16 +1218,12 @@ _PAGE = """<!doctype html>
     <div class="ctl">
       <div class="ctl-lab">Watching for new puts <span id="wl-count" class="count"></span></div>
       <div class="wl" id="wl"></div>
-      <div class="row">
+      <div class="row owner-only">
         <input class="f" id="wl-in" placeholder="Add ticker, e.g. AAPL" maxlength="6"
           autocapitalize="characters" autocomplete="off"/>
         <button class="go" id="wl-add">Add</button>
       </div>
-          <div class="hint">Aim for 10–25 names you'd be happy to own. Changes apply live. Owner-only (CONTROL_TOKEN); pause token cannot change this. Overlay values on the data disk override config.yaml.</div>
-          <div class="ctl-lab" style="margin-top:12px">Owner token</div>
-          <div class="row">
-            <input class="f" id="wl-token" type="password" placeholder="CONTROL_TOKEN" autocomplete="off"/>
-          </div>
+          <div class="hint">Aim for 10–25 names you'd be happy to own. Changes apply live. Owner login can edit; view-only cannot. Overlay values on the data disk override config.yaml.</div>
           <div class="hint ov-note" id="wl-ov-note"></div>
           <div class="say" id="wl-say"></div>
 
@@ -1229,7 +1231,7 @@ _PAGE = """<!doctype html>
       <div class="row">
         <input class="f wk mono" id="wk-in" inputmode="decimal" placeholder="0"/>
         <span class="muted" style="font-size:13px">% of account</span>
-        <button class="go" id="wk-save">Save</button>
+        <button class="go owner-only" id="wk-save">Save</button>
       </div>
       <div class="hint">Past this, new entries wait for your one-tap OK instead of auto-firing. 0 = off.</div>
       <div class="say" id="wk-say"></div>
@@ -1307,23 +1309,20 @@ _PAGE = """<!doctype html>
   <div class="tabpane" id="pane-tuning" hidden>
   <section class="card2">
     <div class="card-h"><h2>Tuning</h2><span class="count">owner-only</span></div>
-    <div class="hint">Strategy knobs apply live and persist on the data-disk overlay (which overrides config.yaml). Owner-only: dashboard login + CONTROL_TOKEN. Pause token cannot change these. Mode, live-arming, and broker stay file-only.</div>
+    <div class="hint">Strategy knobs apply live and persist on the data-disk overlay (which overrides config.yaml). Owner login can edit; view-only cannot. Mode, live-arming, and broker stay file-only. Real orders and limit-only are locked in code.</div>
     <div class="ctl">
-      <div class="ctl-lab">Owner token</div>
-      <div class="row">
-        <input class="f" id="tn-token" type="password" placeholder="CONTROL_TOKEN" autocomplete="off"/>
-      </div>
       <div class="hint ov-note" id="tn-ov-note"></div>
       <div class="ctl-lab">Tax reserve / gains sweep</div>
-      <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="tn-tr-on" disabled/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
+      <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-on"/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
       <div class="scr-filters">
-        <label>% of net gains<input class="f scrn" id="tn-tr-pct" inputmode="decimal" placeholder="20" disabled/></label>
-        <label>Symbol<input class="f scrn" id="tn-tr-sym" placeholder="SGOV" maxlength="6" autocapitalize="characters" disabled/></label>
-        <label>Day<select class="f" id="tn-tr-day" disabled><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option></select></label>
-        <label>Time (ET)<input class="f scrn" id="tn-tr-time" placeholder="15:40" disabled/></label>
+        <label>% of net gains<input class="f scrn" id="tn-tr-pct" inputmode="decimal" placeholder="20"/></label>
+        <label>Symbol<input class="f scrn" id="tn-tr-sym" placeholder="SGOV" maxlength="6" autocapitalize="characters"/></label>
+        <label>Day<select class="f" id="tn-tr-day"><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option></select></label>
+        <label>Time (ET)<input class="f scrn" id="tn-tr-time" placeholder="15:40"/></label>
+        <button class="go" id="tn-tr-save">Save</button>
       </div>
-      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="tn-tr-dry" disabled/> Dry run (log what it would buy, place nothing)</label></div>
-      <div class="hint">File-only, same as mode: pct, dry-run, and the SGOV test-buy switch live in config.yaml. Overlay cannot flip them.</div>
+      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-dry"/> Dry run (log what it would buy, place nothing)</label></div>
+      <div class="hint">Applies live and persists on the data-disk overlay. Dry-run logs the intended buy without placing it.</div>
       <div class="say" id="tn-tr-say"></div>
 
       <div class="ctl-lab" style="margin-top:18px">Market regime</div>
@@ -1483,6 +1482,18 @@ const pct = (v) => v == null ? "—" : (v*100).toFixed(0) + "%";
 const human = (l) => String(l == null ? "" : l).split("_").join(" ");
 const biasPill = (b) => { const k = b==="favorable"?"fav":(b==="avoid"?"avoid":(b==="mixed"?"mixed":"")); return `<span class="pill ${k}">${esc(b||"none")}</span>`; };
 async function getJSON(u){ const r = await fetch(u,{credentials:"same-origin"}); if(!r.ok) throw new Error(u+" -> "+r.status); return r.json(); }
+const ROLE = "__TB_ROLE__";
+function isOwner(){ return ROLE === "owner"; }
+function applyRoleUI(){
+  if(isOwner()) return;
+  document.body.classList.add("role-viewer");
+  const badge = $("role-badge");
+  if(badge){ badge.className = "view-badge"; badge.textContent = "view-only login"; }
+  document.querySelectorAll("#al-modes .rbtn, #al-test, #wl-add, #wl-in, #wk-save, #wk-in, #brief-run, #scr-run, #scr-scan, #pane-tuning button.go, #pane-tuning input, #pane-tuning select, #scr-syms, .scr-filters input").forEach(el => {
+    if(el) el.disabled = true;
+  });
+}
+applyRoleUI();
 function tickerLogo(sym){
   const s = esc(sym);
   const hue = [...s].reduce((a,c)=>a+c.charCodeAt(0),0)%360;
@@ -1537,27 +1548,6 @@ async function loadConn(){
   renderAlerts(al);
 }
 
-function ownerToken(){
-  const ids = ["al-token","wl-token","tn-token"];
-  for(const id of ids){
-    const el = $(id);
-    const typed = el && el.value ? el.value.trim() : "";
-    if(typed){
-      try{ sessionStorage.setItem("tb_control_token", typed); }catch(e){}
-      ids.forEach(other => { const o=$(other); if(o && !o.value) o.value = typed; });
-      return typed;
-    }
-  }
-  try{ return sessionStorage.getItem("tb_control_token") || ""; }catch(e){ return ""; }
-}
-function fillOwnerTokenFields(){
-  let saved = "";
-  try{ saved = sessionStorage.getItem("tb_control_token") || ""; }catch(e){}
-  ["al-token","wl-token","tn-token"].forEach(id => {
-    const el = $(id);
-    if(el && !el.value && saved) el.value = saved;
-  });
-}
 function renderOverlaySource(cfg){
   const paths = (cfg && cfg.from_overlay) || [];
   const html = paths.length
@@ -1579,7 +1569,6 @@ function renderAlerts(a){
   }
 }
 async function loadAlerts(){
-  fillOwnerTokenFields();
   try {
     const st = await getJSON("/control/status");
     renderAlerts(st.alerts || {});
@@ -1587,13 +1576,12 @@ async function loadAlerts(){
 }
 async function setAlertMode(mode){
   const say = $("al-say");
-  const tok = ownerToken();
-  if(!tok){
-    if(say){ say.className = "say err"; say.textContent = "Enter CONTROL_TOKEN to change alerts."; }
+  if(!isOwner()){
+    if(say){ say.className = "say err"; say.textContent = "View-only login cannot change alerts."; }
     return;
   }
   try {
-    const r = await fetch("/control/alerts-mode?token="+encodeURIComponent(tok)+"&mode="+encodeURIComponent(mode), {method:"POST", credentials:"same-origin"});
+    const r = await fetch("/control/alerts-mode?mode="+encodeURIComponent(mode), {method:"POST", credentials:"same-origin"});
     const d = await r.json();
     if(!r.ok || !d.ok){
       if(say){ say.className = "say err"; say.textContent = d.error || d.status || ("HTTP "+r.status); }
@@ -1607,14 +1595,13 @@ async function setAlertMode(mode){
 }
 async function sendTestAlert(){
   const say = $("al-say");
-  const tok = ownerToken();
-  if(!tok){
-    if(say){ say.className = "say err"; say.textContent = "Enter CONTROL_TOKEN to send a test alert."; }
+  if(!isOwner()){
+    if(say){ say.className = "say err"; say.textContent = "View-only login cannot send a test alert."; }
     return;
   }
   if(say){ say.className = "say"; say.textContent = "Sending test alert…"; }
   try {
-    const r = await fetch("/control/test-alert?token="+encodeURIComponent(tok), {method:"POST", credentials:"same-origin"});
+    const r = await fetch("/control/test-alert", {method:"POST", credentials:"same-origin"});
     const d = await r.json();
     if(d.alerts) renderAlerts(d.alerts);
     if(!r.ok){
@@ -1718,7 +1705,7 @@ async function loadTiers(){
   const nxt = d.next ? `<div class="hint">Next unlock: <b>${esc(d.next.symbol)}</b> needs about ${money(d.next.account_value_needed)} of account value (one contract = ${money(d.next.collateral)}).</div>` : "";
   el.innerHTML = (ready.length ? ready.map(r => `<div class="row" style="margin-bottom:6px"><span class="wl-tag">${esc(r.symbol)}</span>
       <span class="muted" style="font-size:12.5px;flex:1">${money(r.collateral)} per contract · cap ${money(r.per_name_cap)}${r.note ? " · " + esc(r.note) : ""}</span>
-      <button class="go" data-add="${esc(r.symbol)}" data-pt='${esc(JSON.stringify(r.per_ticker||{}))}'>Add</button></div>`).join("")
+      ${isOwner()?`<button class="go" data-add="${esc(r.symbol)}" data-pt='${esc(JSON.stringify(r.per_ticker||{}))}'>Add</button>`:""}</div>`).join("")
     : `<div class="muted" style="font-size:12.5px">Quality names from the community list appear here once one contract fits under the per-name cap. Nothing is added without a tap.</div>`) + nxt
     + `<div class="say" id="tiers-say"></div>`;
   el.querySelectorAll("button[data-add]").forEach(b => b.onclick = async () => {
@@ -1736,6 +1723,16 @@ function fillReserve(tr){
   _setIf("tn-tr-sym", tr.symbol || "SGOV");
   _setIf("tn-tr-day", tr.weekday != null ? String(tr.weekday) : "4");
   _setIf("tn-tr-time", (tr.hour != null ? String(tr.hour).padStart(2,"0") : "15") + ":" + (tr.minute != null ? String(tr.minute).padStart(2,"0") : "40"));
+}
+async function saveReserve(){
+  const pct = parseFloat(($("tn-tr-pct").value||"").trim()); const sym = ($("tn-tr-sym").value||"").trim().toUpperCase();
+  const tm = ($("tn-tr-time").value||"15:40").trim().split(":"); const hh = parseInt(tm[0],10), mm = parseInt(tm[1]||"0",10);
+  if(isNaN(pct) || pct <= 0 || pct > 60){ say("tn-tr-say","Enter a percent between 1 and 60.",false); return; }
+  if(!/^[A-Z]{1,6}$/.test(sym)){ say("tn-tr-say","Enter a stock or ETF ticker, e.g. SGOV.",false); return; }
+  if(isNaN(hh) || isNaN(mm) || hh < 9 || hh > 15 || (hh === 9 && mm < 35)){ say("tn-tr-say","Time must be inside market hours (09:35 to 15:55 ET).",false); return; }
+  try { await postConfig({tax_reserve:{enabled:$("tn-tr-on").checked, dry_run:$("tn-tr-dry").checked, pct: pct/100, symbol: sym, weekday: parseInt($("tn-tr-day").value,10), hour: hh, minute: mm}});
+    say("tn-tr-say", $("tn-tr-on").checked ? (($("tn-tr-dry").checked ? "On (dry run): " : "On: ") + pct + "% of net gains into " + sym + " every " + dayName(parseInt($("tn-tr-day").value,10)) + ".") : "Off.", true);
+  } catch(e){ say("tn-tr-say","Couldn't save: "+e.message,false); }
 }
 
 /* ---- activity ---- */
@@ -1853,7 +1850,6 @@ async function runScan(){
   finally{ $("scr-scan").disabled=false; }
 }
 async function loadControls(){
-  fillOwnerTokenFields();
   const cfg = await getJSON("/api/config");
   renderOverlaySource(cfg);
   const e = cfg.editable.entry || {};
@@ -1863,7 +1859,7 @@ async function loadControls(){
   if(document.activeElement !== $("wk-in")) $("wk-in").value = wt ? (wt*100).toFixed(wt*100 % 1 ? 1 : 0) : "0";
   fillTuning(e);
   fillMacro(cfg.editable.macro || {});
-  fillReserve((cfg.readonly && cfg.readonly.tax_reserve) || {});
+  fillReserve((cfg.editable && cfg.editable.tax_reserve) || {});
 }
 function fillMacro(m){
   if(document.activeElement !== $("tn-skip-dt")) $("tn-skip-dt").checked = !!m.skip_confirmed_downtrend;
@@ -1958,20 +1954,19 @@ async function savePerTicker(){
 function renderWatchlist(){
   $("wl-count").textContent = watchlist.length ? "("+watchlist.length+")" : "";
   $("wl").innerHTML = watchlist.map(t =>
-    `<span class="wl-tag">${esc(t)} <button class="wl-x" data-t="${esc(t)}" title="Remove ${esc(t)}">×</button></span>`
+    `<span class="wl-tag">${esc(t)}${isOwner()?` <button class="wl-x" data-t="${esc(t)}" title="Remove ${esc(t)}">×</button>`:""}</span>`
   ).join("") || `<span class="muted" style="font-size:12.5px">No tickers yet — add a few below.</span>`;
   $("wl").querySelectorAll(".wl-x").forEach(b => b.onclick = () => removeTicker(b.dataset.t));
 }
 function say(id, msg, ok){ const e=$(id); e.textContent=msg; e.className="say "+(ok?"ok":"err"); if(ok) setTimeout(()=>{if(e.textContent===msg)e.textContent="";},4000); }
 async function postConfig(patch){
-  const tok = ownerToken();
-  if(!tok) throw new Error("Enter CONTROL_TOKEN to save settings.");
-  const r = await fetch("/api/config?token="+encodeURIComponent(tok), {
+  if(!isOwner()) throw new Error("View-only login cannot save settings.");
+  const r = await fetch("/api/config", {
     method:"POST", headers:{"Content-Type":"application/json"},
     credentials:"same-origin", body:JSON.stringify(patch)
   });
   const d = await r.json().catch(()=>({}));
-  if(r.status === 401) throw new Error("Wrong CONTROL_TOKEN (unauthorized).");
+  if(r.status === 403) throw new Error("View-only login cannot save settings.");
   if(!r.ok || d.ok === false) throw new Error(d.error || ("HTTP "+r.status));
   renderOverlaySource(d);
   return d;
@@ -2309,6 +2304,7 @@ $("wk-save").onclick = saveWeekly;
 $("wk-in").addEventListener("keydown", e => { if(e.key==="Enter") saveWeekly(); });
 $("tn-uc-save").onclick = saveMulti;
 $("tn-dt-save").onclick = saveDowntrend;
+$("tn-tr-save").onclick = saveReserve;
 $("tn-gates-save").onclick = saveGates;
 $("tn-global-save").onclick = saveGlobal;
 $("tn-pt-save").onclick = savePerTicker;

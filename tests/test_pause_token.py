@@ -151,18 +151,18 @@ def test_pause_token_rejected_by_resume_and_approval_routes(ctx):
     client.post("/control/pause-only?token=" + PAUSE, auth=None)
     assert ctx["killswitch"].is_paused() is True
 
-    resume = client.post(f"/control/resume?token={PAUSE}")
+    resume = client.post(f"/control/resume?token={PAUSE}", auth=None)
     assert resume.status_code == 401
     assert ctx["killswitch"].is_paused() is True
 
-    assert client.post("/control/approve/dec-1?t=" + PAUSE).status_code == 401
-    assert client.post("/control/reject/dec-1?t=" + PAUSE).status_code == 401
-    assert client.post("/control/approve-entry/dec-1?t=" + PAUSE).status_code == 401
-    assert client.post("/control/reject-entry/dec-1?t=" + PAUSE).status_code == 401
+    assert client.post("/control/approve/dec-1?t=" + PAUSE, auth=None).status_code == 401
+    assert client.post("/control/reject/dec-1?t=" + PAUSE, auth=None).status_code == 401
+    assert client.post("/control/approve-entry/dec-1?t=" + PAUSE, auth=None).status_code == 401
+    assert client.post("/control/reject-entry/dec-1?t=" + PAUSE, auth=None).status_code == 401
 
-    # Existing CONTROL_TOKEN pause/resume path still works (and PAUSE_TOKEN cannot use it).
-    assert client.post(f"/control/pause?token={PAUSE}").status_code == 401
-    ok = client.post(f"/control/resume?token={CONTROL}")
+    # PAUSE_TOKEN cannot use /control/pause or /control/resume. Owner Basic or CONTROL_TOKEN can.
+    assert client.post(f"/control/pause?token={PAUSE}", auth=None).status_code == 401
+    ok = client.post(f"/control/resume?token={CONTROL}", auth=None)
     assert ok.status_code == 200
     assert ok.json()["status"] == "resumed"
     assert ctx["killswitch"].is_paused() is False
