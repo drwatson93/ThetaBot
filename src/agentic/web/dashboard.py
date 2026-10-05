@@ -3,7 +3,7 @@
   GET /                -> the dashboard page
   GET /dashboard       -> the dashboard page
   GET /api/stats       -> win rate, realized/unrealized P&L, per-rule rollup
-  GET /api/positions   -> open + closed positions with P&L and the rule that closed them
+  GET /api/positions   -> open + closed positions with P&L, underlying last, and the rule that closed them
   GET /api/decisions   -> recent close decisions with reasons (the "why", for memory tuning)
   GET /api/audit       -> recent audit events
 
@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
-from ..services.stats import compute_stats, position_rows
+from ..domain.models import utcnow
 from ..domain.order_pricing import public_close_pricing_fields, public_pricing_fields
+from ..services.stats import compute_stats, position_rows
 from .auth import require_auth, require_owner
 from .calc_page import CALC_PAGE
 
@@ -43,6 +44,89 @@ def _sector_exposure(positions, riskcfg, account_value):
     return [{"sector": k, "collateral": round(v, 0),
              "pct_of_account": round(v / account_value * 100, 1) if account_value else None}
             for k, v in sorted(exp.items(), key=lambda x: -x[1])]
+
+
+def _md_price_source(md) -> str:
+    """Short label for the live equity-quote provider (crew-bot note, not a new feed)."""
+    name = type(md).__name__.lower()
+    if "robinhood" in name:
+        return "robinhood"
+    if "alpaca" in name:
+        return "alpaca"
+    return "market_data"
+
+
+def _ctx_last_price(ctx_map: dict, symbol: str):
+    """Last-scan underlying close from scanner.last_context, if present."""
+    if not ctx_map:
+        return None
+    by_upper = {str(k).upper(): v for k, v in ctx_map.items()}
+    c = by_upper.get((symbol or "").upper())
+    if c is None:
+        return None
+    px = c.get("price") if isinstance(c, dict) else getattr(c, "price", None)
+    try:
+        return float(px) if px is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def load_underlying_quotes(deps: "WebDeps", positions) -> dict[str, dict]:
+    """Live equity last/mark per unique underlying, reused from MarketDataProvider.
+
+    OPEN/CLOSING names, and closed names still in the last scan context, call
+    ``get_underlying_price`` (Robinhood ``get_equity_quotes`` last trade / mark, or Alpaca
+    last trade — same path the scanner already uses). Remaining rows fall back to the last
+    scan's daily close. Fail-open: a quote miss leaves the symbol out of the map so the row
+    serializes ``underlying_price: null``.
+    """
+    quotes: dict[str, dict] = {}
+    sc = getattr(deps, "scanner", None)
+    md = getattr(sc, "market_data", None) if sc is not None else None
+    ctx = getattr(sc, "last_context", {}) if sc is not None else {}
+    scanned = getattr(sc, "last_scan_at", None) if sc is not None else None
+    scan_as_of = scanned.isoformat() if scanned is not None and hasattr(scanned, "isoformat") else None
+
+    all_syms: list[str] = []
+    seen: set[str] = set()
+    open_set: set[str] = set()
+    for p in positions:
+        sym = (getattr(p, "underlying", None) or "").upper()
+        if not sym:
+            continue
+        if sym not in seen:
+            seen.add(sym)
+            all_syms.append(sym)
+        status = getattr(getattr(p, "status", None), "value", getattr(p, "status", None))
+        if str(status) in ("OPEN", "CLOSING"):
+            open_set.add(sym)
+    ctx_syms = {str(k).upper() for k in (ctx or {})}
+    live_syms = [s for s in all_syms if s in open_set or s in ctx_syms]
+
+    now_iso = utcnow().isoformat()
+    source = _md_price_source(md) if md is not None else "market_data"
+    getter = getattr(md, "get_underlying_price", None) if md is not None else None
+    for sym in live_syms:
+        px = None
+        if getter is not None:
+            try:
+                px = await getter(sym)
+            except Exception:  # noqa: BLE001 — advisory quote; never fail the positions API
+                px = None
+        try:
+            px = float(px) if px is not None else None
+        except (TypeError, ValueError):
+            px = None
+        if px is not None:
+            quotes[sym] = {"price": px, "source": source, "as_of": now_iso}
+
+    for sym in all_syms:
+        if sym in quotes:
+            continue
+        px = _ctx_last_price(ctx or {}, sym)
+        if px is not None:
+            quotes[sym] = {"price": px, "source": "last_scan", "as_of": scan_as_of}
+    return quotes
 
 
 def make_dashboard_router(deps: "WebDeps") -> APIRouter:
@@ -76,9 +160,12 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
 
     @router.get("/api/positions")
     async def api_positions() -> dict:
+        positions = deps.positions.list_all()
+        quotes = await load_underlying_quotes(deps, positions)
         rows = position_rows(
-            deps.positions.list_all(), deps.orders.list_all(), deps.decisions.recent(1000),
+            positions, deps.orders.list_all(), deps.decisions.recent(1000),
             real_only=deps.settings.is_live,
+            underlying_quotes=quotes,
         )
         return {"positions": rows}
 
