@@ -149,14 +149,38 @@ def _is_paper_position(p: Position, paper_occs: set[str]) -> bool:
     return p.occ_symbol in paper_occs
 
 
+def _underlying_quote_fields(underlying: str, quotes: dict[str, dict] | None) -> dict:
+    """Stamp ``underlying_price`` (+ source/as_of) onto a position row. Always present."""
+    q: dict = {}
+    if quotes:
+        key = (underlying or "").upper()
+        q = quotes.get(key) or quotes.get(underlying) or {}
+    price = q.get("price") if q else None
+    if price is not None:
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            price = None
+    return {
+        "underlying_price": price,
+        "underlying_price_source": q.get("source") if price is not None else None,
+        "underlying_price_as_of": q.get("as_of") if price is not None else None,
+    }
+
+
 def position_rows(
     positions: list[Position], orders: list[Order], decisions: list[CloseDecision],
     real_only: bool = False,
+    underlying_quotes: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Per-position view rows (P&L + attributed rule) for /api/positions.
 
     ``real_only`` drops paper positions — used in live mode so views/reports show only real trades,
     not leftover paper-soak history.
+
+    ``underlying_quotes`` is an optional ``{SYMBOL: {price, source, as_of}}`` map from the
+    dashboard (live equity last/mark, falling back to the last scan). Missing or unknown
+    symbols serialize as ``underlying_price: null`` — never invented.
     """
     by_pos = _orders_by_position(orders)
     rule_by_pos = _rule_by_position(decisions)
@@ -191,6 +215,7 @@ def position_rows(
             "close_price": info["close_price"],
             "pnl_estimated": info["pnl_estimated"],
             "rule": rule_by_pos.get(p.id),
+            **_underlying_quote_fields(p.underlying, underlying_quotes),
             **public_pricing_fields(open_o),
             **order_as_close_pricing(close_o),
         })

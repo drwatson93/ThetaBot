@@ -1,5 +1,6 @@
 """Dashboard: compute_stats P&L/win-rate logic + read-only API endpoints."""
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -8,8 +9,9 @@ from agentic.domain.enums import (
     DecisionStatus, OptionType, OrderStatus, PositionStatus, RuleType, Strategy,
 )
 from agentic.domain.models import CloseDecision, Order, Position
+from agentic.entry.context import UnderlyingContext
 from agentic.services.killswitch import KillSwitch
-from agentic.services.stats import compute_stats, position_pnl
+from agentic.services.stats import compute_stats, position_pnl, position_rows
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
@@ -112,6 +114,10 @@ def test_dashboard_endpoints(tmp_path):
 
     rows = client.get("/api/positions").json()["positions"]
     assert rows[0]["outcome"] == "win" and rows[0]["rule"] == "profit-50"
+    # No scanner / market data in this fixture — field is present, quote is genuinely unavailable.
+    assert rows[0]["underlying_price"] is None
+    assert rows[0]["underlying_price_source"] is None
+    assert rows[0]["underlying_price_as_of"] is None
 
     decs = client.get("/api/decisions").json()["decisions"]
     assert decs[0]["rule_name"] == "profit-50"
@@ -172,3 +178,145 @@ def test_auth_enforced_when_password_set(tmp_path, monkeypatch):
     assert client.get("/dashboard", auth=("me", "s3cret")).status_code == 200
     # Open endpoints stay open: health (Coolify healthcheck) is never auth-gated.
     assert client.get("/health").status_code == 200
+
+
+# --- underlying_price on /api/positions ----------------------------------------------------------
+
+def test_position_rows_include_underlying_price_fields():
+    """Serializer always emits the field; price is null unless a quote map is passed."""
+    p = _pos("OPEN", PositionStatus.OPEN, 1.5, mark=1.0)
+    bare = position_rows([p], [], [])[0]
+    assert bare["underlying_price"] is None
+    assert bare["underlying_price_source"] is None
+    assert bare["underlying_price_as_of"] is None
+
+    stamped = position_rows(
+        [p], [], [],
+        underlying_quotes={"AAPL": {
+            "price": 185.42, "source": "robinhood", "as_of": "2026-10-05T14:00:00+00:00",
+        }},
+    )[0]
+    assert stamped["underlying_price"] == 185.42
+    assert stamped["underlying_price_source"] == "robinhood"
+    assert stamped["underlying_price_as_of"] == "2026-10-05T14:00:00+00:00"
+    # Clerk/Watchman cushion: (price - strike) / strike from this field alone.
+    assert round((stamped["underlying_price"] - stamped["strike"]) / stamped["strike"], 6) == round(
+        (185.42 - 250.0) / 250.0, 6
+    )
+
+
+class _FakeRobinhoodMD:
+    """Stand-in for RobinhoodMarketData.get_underlying_price — no live MCP."""
+
+    def __init__(self, prices, boom=False):
+        self.prices = prices
+        self.boom = boom
+        self.calls = []
+
+    async def get_underlying_price(self, underlying):
+        self.calls.append(underlying)
+        if self.boom:
+            raise RuntimeError("quote feed down")
+        return self.prices.get((underlying or "").upper())
+
+
+def _pos_app(tmp_path, pos, scanner=None):
+    db = Database(tmp_path / "px.db")
+    audit = AuditStore(db)
+    positions = PositionStore(db)
+    positions.upsert(pos)
+    deps = WebDeps(
+        settings=Settings(mode="paper"), signals=SignalStore(db),
+        killswitch=KillSwitch(db, audit), approval_gate=None, audit=audit,
+        positions=positions, orders=OrderStore(db), decisions=DecisionStore(db),
+        scanner=scanner,
+    )
+    return TestClient(create_app(deps))
+
+
+def test_api_positions_underlying_price_from_market_data(tmp_path):
+    """Open rows reuse MarketDataProvider.get_underlying_price (Robinhood equity last)."""
+    md = _FakeRobinhoodMD({"AAPL": 187.55})
+    client = _pos_app(
+        tmp_path, _pos("AAPL260622P00250000", PositionStatus.OPEN, 1.5, mark=1.0, opt=OptionType.PUT),
+        scanner=SimpleNamespace(market_data=md, last_context={}, last_scan_at=None),
+    )
+    row = client.get("/api/positions").json()["positions"][0]
+    assert row["underlying_price"] == 187.55
+    assert row["underlying_price_source"] == "robinhood"
+    assert row["underlying_price_as_of"]
+    assert md.calls == ["AAPL"]
+    assert round((row["underlying_price"] - row["strike"]) / row["strike"], 4) == round(
+        (187.55 - 250.0) / 250.0, 4
+    )
+
+
+def test_api_positions_underlying_price_falls_back_to_last_scan(tmp_path):
+    """When the live quote is missing, still-listed names use the last scan's daily close."""
+    md = _FakeRobinhoodMD({})  # get_underlying_price returns None
+    scanned = datetime(2026, 10, 5, 13, 30, tzinfo=timezone.utc)
+    client = _pos_app(
+        tmp_path, _pos("AAPL260622P00250000", PositionStatus.OPEN, 1.5, mark=1.0, opt=OptionType.PUT),
+        scanner=SimpleNamespace(
+            market_data=md, last_scan_at=scanned,
+            last_context={"AAPL": UnderlyingContext(symbol="AAPL", price=191.0)},
+        ),
+    )
+    row = client.get("/api/positions").json()["positions"][0]
+    assert row["underlying_price"] == 191.0
+    assert row["underlying_price_source"] == "last_scan"
+    assert row["underlying_price_as_of"] == scanned.isoformat()
+
+
+def test_api_positions_underlying_price_null_when_quote_unavailable(tmp_path):
+    """Closed-off-watchlist (and quote errors) stay null — never invent a stock last."""
+    md = _FakeRobinhoodMD({}, boom=True)
+    client = _pos_app(
+        tmp_path, _pos("AAPL260622C00250000", PositionStatus.CLOSED, 2.0),
+        scanner=SimpleNamespace(market_data=md, last_context={}, last_scan_at=None),
+    )
+    r = client.get("/api/positions")
+    assert r.status_code == 200
+    row = r.json()["positions"][0]
+    assert row["underlying_price"] is None
+    assert row["underlying_price_source"] is None
+    assert md.calls == []  # closed + not in last_context → no live fetch
+
+
+def test_api_positions_closed_still_listed_gets_live_quote(tmp_path):
+    """Closed rows still in last-scan context get the live last, not only the scan close."""
+    md = _FakeRobinhoodMD({"AAPL": 180.25})
+    client = _pos_app(
+        tmp_path, _pos("AAPL260622P00250000", PositionStatus.CLOSED, 2.0, opt=OptionType.PUT),
+        scanner=SimpleNamespace(
+            market_data=md, last_scan_at=None,
+            last_context={"AAPL": UnderlyingContext(symbol="AAPL", price=179.0)},
+        ),
+    )
+    row = client.get("/api/positions").json()["positions"][0]
+    assert row["underlying_price"] == 180.25
+    assert row["underlying_price_source"] == "robinhood"
+    assert md.calls == ["AAPL"]
+
+
+def test_robinhood_get_underlying_price_uses_equity_last():
+    """The number on the API is last_trade_price from RH get_equity_quotes (mocked, no secrets)."""
+    import asyncio
+
+    from agentic.brokers.robinhood_mcp import RobinhoodMCPBroker
+    from agentic.marketdata.robinhood_md import RobinhoodMarketData
+
+    class _Broker:
+        async def _call_tool(self, tool, args):
+            assert tool == "get_equity_quotes" and args == {"symbols": ["MSFT"]}
+            return {"data": {"results": [{"quote": {
+                "last_trade_price": "412.10", "bid_price": "412.00", "ask_price": "412.20",
+            }}]}}
+
+        _iter_records = staticmethod(RobinhoodMCPBroker._iter_records)
+
+    async def _run():
+        px = await RobinhoodMarketData(_Broker()).get_underlying_price("MSFT")
+        assert px == 412.10
+
+    asyncio.run(_run())
