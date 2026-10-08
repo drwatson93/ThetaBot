@@ -1400,7 +1400,7 @@ _PAGE = """<!doctype html>
       </div>
       <div id="rules-confirm" class="owner-only" hidden>
         <div class="ctl-lab">Confirm exit-rule changes</div>
-        <div class="hint">Old → new. Nothing is saved until you confirm.</div>
+        <div class="hint">Old → new. The form is locked until you save or cancel. Nothing is saved until you confirm.</div>
         <div id="rules-diff"></div>
         <div class="row" style="margin-top:8px">
           <button class="go" id="rules-confirm-go" type="button">Save changes</button>
@@ -2078,6 +2078,7 @@ async function postConfig(patch){
   });
   const d = await r.json().catch(()=>({}));
   if(r.status === 403) throw new Error("View-only login cannot save settings.");
+  if(r.status === 409) throw new Error(d.error || "Exit rules changed. Reload the Rules tab and try again.");
   if(!r.ok || d.ok === false) throw new Error(d.error || ("HTTP "+r.status));
   renderOverlaySource(d);
   return d;
@@ -2367,8 +2368,10 @@ async function openSavedBrief(id){
 /* ---- orchestration ---- */
 let lastLoad = 0;
 let rulesSnapshot = null;
+let rulesBaseSig = "";
 let rulesFormDirty = false;
 let pendingRules = null;
+let rulesShownDiff = [];
 function rulesFormBusy(){
   const confirm = $("rules-confirm");
   if(confirm && !confirm.hidden) return true;
@@ -2381,10 +2384,11 @@ function numAttr(v){
   const n = Number(v);
   return isFinite(n) ? String(n) : "";
 }
-function renderRulesEditor(rules){
+function renderRulesEditor(rules, signature){
   const box = $("rules-editor");
   if(!box) return;
   rulesSnapshot = JSON.parse(JSON.stringify(rules || []));
+  rulesBaseSig = signature || "";
   if(!rulesSnapshot.length){
     box.innerHTML = "<p class='muted'>No exit rules are configured.</p>";
     applyRoleUI();
@@ -2418,7 +2422,7 @@ function renderRulesEditor(rules){
         <input class="f scrn rule-num" data-i="${i}" data-param="dte_threshold" inputmode="numeric" value="${esc(numAttr(p.dte_threshold))}"/></label></div>
         <div class="hint">Whole number 0–30. Action stays ${esc(p.action || "alert")}.</div>`;
     } else {
-      fields = `<div class="hint">Match ${esc(p.match || "underlying")}. Requires approval: ${rule.requires_approval ? "yes" : "no"}. No numeric parameter.</div>`;
+      fields = `<div class="hint">Match is display-only (${esc(p.match || "underlying")}): the matcher always tries the exact contract, then the underlying. Requires approval: ${rule.requires_approval ? "yes" : "no"}. No numeric parameter.</div>`;
     }
     return `<div class="rule-card" data-i="${i}">
       <div class="row">
@@ -2499,10 +2503,26 @@ function rulesDiff(before, after){
   }
   return lines;
 }
+function sameRulesPayload(a, b){
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+function lockRulesForm(locked){
+  document.querySelectorAll("#rules-editor input").forEach(el => {
+    if(locked || !isOwner()){ el.disabled = true; return; }
+    if(el.classList.contains("rule-num")){
+      const trig = document.querySelector(`#rules-editor input.trig-on[data-i="${el.dataset.i}"][data-param="${el.dataset.param}"]`);
+      el.disabled = !!(trig && !trig.checked);
+      return;
+    }
+    el.disabled = false;
+  });
+  const review = $("rules-save");
+  if(review) review.disabled = locked || !isOwner();
+}
 async function loadRulesEditor(force){
   if(!force && rulesFormBusy()) return;
   const cfg = await getJSON("/api/config");
-  renderRulesEditor((cfg.editable && cfg.editable.rules) || []);
+  renderRulesEditor((cfg.editable && cfg.editable.rules) || [], cfg.rules_signature || "");
 }
 function reviewRules(){
   if(!isOwner()) return;
@@ -2516,8 +2536,10 @@ function reviewRules(){
       return;
     }
     pendingRules = next;
+    rulesShownDiff = lines;
     $("rules-diff").innerHTML = lines.map(l => `<div>${esc(l)}</div>`).join("");
     $("rules-confirm").hidden = false;
+    lockRulesForm(true);
     say("rules-say", "", true);
   } catch(e){
     $("rules-confirm").hidden = true;
@@ -2530,9 +2552,16 @@ async function confirmRules(){
   const btn = $("rules-confirm-go");
   btn.disabled = true;
   try {
-    await postConfig({rules: pendingRules});
+    const fresh = collectRules();
+    const now = rulesDiff(rulesSnapshot || [], fresh);
+    if(!sameRulesPayload(fresh, pendingRules) || !sameRulesPayload(now, rulesShownDiff)){
+      say("rules-say", "The form changed after you reviewed it. Cancel and review the diff again.", false);
+      return;
+    }
+    await postConfig({rules: fresh, rules_base: rulesBaseSig});
     rulesFormDirty = false;
     pendingRules = null;
+    rulesShownDiff = [];
     $("rules-confirm").hidden = true;
     say("rules-say", "Saved. The monitor picks this up on its next poll.", true);
     await loadRulesEditor(true);
@@ -2604,7 +2633,12 @@ $("tn-preset-putseller").onclick = applyPutSellerPreset;
 $("tn-cush-apply").onclick = applySuggestedCushions;
 $("rules-save").onclick = reviewRules;
 $("rules-confirm-go").onclick = confirmRules;
-$("rules-confirm-cancel").onclick = () => { $("rules-confirm").hidden = true; pendingRules = null; };
+$("rules-confirm-cancel").onclick = () => {
+  $("rules-confirm").hidden = true;
+  pendingRules = null;
+  rulesShownDiff = [];
+  lockRulesForm(false);
+};
 $("rules-editor").addEventListener("input", () => { rulesFormDirty = true; });
 $("rules-editor").addEventListener("change", (e) => {
   rulesFormDirty = true;

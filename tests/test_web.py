@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from agentic.brokers import paper_broker as pb
 from agentic.brokers.paper_broker import PaperBroker
-from agentic.config import Settings
+from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import DecisionStatus, PositionStatus
 from agentic.marketdata.base import PaperMarketData
 from agentic.services.approval import ApprovalGate
@@ -37,7 +37,13 @@ def ctx(tmp_path, monkeypatch):
     signals = SignalStore(db)
     killswitch = KillSwitch(db, audit)
     broker = PaperBroker()
-    settings = Settings(mode="paper", broker="paper", market_data="paper")
+    settings = Settings(
+        mode="paper", broker="paper", market_data="paper",
+        rules=[RuleConfig(
+            name="tv-signal", rule_type="SIGNAL", enabled=True,
+            requires_approval=True, params={"match": "underlying"},
+        )],
+    )
 
     # One open AAPL position, present in both the store and the (paper) broker.
     pos = pb._default_seed()[0]

@@ -26,6 +26,7 @@ from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
 from agentic.web.rules_view import describe_active_rules
+from agentic.web.settings import rules_signature
 
 VIEWER_USER = "viewer"
 VIEWER_PASS = "test-viewer-password-ok"
@@ -86,6 +87,13 @@ def _edit(rules: list[dict], name: str, *, enabled: bool | None = None, **params
     raise AssertionError(name)
 
 
+def _post_rules(c, settings, rules, extra=None, **kwargs):
+    body = {"rules": rules, "rules_base": rules_signature(settings.rules)}
+    if extra:
+        body.update(extra)
+    return c.post("/api/config", json=body, **kwargs)
+
+
 def _audit_count(audit) -> int:
     row = audit.db.conn.execute(
         "SELECT COUNT(*) FROM audit WHERE event_type = ?",
@@ -118,6 +126,10 @@ def test_rules_tab_reuses_owner_gate(client):
     assert 'id="rules-confirm"' in html
     assert "Old → new" in html
     assert "Null means that trigger is off" in html
+    assert "rules_base" in html
+    assert "display-only" in html
+    assert "lockRulesForm" in html
+    assert "status === 409" in html
     assert "#pane-rules input, #pane-rules button" in html
     assert "const ROLE = \"owner\";" in html
     # Mode, live-arming, and broker are not fields on this editor.
@@ -142,7 +154,7 @@ def test_owner_can_toggle_and_tune_rules(client):
     _seed(settings)
     rules = _edit(_dump(settings), "profit-target", profit_pct=0.6)
     _edit(rules, "stop-loss", enabled=False)
-    r = c.post("/api/config", json={"rules": rules})
+    r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
@@ -170,7 +182,7 @@ def test_viewer_rules_save_is_403_and_changes_nothing(client, monkeypatch):
     c, settings, audit, _scanner = client
     _seed(settings)
     rules = _edit(_dump(settings), "stop-loss", enabled=False)
-    r = c.post("/api/config", json={"rules": rules}, auth=(VIEWER_USER, VIEWER_PASS))
+    r = _post_rules(c, settings, rules, auth=(VIEWER_USER, VIEWER_PASS))
     assert r.status_code == 403
     assert settings.rules[1].enabled is True
     assert settings.rules[0].params["profit_pct"] == 0.5
@@ -178,16 +190,20 @@ def test_viewer_rules_save_is_403_and_changes_nothing(client, monkeypatch):
     assert load_overlay() == {}
 
 
-def test_noop_rules_post_writes_audit_with_empty_values(client):
-    """Same convention as every other /api/config save: the row is written, values is empty."""
+def test_noop_rules_post_writes_no_audit_row(client):
+    """An empty leaf diff does not ping Watchman. A real change still writes CONFIG_EDIT."""
     c, settings, audit, _scanner = client
     _seed(settings)
-    r = c.post("/api/config", json={"rules": _dump(settings)})
+    r = _post_rules(c, settings, _dump(settings))
     assert r.status_code == 200, r.text
-    row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
-    assert row["payload"]["changed"] == ["rules"]
-    assert row["payload"]["values"] == {}
+    assert _audit_count(audit) == 0
     assert settings.rules[1].params["loss_mult"] == 2.0
+    changed = _edit(_dump(settings), "profit-target", profit_pct=0.55)
+    assert _post_rules(c, settings, changed).status_code == 200
+    row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
+    assert row["payload"]["values"]["rules.profit-target.params.profit_pct"] == {
+        "old": 0.5, "new": 0.55,
+    }
 
 
 @pytest.mark.parametrize("mutate,needle", [
@@ -211,7 +227,7 @@ def test_invalid_rules_rejected_with_no_change(client, mutate, needle):
     rules = _dump(settings)
     mutate(rules)
     # A sibling edit in the same body must not stick when rules are rejected.
-    r = c.post("/api/config", json={"rules": rules, "paper_buying_power": 111.0})
+    r = _post_rules(c, settings, rules, extra={"paper_buying_power": 111.0})
     assert r.status_code == 400, r.text
     assert needle in r.json()["error"]
     assert r.json()["ok"] is False
@@ -231,7 +247,7 @@ def test_boundary_values_are_accepted(client):
     _edit(rules, "profit-target", profit_pct=0.05)
     _edit(rules, "stop-loss", loss_mult=1.0, delta_stop=1.0)
     _edit(rules, "dte-close", dte_threshold=0)
-    r = c.post("/api/config", json={"rules": rules})
+    r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     assert settings.rules[0].params["profit_pct"] == 0.05
     assert settings.rules[1].params["loss_mult"] == 1.0
@@ -241,7 +257,7 @@ def test_boundary_values_are_accepted(client):
     _edit(rules, "profit-target", profit_pct=0.95)
     _edit(rules, "stop-loss", loss_mult=10, delta_stop=0.1)
     _edit(rules, "dte-close", dte_threshold=30)
-    r = c.post("/api/config", json={"rules": rules})
+    r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     assert settings.rules[0].params["profit_pct"] == 0.95
     assert settings.rules[1].params["loss_mult"] == 10
@@ -265,7 +281,7 @@ def test_identity_changes_rejected_with_no_change(client, mutate, needle):
     _seed(settings)
     rules = _dump(settings)
     mutate(rules)
-    r = c.post("/api/config", json={"rules": rules})
+    r = _post_rules(c, settings, rules)
     assert r.status_code == 400, r.text
     assert needle in r.json()["error"]
     assert [rule.name for rule in settings.rules] == [
@@ -281,7 +297,7 @@ def test_one_stop_trigger_off_keeps_the_other(client):
     c, settings, audit, _scanner = client
     _seed(settings)
     rules = _edit(_dump(settings), "stop-loss", loss_mult=None)
-    r = c.post("/api/config", json={"rules": rules})
+    r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     assert settings.rules[1].enabled is True
     assert settings.rules[1].params["loss_mult"] is None
@@ -297,7 +313,7 @@ def test_one_stop_trigger_off_keeps_the_other(client):
     assert len(delta_hits) == 1 and "Delta" in delta_hits[0].reason
 
     rules = _edit(_dump(settings), "stop-loss", delta_stop=None, loss_mult=2.0)
-    r = c.post("/api/config", json={"rules": rules})
+    r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     engine.refresh(settings.rules)
     assert engine.evaluate(pos, _quote(bid=1.1, ask=1.2, delta=-0.9)) == []
@@ -309,7 +325,7 @@ def test_disabling_the_rule_is_how_both_triggers_turn_off(client):
     c, settings, *_ = client
     _seed(settings)
     rules = _edit(_dump(settings), "stop-loss", enabled=False, loss_mult=None, delta_stop=None)
-    r = c.post("/api/config", json={"rules": rules})
+    r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     assert settings.rules[1].enabled is False
     assert settings.rules[1].params["loss_mult"] is None
@@ -324,7 +340,7 @@ def test_refresh_stops_a_disabled_rule_from_firing(client):
     quote = _quote(bid=2.0, ask=2.2, delta=-0.2)
     assert any(d.rule_name == "stop-loss" for d in engine.evaluate(pos, quote))
     rules = _edit(_dump(settings), "stop-loss", enabled=False)
-    assert c.post("/api/config", json={"rules": rules}).status_code == 200
+    assert _post_rules(c, settings, rules).status_code == 200
     assert engine.refresh(settings.rules) is True
     assert engine.evaluate(pos, quote) == []
     assert "stop-loss" not in {rule.name for rule in engine.rules}
@@ -382,7 +398,7 @@ def test_overlay_persists_rules_across_reload(client, tmp_path):
     )
     rules = _edit(_dump(settings), "stop-loss", loss_mult=None)
     _edit(rules, "dte-close", dte_threshold=7)
-    assert c.post("/api/config", json={"rules": rules}).status_code == 200
+    assert _post_rules(c, settings, rules).status_code == 200
     saved = load_overlay()
     assert saved["rules"][1]["params"]["loss_mult"] is None
     assert saved["rules"][1]["params"]["delta_stop"] == 0.5
@@ -412,3 +428,110 @@ def test_rules_view_describes_off_trigger_and_disabled_rule():
     assert "never a market order at the ask" in stop["detail"]
     profit = next(r for r in rows if r["name"] == "profit-target")
     assert profit["value"] == "off"
+    signal = describe_active_rules(Settings(rules=[
+        RuleConfig(name="tv-signal", rule_type="SIGNAL", enabled=True,
+                   requires_approval=True, params={"match": "underlying"}),
+    ]))
+    row = next(r for r in signal if r["name"] == "tv-signal")
+    assert "display-only" in row["detail"]
+    assert "exact contract" in row["detail"]
+    off = describe_active_rules(Settings(rules=[
+        RuleConfig(name="tv-signal", rule_type="SIGNAL", enabled=False,
+                   requires_approval=True, params={"match": "underlying"}),
+    ]))
+    disabled = next(r for r in off if r["name"] == "tv-signal")
+    assert disabled["value"] == "off"
+    assert "does not replay" in disabled["detail"]
+
+
+def test_config_payload_includes_rules_signature(client):
+    c, settings, *_ = client
+    _seed(settings)
+    body = c.get("/api/config").json()
+    assert body["rules_signature"] == rules_signature(settings.rules)
+
+
+def test_rules_save_requires_rules_base(client):
+    c, settings, audit, _scanner = client
+    _seed(settings)
+    r = c.post("/api/config", json={"rules": _dump(settings)})
+    assert r.status_code == 400
+    assert "rules_base" in r.json()["error"]
+    assert _audit_count(audit) == 0
+    assert settings.rules[0].params["profit_pct"] == 0.5
+
+
+def test_stale_rules_base_is_409_with_no_change(client):
+    c, settings, audit, _scanner = client
+    _seed(settings)
+    sig = rules_signature(settings.rules)
+    stale = _dump(settings)
+    stale[0]["params"]["profit_pct"] = 0.7
+    settings.rules[1].enabled = False
+    r = c.post("/api/config", json={
+        "rules": stale, "rules_base": sig, "paper_buying_power": 111.0,
+    })
+    assert r.status_code == 409, r.text
+    assert "Reload" in r.json()["error"]
+    assert settings.rules[0].params["profit_pct"] == 0.5
+    assert settings.rules[1].enabled is False
+    assert settings.paper_buying_power == 100_000.0
+    assert _audit_count(audit) == 0
+    assert load_overlay() == {}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_rule_numbers_are_rejected(client, bad):
+    """NaN and Infinity are not JSON numbers the API will apply."""
+    import json as _json
+
+    c, settings, audit, _scanner = client
+    _seed(settings)
+    rules = _dump(settings)
+    rules[1]["params"]["loss_mult"] = bad
+    body = {"rules": rules, "rules_base": rules_signature(settings.rules)}
+    raw = _json.dumps(body, allow_nan=True).encode()
+    r = c.post("/api/config", content=raw, headers={"Content-Type": "application/json"})
+    assert r.status_code >= 400
+    assert settings.rules[1].params["loss_mult"] == 2.0
+    assert settings.rules[1].enabled is True
+    assert _audit_count(audit) == 0
+    assert load_overlay() == {}
+    from agentic.web.settings import SettingsEditError, _check_rule_number
+    with pytest.raises(SettingsEditError, match="finite"):
+        _check_rule_number("stop-loss", "loss_mult", bad, ("float", 1.0, 10.0, True))
+
+
+def test_reenable_both_null_stop_without_a_trigger_is_rejected(client):
+    c, settings, audit, _scanner = client
+    _seed(settings)
+    off = _edit(_dump(settings), "stop-loss", enabled=False, loss_mult=None, delta_stop=None)
+    assert _post_rules(c, settings, off).status_code == 200
+    again = _dump(settings)
+    again[1]["enabled"] = True
+    r = _post_rules(c, settings, again)
+    assert r.status_code == 400, r.text
+    assert "both triggers" in r.json()["error"]
+    assert settings.rules[1].enabled is False
+    assert settings.rules[1].params["loss_mult"] is None
+    assert settings.rules[1].params["delta_stop"] is None
+    assert _audit_count(audit) == 1  # the disable wrote a row; the rejection did not
+
+
+def test_reenable_stop_with_loss_mult_fires_after_refresh(client):
+    c, settings, *_ = client
+    _seed(settings)
+    off = _edit(_dump(settings), "stop-loss", enabled=False, loss_mult=None, delta_stop=None)
+    assert _post_rules(c, settings, off).status_code == 200
+    engine = RulesEngine.from_configs(settings.rules)
+    pos = _pos()
+    quote = _quote(bid=2.0, ask=2.2, delta=-0.2)
+    assert engine.evaluate(pos, quote) == []
+    back = _dump(settings)
+    back[1]["enabled"] = True
+    back[1]["params"]["loss_mult"] = 2.0
+    assert _post_rules(c, settings, back).status_code == 200
+    assert engine.refresh(settings.rules) is True
+    hits = engine.evaluate(pos, quote)
+    assert len(hits) == 1 and "Stop-loss" in hits[0].reason
+    assert engine.evaluate(pos, _quote(bid=1.1, ask=1.2, delta=-0.8)) == []

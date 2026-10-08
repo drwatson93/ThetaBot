@@ -21,7 +21,10 @@ Design constraints (see docs/STAGE2_PLAN.md):
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Body, Depends
@@ -69,6 +72,10 @@ class SettingsEditError(ValueError):
     """Raised when a patch is rejected (protected key or invalid value)."""
 
 
+class RulesConflict(SettingsEditError):
+    """The running rules changed since the client loaded them. HTTP 409, nothing applied."""
+
+
 # Identity of a rule is (name, rule_type). The dashboard may tune these fields only.
 _ALLOWED_RULE_TYPES = frozenset({"PROFIT_TARGET", "STOP_LOSS", "DTE", "SIGNAL"})
 # kind, lo, hi, nullable. Null is meaningful only for the two stop-loss triggers.
@@ -83,6 +90,18 @@ _TUNABLE_PARAMS: dict[str, dict[str, tuple[str, float, float, bool]]] = {
 }
 
 
+def rules_signature(rules: list) -> str:
+    """Stable hash of the running rules list. The dashboard sends it back as ``rules_base``."""
+    rows = []
+    for rule in rules:
+        if isinstance(rule, BaseModel):
+            rows.append(rule.model_dump(mode="json"))
+        else:
+            rows.append(rule)
+    blob = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
 def _check_rule_number(rule_name: str, key: str, value: Any, spec: tuple) -> Any:
     kind, lo, hi, nullable = spec
     if value is None:
@@ -91,6 +110,8 @@ def _check_rule_number(rule_name: str, key: str, value: Any, spec: tuple) -> Any
         raise SettingsEditError(f"{rule_name}: {key} is required.")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SettingsEditError(f"{rule_name}: {key} must be a number.")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise SettingsEditError(f"{rule_name}: {key} must be a finite number.")
     if kind == "int" and not isinstance(value, int):
         raise SettingsEditError(
             f"{rule_name}: {key} must be a whole number from {int(lo)} to {int(hi)}."
@@ -104,14 +125,21 @@ def _check_rule_number(rule_name: str, key: str, value: Any, spec: tuple) -> Any
     return value
 
 
-def prepare_rules_update(current: list, submitted: Any) -> list[dict]:
+def prepare_rules_update(
+    current: list, submitted: Any, *, base_signature: str | None = None
+) -> list[dict]:
     """Validate a full ``rules`` replacement against the rules that are running.
 
     The submitted list must be the same rules (same names, types, and order). Omitted
     parameters stay as they are. JSON null on ``loss_mult`` or ``delta_stop`` turns that
     trigger off. An enabled stop-loss with both triggers null is rejected — disable the
-    rule instead. Raises SettingsEditError before any value is applied.
+    rule instead. When ``base_signature`` does not match the running rules, raises
+    RulesConflict before any value is applied. Other failures raise SettingsEditError.
     """
+    if base_signature is not None and rules_signature(current) != base_signature:
+        raise RulesConflict(
+            "Exit rules changed since this form was loaded. Reload the Rules tab and try again."
+        )
     if not isinstance(submitted, list):
         raise SettingsEditError("rules must be a list of the current rules.")
     if len(submitted) != len(current):
@@ -233,12 +261,23 @@ def apply_patch(settings: Settings, patch: dict, *, overlay_path=None) -> list[s
     """
     if not isinstance(patch, dict) or not patch:
         raise SettingsEditError("Request body must be a non-empty object of settings to change.")
-    _reject_protected(patch)
     # Copy so a rejected rules list never mutates the caller's body, and so the
     # validated replacement (not a partial client object) is what gets applied.
     patch = dict(patch)
+    # Meta field, not a setting. Strip it before the allowlist check so it cannot
+    # be stored, and so a stale tab cannot overwrite a newer rules list.
+    base_sig = patch.pop("rules_base", None)
+    if not patch:
+        raise SettingsEditError("Request body must be a non-empty object of settings to change.")
+    _reject_protected(patch)
     if "rules" in patch:
-        patch["rules"] = prepare_rules_update(list(settings.rules), patch["rules"])
+        if not isinstance(base_sig, str) or not base_sig:
+            raise SettingsEditError(
+                "rules_base is required when saving rules. Reload the Rules tab and try again."
+            )
+        patch["rules"] = prepare_rules_update(
+            list(settings.rules), patch["rules"], base_signature=base_sig
+        )
 
     from ..config import _deep_merge  # local import to avoid a public surface for the helper
 
@@ -331,6 +370,7 @@ def _config_payload(settings: Settings, *, role: str | None = None) -> dict[str,
         },
         "from_overlay": overlay_source_paths(overlay),
         "overlay": overlay,
+        "rules_signature": rules_signature(settings.rules),
     }
     if role is not None:
         body["role"] = role
@@ -361,20 +401,25 @@ def make_settings_router(deps: "WebDeps") -> APIRouter:
             changed = apply_patch(deps.settings, patch)
             after = deps.settings.model_dump(mode="json")
             new_watchlist = list(deps.settings.entry.watchlist or [])
-            deps.audit.record(
-                AuditEventType.CONFIG_EDIT,
-                {
-                    "who": "owner",
-                    "changed": changed,
-                    "values": _leaf_diff(before, after),
-                    "watchlist": {"old": old_watchlist, "new": new_watchlist},
-                },
-                source="dashboard",
-            )
+            values = _leaf_diff(before, after)
+            # A no-op save writes no CONFIG_EDIT row, so Watchman is not pinged.
+            if values:
+                deps.audit.record(
+                    AuditEventType.CONFIG_EDIT,
+                    {
+                        "who": "owner",
+                        "changed": changed,
+                        "values": values,
+                        "watchlist": {"old": old_watchlist, "new": new_watchlist},
+                    },
+                    source="dashboard",
+                )
             body = _config_payload(deps.settings, role=role)
             body["ok"] = True
             body["changed"] = changed
             return JSONResponse(body)
+        except RulesConflict as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
         except SettingsEditError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 

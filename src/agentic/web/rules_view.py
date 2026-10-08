@@ -120,8 +120,17 @@ def describe_active_rules(
     for rule in s.rules:
         params = rule.params or {}
         if not rule.enabled:
-            add("Exits", rule.name, "off",
-                "Disabled. The monitor does not evaluate this rule until it is turned back on.")
+            if rule.rule_type == "SIGNAL":
+                detail = (
+                    "Disabled. TradingView close alerts are not matched and are expired, "
+                    "so turning this back on does not replay them. Alerts that arrive "
+                    "after it is on can still close."
+                )
+            else:
+                detail = (
+                    "Disabled. The monitor does not evaluate this rule until it is turned back on."
+                )
+            add("Exits", rule.name, "off", detail)
             continue
         if rule.rule_type == "PROFIT_TARGET":
             pct = params.get("profit_pct")
@@ -154,7 +163,8 @@ def describe_active_rules(
                 "Near-expiry close (or alert) so a weekly is not held into expiration by accident.")
         elif rule.rule_type == "SIGNAL":
             add("Exits", rule.name, "TradingView signal",
-                f"Match {params.get('match', 'underlying')}. "
+                f"Match is display-only ({params.get('match', 'underlying')}): "
+                "the matcher always tries the exact contract, then the underlying. "
                 f"Requires approval: {'yes' if rule.requires_approval else 'no'}.")
         else:
             add("Exits", rule.name, rule.rule_type, str(params))

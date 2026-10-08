@@ -24,11 +24,23 @@ log = logging.getLogger("agentic.signals")
 SIGNAL_RULE_NAME = "tv-signal"
 
 
+def _enabled_signal_rule(settings: Settings):
+    """The live SIGNAL rule, or None when it is missing or turned off.
+
+    Read from ``settings.rules`` on every pass. The processor keeps one Settings
+    object, so a dashboard hot-edit is visible here without rebuilding it.
+    """
+    for rule in settings.rules:
+        if rule.rule_type == "SIGNAL" and rule.enabled:
+            return rule
+    return None
+
+
 def _signal_base_approval(settings: Settings) -> bool:
-    for r in settings.rules:
-        if r.rule_type == "SIGNAL":
-            return r.requires_approval
-    return True  # safe default: signals need approval
+    rule = _enabled_signal_rule(settings)
+    if rule is None:
+        return True  # safe default if something still asks; process_pending will not close
+    return bool(rule.requires_approval)
 
 
 class SignalProcessor:
@@ -55,6 +67,13 @@ class SignalProcessor:
         )
 
     async def process_pending(self) -> int:
+        # Rules are read live. build_rules never constructs a SIGNAL rule, so the
+        # enabled flag has to be honored here or turning tv-signal off still closes.
+        rule = _enabled_signal_rule(self.settings)
+        if rule is None:
+            self._expire_while_disabled()
+            return 0
+        self.matcher.base_requires_approval = bool(rule.requires_approval)
         new = self.signals.list_by_status(SignalStatus.NEW)
         for sig in new:
             try:
@@ -66,6 +85,19 @@ class SignalProcessor:
                     source="signals",
                 )
         return len(new)
+
+    def _expire_while_disabled(self) -> None:
+        """Mark NEW signals so turning the rule back on does not replay them.
+
+        No match, no close decision, no executor, and no approval gate.
+        """
+        for sig in self.signals.list_by_status(SignalStatus.NEW):
+            self.signals.set_status(sig.id, SignalStatus.NO_MATCH)
+            self.audit.record(
+                AuditEventType.SIGNAL,
+                {"expired": True, "reason": "signal_rule_disabled", "dedup_key": sig.dedup_key},
+                source="signals",
+            )
 
     async def _process_one(self, sig: Signal) -> None:
         if sig.ttl_expires_at is not None and utcnow() > sig.ttl_expires_at:
