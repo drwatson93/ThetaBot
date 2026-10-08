@@ -1092,6 +1092,10 @@ _PAGE = """<!doctype html>
   .hint{font-size:11.5px;color:var(--faint);margin-top:7px}
   .say{font-size:12px;margin-top:7px;min-height:16px}
   .say.ok{color:var(--pos)} .say.err{color:var(--neg)}
+  .rule-card{border:1px solid var(--line);border-radius:10px;padding:12px;margin:0 0 10px;background:var(--card)}
+  .rule-card .nm{font-weight:650}
+  #rules-diff{font-family:var(--mono);font-size:12.5px;line-height:1.6;padding:8px 10px;background:var(--raise);border:1px solid var(--line);border-radius:8px}
+  #rules-confirm{margin-top:12px}
   .scanline{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);margin-top:6px}
   .tvrow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px}
   .tvrow:last-of-type{border-bottom:0}
@@ -1386,9 +1390,29 @@ _PAGE = """<!doctype html>
   </div>
 
   <div class="tabpane" id="pane-rules" hidden>
+  <section class="card2" data-nofold="1">
+    <div class="card-h"><h2>Exit rules</h2><span class="count">owner edits · applies live</span></div>
+    <div class="hint">Owner login can turn each exit rule on or off and change its numbers. View-only login cannot. A stop-loss trigger switched off is stored as null and does not fire; the other trigger still does. Switching both triggers off while the rule stays on is rejected — turn the rule off instead. Null means that trigger is off. Saving shows old → new and waits for confirm. You cannot add, remove, or retype a rule here. Changes persist on the data-disk overlay and the monitor reloads them on its next poll. Mode, live-arming, and broker stay file-only. Real orders stay locked in code.</div>
+    <div id="rules-editor" class="ctl"><div class="muted">Loading…</div></div>
+    <div class="ctl" style="padding-top:0">
+      <div class="row owner-only">
+        <button class="go" id="rules-save" type="button">Review changes</button>
+      </div>
+      <div id="rules-confirm" class="owner-only" hidden>
+        <div class="ctl-lab">Confirm exit-rule changes</div>
+        <div class="hint">Old → new. Nothing is saved until you confirm.</div>
+        <div id="rules-diff"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="go" id="rules-confirm-go" type="button">Save changes</button>
+          <button class="rbtn" id="rules-confirm-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+      <div class="say" id="rules-say"></div>
+    </div>
+  </section>
   <section class="card2">
-    <div class="card-h"><h2>Active rules</h2><span class="count">from the running config · read-only</span></div>
-    <div class="hint">These are the hard limits the engine is using right now, written in plain English. They come from the same config the scanner and monitor read, so this page cannot drift. Edit <code>config.yaml</code> (or environment variables) and restart to change them.</div>
+    <div class="card-h"><h2>All limits</h2><span class="count">plain English · read-only</span></div>
+    <div class="hint">Hours, sizing, and the order locks, from the same running config. Exit-rule numbers are edited above.</div>
     <div id="rules-list" class="muted">Loading…</div>
   </section>
   </div>
@@ -1576,7 +1600,7 @@ function applyRoleUI(){
   document.body.classList.add("role-viewer");
   const badge = $("role-badge");
   if(badge){ badge.className = "view-badge"; badge.textContent = "view-only login"; }
-  document.querySelectorAll("#al-modes .rbtn, #al-test, #wl-add, #wl-in, #wk-save, #wk-in, #brief-run, #scr-run, #scr-scan, #pane-tuning button.go, #pane-tuning input, #pane-tuning select, #scr-syms, .scr-filters input").forEach(el => {
+  document.querySelectorAll("#al-modes .rbtn, #al-test, #wl-add, #wl-in, #wk-save, #wk-in, #brief-run, #scr-run, #scr-scan, #pane-tuning button.go, #pane-tuning input, #pane-tuning select, #pane-rules input, #pane-rules button, #scr-syms, .scr-filters input").forEach(el => {
     if(el) el.disabled = true;
   });
 }
@@ -2342,23 +2366,203 @@ async function openSavedBrief(id){
 
 /* ---- orchestration ---- */
 let lastLoad = 0;
+let rulesSnapshot = null;
+let rulesFormDirty = false;
+let pendingRules = null;
+function rulesFormBusy(){
+  const confirm = $("rules-confirm");
+  if(confirm && !confirm.hidden) return true;
+  if(rulesFormDirty) return true;
+  const ed = $("rules-editor");
+  return !!(ed && ed.contains(document.activeElement));
+}
+function numAttr(v){
+  if(v == null || v === "") return "";
+  const n = Number(v);
+  return isFinite(n) ? String(n) : "";
+}
+function renderRulesEditor(rules){
+  const box = $("rules-editor");
+  if(!box) return;
+  rulesSnapshot = JSON.parse(JSON.stringify(rules || []));
+  if(!rulesSnapshot.length){
+    box.innerHTML = "<p class='muted'>No exit rules are configured.</p>";
+    applyRoleUI();
+    return;
+  }
+  const cards = rulesSnapshot.map((rule, i) => {
+    const on = rule.enabled ? "checked" : "";
+    let fields = "";
+    const p = rule.params || {};
+    if(rule.rule_type === "PROFIT_TARGET"){
+      fields = `<div class="scr-filters"><label>profit_pct
+        <input class="f scrn rule-num" data-i="${i}" data-param="profit_pct" inputmode="decimal" value="${esc(numAttr(p.profit_pct))}"/></label></div>
+        <div class="hint">0.05–0.95. 0.50 closes once half the credit is captured.${p.trailing ? " Trailing stays as configured." : ""}</div>`;
+    } else if(rule.rule_type === "STOP_LOSS"){
+      const trig = (key, lo, hi) => {
+        const checked = p[key] != null ? "checked" : "";
+        const dis = p[key] == null ? "disabled" : "";
+        return `<div><div class="ctl-lab">${esc(key)}</div>
+          <span class="row">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;text-transform:none;letter-spacing:0">
+              <input type="checkbox" class="trig-on" data-i="${i}" data-param="${esc(key)}" ${checked}/> On
+            </label>
+            <input class="f scrn rule-num" data-i="${i}" data-param="${esc(key)}" inputmode="decimal" value="${esc(numAttr(p[key]))}" ${dis}/>
+          </span>
+          <div class="hint" style="padding:0">${lo}–${hi}. Uncheck to turn this trigger off.</div></div>`;
+      };
+      fields = `<div class="scr-filters">${trig("loss_mult","1","10")}${trig("delta_stop","0.1","1")}</div>
+        <div class="hint">Null means that trigger is off. Leave at least one on, or turn the whole rule off.</div>`;
+    } else if(rule.rule_type === "DTE"){
+      fields = `<div class="scr-filters"><label>dte_threshold
+        <input class="f scrn rule-num" data-i="${i}" data-param="dte_threshold" inputmode="numeric" value="${esc(numAttr(p.dte_threshold))}"/></label></div>
+        <div class="hint">Whole number 0–30. Action stays ${esc(p.action || "alert")}.</div>`;
+    } else {
+      fields = `<div class="hint">Match ${esc(p.match || "underlying")}. Requires approval: ${rule.requires_approval ? "yes" : "no"}. No numeric parameter.</div>`;
+    }
+    return `<div class="rule-card" data-i="${i}">
+      <div class="row">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+          <input type="checkbox" class="rule-on" data-i="${i}" ${on}/>
+          <span class="nm">${esc(rule.name)}</span>
+        </label>
+        <span class="pill">${esc(rule.rule_type)}</span>
+      </div>
+      ${fields}
+    </div>`;
+  }).join("");
+  box.innerHTML = cards;
+  applyRoleUI();
+}
+function readDecimal(i, param, lo, hi){
+  const el = document.querySelector(`#rules-editor input.rule-num[data-i="${i}"][data-param="${param}"]`);
+  const raw = (el && el.value || "").trim();
+  const n = Number(raw);
+  if(raw === "" || !isFinite(n) || n < lo || n > hi){
+    throw new Error(param + " must be between " + lo + " and " + hi + ".");
+  }
+  return n;
+}
+function readTrigger(i, param, lo, hi){
+  const box = document.querySelector(`#rules-editor input.trig-on[data-i="${i}"][data-param="${param}"]`);
+  if(!box || !box.checked) return null;
+  return readDecimal(i, param, lo, hi);
+}
+function readWhole(i, param, lo, hi){
+  const el = document.querySelector(`#rules-editor input.rule-num[data-i="${i}"][data-param="${param}"]`);
+  const raw = (el && el.value || "").trim();
+  if(!/^[0-9]+$/.test(raw)) throw new Error(param + " must be a whole number from " + lo + " to " + hi + ".");
+  const n = Number(raw);
+  if(n < lo || n > hi) throw new Error(param + " must be a whole number from " + lo + " to " + hi + ".");
+  return n;
+}
+function collectRules(){
+  if(!rulesSnapshot) throw new Error("Rules are still loading.");
+  return rulesSnapshot.map((rule, i) => {
+    const onEl = document.querySelector(`#rules-editor input.rule-on[data-i="${i}"]`);
+    const enabled = !!(onEl && onEl.checked);
+    const params = Object.assign({}, rule.params || {});
+    if(rule.rule_type === "PROFIT_TARGET") params.profit_pct = readDecimal(i, "profit_pct", 0.05, 0.95);
+    else if(rule.rule_type === "STOP_LOSS"){
+      params.loss_mult = readTrigger(i, "loss_mult", 1, 10);
+      params.delta_stop = readTrigger(i, "delta_stop", 0.1, 1);
+      if(enabled && params.loss_mult == null && params.delta_stop == null){
+        throw new Error("Stop-loss is on but both triggers are off. Turn the rule off, or leave one trigger on.");
+      }
+    } else if(rule.rule_type === "DTE") params.dte_threshold = readWhole(i, "dte_threshold", 0, 30);
+    return {
+      name: rule.name,
+      rule_type: rule.rule_type,
+      enabled: enabled,
+      requires_approval: !!rule.requires_approval,
+      params: params
+    };
+  });
+}
+function rulesDiff(before, after){
+  const lines = [];
+  const keys = ["profit_pct", "loss_mult", "delta_stop", "dte_threshold"];
+  for(let i = 0; i < before.length; i++){
+    const a = before[i], b = after[i];
+    if(!!a.enabled !== !!b.enabled){
+      lines.push(a.name + " · enabled: " + (a.enabled ? "on" : "off") + " → " + (b.enabled ? "on" : "off"));
+    }
+    for(const k of keys){
+      const av = (a.params || {})[k];
+      const bv = (b.params || {})[k];
+      const aOff = av == null, bOff = bv == null;
+      if(aOff && bOff) continue;
+      if(!aOff && !bOff && Number(av) === Number(bv)) continue;
+      const fmt = (v) => v == null ? "off" : String(v);
+      lines.push(a.name + " · " + k + ": " + fmt(av) + " → " + fmt(bv));
+    }
+  }
+  return lines;
+}
+async function loadRulesEditor(force){
+  if(!force && rulesFormBusy()) return;
+  const cfg = await getJSON("/api/config");
+  renderRulesEditor((cfg.editable && cfg.editable.rules) || []);
+}
+function reviewRules(){
+  if(!isOwner()) return;
+  try {
+    const next = collectRules();
+    const lines = rulesDiff(rulesSnapshot || [], next);
+    if(!lines.length){
+      $("rules-confirm").hidden = true;
+      pendingRules = null;
+      say("rules-say", "Nothing changed.", false);
+      return;
+    }
+    pendingRules = next;
+    $("rules-diff").innerHTML = lines.map(l => `<div>${esc(l)}</div>`).join("");
+    $("rules-confirm").hidden = false;
+    say("rules-say", "", true);
+  } catch(e){
+    $("rules-confirm").hidden = true;
+    pendingRules = null;
+    say("rules-say", e.message, false);
+  }
+}
+async function confirmRules(){
+  if(!isOwner() || !pendingRules) return;
+  const btn = $("rules-confirm-go");
+  btn.disabled = true;
+  try {
+    await postConfig({rules: pendingRules});
+    rulesFormDirty = false;
+    pendingRules = null;
+    $("rules-confirm").hidden = true;
+    say("rules-say", "Saved. The monitor picks this up on its next poll.", true);
+    await loadRulesEditor(true);
+  } catch(e){
+    say("rules-say", e.message || "Couldn't save.", false);
+  } finally {
+    if(btn) btn.disabled = false;
+    applyRoleUI();
+  }
+}
 async function loadRules(){
   const box = $("rules-list");
   if(!box) return;
   const d = await getJSON("/api/rules");
   const rows = d.rules || [];
-  if(!rows.length){ box.innerHTML = "<p class='muted'>No rules loaded.</p>"; return; }
-  let html = "";
-  let group = "";
-  for(const r of rows){
-    if(r.group !== group){
-      group = r.group;
-      html += `<div class="ctl-lab" style="margin-top:16px">${esc(group)}</div>`;
+  if(!rows.length){ box.innerHTML = "<p class='muted'>No rules loaded.</p>"; }
+  else {
+    let html = "";
+    let group = "";
+    for(const r of rows){
+      if(r.group !== group){
+        group = r.group;
+        html += `<div class="ctl-lab" style="margin-top:16px">${esc(group)}</div>`;
+      }
+      html += `<div class="wkline"><span class="wklbl">${esc(r.name)}</span> ${esc(r.value)}</div>`;
+      if(r.detail) html += `<div class="hint">${esc(r.detail)}</div>`;
     }
-    html += `<div class="wkline"><span class="wklbl">${esc(r.name)}</span> ${esc(r.value)}</div>`;
-    if(r.detail) html += `<div class="hint">${esc(r.detail)}</div>`;
+    box.innerHTML = html;
   }
-  box.innerHTML = html;
+  try { await loadRulesEditor(false); } catch(e){ console.error("rules-editor", e); }
 }
 async function loadAll(){
   for (const [fn,name] of [[loadConn,"conn"],[loadHolds,"holds"],[loadWeek,"week"],
@@ -2398,6 +2602,17 @@ $("tn-pt-save").onclick = savePerTicker;
 $("tn-setups-save").onclick = saveSetupGates;
 $("tn-preset-putseller").onclick = applyPutSellerPreset;
 $("tn-cush-apply").onclick = applySuggestedCushions;
+$("rules-save").onclick = reviewRules;
+$("rules-confirm-go").onclick = confirmRules;
+$("rules-confirm-cancel").onclick = () => { $("rules-confirm").hidden = true; pendingRules = null; };
+$("rules-editor").addEventListener("input", () => { rulesFormDirty = true; });
+$("rules-editor").addEventListener("change", (e) => {
+  rulesFormDirty = true;
+  const t = e.target;
+  if(!t.classList || !t.classList.contains("trig-on")) return;
+  const num = document.querySelector(`#rules-editor input.rule-num[data-i="${t.dataset.i}"][data-param="${t.dataset.param}"]`);
+  if(num) num.disabled = !t.checked || !isOwner();
+});
 
 /* ---- collapsible cards: tap a card title to fold it; remembered per device ---- */
 (function initCollapsibles(){

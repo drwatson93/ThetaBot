@@ -118,22 +118,44 @@ def describe_active_rules(
         "Uses journaled realized P&L, including assignment mark-to-market.")
 
     for rule in s.rules:
-        if not rule.enabled:
-            continue
         params = rule.params or {}
+        if not rule.enabled:
+            add("Exits", rule.name, "off",
+                "Disabled. The monitor does not evaluate this rule until it is turned back on.")
+            continue
         if rule.rule_type == "PROFIT_TARGET":
-            detail = f"Close when {params.get('profit_pct', 0):.0%} of the credit is captured."
+            pct = params.get("profit_pct")
+            detail = (
+                f"Close when {float(pct):.0%} of the credit is captured."
+                if isinstance(pct, (int, float)) and not isinstance(pct, bool)
+                else "Profit target is set."
+            )
             if params.get("trailing"):
                 detail += f" Trailing: give back {params.get('trail_gap', 0):.0%} from the peak."
             add("Exits", rule.name, "profit target", detail)
         elif rule.rule_type == "STOP_LOSS":
+            loss = params.get("loss_mult")
+            delta = params.get("delta_stop")
+            parts: list[str] = []
+            if loss is None:
+                parts.append("the loss-multiple trigger is off")
+            else:
+                parts.append(f"the mid cost-to-close ≥ {float(loss):.1f}× credit")
+            if delta is None:
+                parts.append("the |delta| trigger is off")
+            else:
+                parts.append(f"|delta| ≥ {float(delta):.2f}")
             add("Exits", rule.name, "stop loss",
-                f"Buy back if the mid cost-to-close ≥ {params.get('loss_mult', 0):.1f}× credit "
-                f"or |delta| ≥ {params.get('delta_stop', 0):.2f}. "
+                "Buy back if " + " or ".join(parts) + ". "
+                "Null means that trigger is off; the other trigger still closes. "
                 "The close is a limit starting at the bid/ask midpoint, never a market order at the ask.")
         elif rule.rule_type == "DTE":
             add("Exits", rule.name, f"{params.get('action', 'close')} at {params.get('dte_threshold')} DTE",
                 "Near-expiry close (or alert) so a weekly is not held into expiration by accident.")
+        elif rule.rule_type == "SIGNAL":
+            add("Exits", rule.name, "TradingView signal",
+                f"Match {params.get('match', 'underlying')}. "
+                f"Requires approval: {'yes' if rule.requires_approval else 'no'}.")
         else:
             add("Exits", rule.name, rule.rule_type, str(params))
 

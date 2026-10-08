@@ -10,6 +10,11 @@ Two independent triggers (either fires a close, whichever hits first):
 Stateless. For the wheel, assignment is acceptable, so this is a deliberate opt-in defense against
 a name that "keeps going down". Cost-to-close is the bid/ask midpoint so a momentary wide ask
 cannot trip the stop. The close order itself is a limit that starts at mid.
+
+A trigger whose param is null is off and does not fire; the other trigger still does. 0 is not
+"off" (it would trip immediately) and the settings API rejects it. An enabled rule with both
+triggers null never fires here. The dashboard rejects that combination and asks the owner to
+disable the rule instead.
 """
 from __future__ import annotations
 
