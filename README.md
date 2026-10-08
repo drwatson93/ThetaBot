@@ -339,6 +339,25 @@ rules:                           # each rule needs rule_type (required by the co
       profit_pct: 0.5            # close once 50% of the credit is captured
 ```
 
+### Exit rules from the dashboard
+
+The owner login can tune exit rules on the dashboard **Rules** tab. The view-only login sees the same numbers and cannot save (the server returns 403). Each rule has an on/off switch. The number fields are:
+
+| Field | Rule | Allowed |
+|---|---|---|
+| `profit_pct` | profit target | 0.05–0.95 |
+| `loss_mult` | stop loss | 1.0–10, or off |
+| `delta_stop` | stop loss | 0.1–1.0, or off |
+| `dte_threshold` | DTE close | whole number 0–30 |
+
+**Stop-loss triggers.** `null` means that trigger is off. `0` is not off (it would trip immediately) and is rejected. Turning off `loss_mult` leaves `delta_stop` active, and the other way around. Turning **both** triggers off while the rule stays enabled is rejected — disable the rule itself (`enabled: false`) to turn stop-loss off. You can turn the rule back on later and set either trigger again.
+
+Saving posts the full rules list. The page shows old → new and waits for a confirm click. The list must be the same rules that are already running: same names, same `rule_type`, same order. Adding, removing, or retyping a rule is rejected and nothing is changed. Other fields (`requires_approval`, `action`, `match`, trailing) stay as they are.
+
+A successful save is applied in place, written to the data-disk overlay (it overrides `config.yaml`), and recorded as a `CONFIG_EDIT` audit row. Changed fields are stored as `rules.<name>.<field>: {old, new}` — for example `rules.stop-loss.params.loss_mult` from `2.0` to `null`. A scripted save that changes nothing still writes that row with an empty `values` object, which is how every other `/api/config` save works. The Rules tab itself does not post when the diff is empty.
+
+The monitor reloads rules on its next poll. A disabled rule is not evaluated. Mode, live-arming, broker, and the hard-coded real-order lock are not on this screen.
+
 Tune the yield floor and delta band to your own risk tolerance. Higher `min_annualized_yield` = fewer, richer, higher-IV trades; lower = more, thinner ones. The defaults above are the ones that survived a real-option-print backtest under both fair and worst-case fills; **[docs/backtests.md](docs/backtests.md)** lists every lever tested, what held up, and what did not.
 
 ## Optional integrations (for different setups)

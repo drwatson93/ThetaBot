@@ -95,6 +95,23 @@ def test_stop_loss_holds_when_fine():
     assert r.evaluate(_pos(credit=1.0), _q(ask=1.2, bid=1.1, delta=-0.25), NOW) is None
 
 
+def test_null_stop_trigger_does_not_fire_while_the_other_does():
+    """Null turns one trigger off. 0 is not used — it would trip on any positive cost."""
+    loss_off = StopLossRule("stop", False, {"loss_mult": None, "delta_stop": 0.5})
+    # Mid is far past 2x credit, but the loss multiple is off and |delta| is fine.
+    assert loss_off.evaluate(_pos(credit=1.0), _q(ask=3.1, bid=3.0, delta=-0.2), NOW) is None
+    delta_hit = loss_off.evaluate(_pos(credit=1.0), _q(ask=1.2, bid=1.1, delta=-0.6), NOW)
+    assert delta_hit is not None and "Delta" in delta_hit.reason
+
+    delta_off = StopLossRule("stop", False, {"loss_mult": 2.0, "delta_stop": None})
+    assert delta_off.evaluate(_pos(credit=1.0), _q(ask=1.2, bid=1.1, delta=-0.9), NOW) is None
+    loss_hit = delta_off.evaluate(_pos(credit=1.0), _q(ask=2.2, bid=2.0, delta=-0.9), NOW)
+    assert loss_hit is not None and "Stop-loss" in loss_hit.reason
+
+    both_off = StopLossRule("stop", False, {"loss_mult": None, "delta_stop": None})
+    assert both_off.evaluate(_pos(credit=1.0), _q(ask=3.1, bid=3.0, delta=-0.9), NOW) is None
+
+
 # --- monitor peak tracking ----------------------------------------------------------------------
 
 class _Broker:
