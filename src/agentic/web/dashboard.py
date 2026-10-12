@@ -3,7 +3,7 @@
   GET /                -> the dashboard page
   GET /dashboard       -> the dashboard page
   GET /api/stats       -> win rate, realized/unrealized P&L, per-rule rollup
-  GET /api/positions   -> open + closed positions with P&L, underlying last, and the rule that closed them
+  GET /api/positions   -> open + closed positions with P&L, percent P/L, the exit plan, underlying last, and the rule that closed them
   GET /api/decisions   -> recent close decisions with reasons (the "why", for memory tuning)
   GET /api/audit       -> recent audit events
 
@@ -22,6 +22,7 @@ from ..domain.models import utcnow
 from ..domain.order_pricing import public_close_pricing_fields, public_pricing_fields
 from ..services.stats import compute_stats, position_rows
 from .auth import require_auth, require_owner
+from .position_cards import card_pnl_percent, holding_plan, live_profit_pct
 from .calc_page import CALC_PAGE
 
 if TYPE_CHECKING:
@@ -167,7 +168,17 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             real_only=deps.settings.is_live,
             underlying_quotes=quotes,
         )
-        return {"positions": rows}
+        for row in rows:
+            # Same dollars the card already shows. Does not recompute P&L.
+            row["pnl_pct"] = card_pnl_percent(
+                row.get("unrealized_pnl"), row.get("credit_received"), row.get("quantity"),
+            )
+        return {
+            "positions": rows,
+            "plan": holding_plan(deps.settings.rules),
+            # Live profit-target arm (a fraction). The gauge tick uses this; null when that rule is off.
+            "profit_pct": live_profit_pct(deps.settings.rules),
+        }
 
     @router.get("/api/decisions")
     async def api_decisions(limit: int = 100) -> dict:
@@ -1042,7 +1053,7 @@ _PAGE = """<!doctype html>
   .pnl{text-align:right;flex:none}
   .pnl .v{font-size:19px;font-weight:700;font-family:var(--mono);font-variant-numeric:tabular-nums}
   .pnl .l{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
-  .facts{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);
+  .facts{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
     border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;margin:14px 0}
   .fact{background:var(--card);padding:9px 11px}
   .fact .k{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em}
@@ -1193,6 +1204,7 @@ _PAGE = """<!doctype html>
     .app{padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))}
     .masthead h1{font-size:17px}
     .fact .v{font-size:13.5px}
+    .facts{grid-template-columns:repeat(2,1fr)}
     .scr-filters label{flex:1 1 40%}
   }
 </style>
@@ -1729,14 +1741,22 @@ async function sendTestAlert(){
 }
 
 /* ---- holdings (plain english) ---- */
-function planFor(p){
-  const put = p.option_type === "PUT";
-  if(p.dte <= 2) return "Near expiry — the bot will let it expire for the full credit or close it, and ping you.";
-  if(put) return "Holding. The bot <b>auto-closes at +50% profit</b>, <b>rolls it for a credit</b> if the stock tests your strike near expiry, and <b>pings you at 2 days left</b>.";
-  return "Covered call working. The bot manages it to expiry or buys it back at the profit target; if the shares get called away, it returns to selling puts.";
+function formatPnlPct(v){
+  // pnl_pct is already a whole percent from the server. Do not divide again.
+  if(typeof v !== "number" || !isFinite(v)) return {text:"—", cls:"muted"};
+  if(v > 0) return {text:"+" + v + "%", cls:"pos-c"};
+  if(v < 0) return {text:v + "%", cls:"neg"};
+  return {text:"0%", cls:""};
+}
+function gaugeTargetLeft(arm){
+  // Same -1..+1 track as the marker. 0.5 sits at 75%; 0.8 sits at 90%.
+  if(typeof arm !== "number" || !isFinite(arm)) return null;
+  return Math.max(2, Math.min(98, (arm + 1) / 2 * 100));
 }
 async function loadHolds(){
-  const {positions} = await getJSON("/api/positions");
+  const data = await getJSON("/api/positions");
+  const positions = data.positions || [];
+  const plan = data.plan ? data.plan : "No exit rules are on";
   const open = positions.filter(p => p.status==="OPEN" || p.status==="CLOSING");
   const done = positions.filter(p => !(p.status==="OPEN" || p.status==="CLOSING"));
   $("pos-count").textContent = open.length + (open.length===1?" open position":" open positions");
@@ -1745,12 +1765,15 @@ async function loadHolds(){
     const credit = p.credit_received*100*p.quantity;
     const nowVal = p.current_mark!=null ? p.current_mark*100*p.quantity : null;
     const upnl = p.unrealized_pnl;
+    const pct = formatPnlPct(p.pnl_pct);
     let gauge = "";
     if(nowVal!=null && credit>0){
       const capt = upnl/credit;                 // -1..+1 of credit
       const posp = Math.max(2,Math.min(98,(capt+1)/2*100));
+      const tick = gaugeTargetLeft(data.profit_pct);
+      const target = tick==null ? "" : `<div class="target" style="left:${tick}%"></div>`;
       gauge = `<div class="gauge"><div class="gauge-lab"><span>Losing</span><span>Profit captured</span><span>Winning</span></div>
-        <div class="track"><div class="zero"></div><div class="target" style="left:75%"></div>
+        <div class="track"><div class="zero"></div>${target}
         <div class="marker ${upnl>=0?"up":""}" style="left:${posp}%"></div></div></div>`;
     }
     return `<article class="pos-item">
@@ -1763,8 +1786,9 @@ async function loadHolds(){
         <div class="fact"><div class="k">Credit collected</div><div class="v">${money(credit)}</div></div>
         <div class="fact"><div class="k">Cost to close now</div><div class="v">${nowVal!=null?money(nowVal):"—"}</div></div>
         <div class="fact"><div class="k">Days left</div><div class="v">${p.dte}</div></div>
+        <div class="fact"><div class="k">Percent P/L</div><div class="v ${pct.cls}">${esc(pct.text)}</div></div>
       </div>${gauge}
-      <div class="plan"><span class="ic">→</span><div><b>Plan:</b> ${planFor(p)}</div></div>
+      <div class="plan"><span class="ic">→</span><div><b>Plan:</b> ${esc(plan)}</div></div>
     </article>`;
   }).join("") || `<div class="pos-item muted">No open positions right now. The scanner will open new cash-secured puts when a watchlist name meets your rules.</div>`;
 
