@@ -94,22 +94,22 @@ def _number(value: Any) -> float | None:
     return float(dec)
 
 
-def _whole(value: Any) -> int | None:
-    dec = _decimal(value)
-    if dec is None or dec != dec.to_integral_value():
-        return None
-    return int(dec)
+def _trim(dec: Decimal) -> str:
+    """Decimal text with no extra rounding and no trailing zeros."""
+    text = format(dec, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 
-def _points(fraction: float) -> int:
-    """0.8 → 80, with the same half-away-from-zero rule as P/L percent."""
-    return round_half_away_from_zero(Decimal(str(fraction)) * Decimal(100))
+def _num_label(value: float) -> str:
+    """Configured number as written. 2.25 stays 2.25; 2.0 stays 2."""
+    return _trim(Decimal(str(value)))
 
 
-def _fixed(value: float, places: int) -> str:
-    quant = Decimal("1").scaleb(-places)
-    dec = Decimal(str(value)).quantize(quant, rounding=ROUND_HALF_UP)
-    return f"{dec:.{places}f}"
+def _pct_label(fraction: float) -> str:
+    """0.8 → 80%, 0.575 → 57.5%. Does not round to a whole percent."""
+    return _trim(Decimal(str(fraction)) * Decimal(100)) + "%"
 
 
 def _days_left(threshold: int) -> str:
@@ -117,59 +117,132 @@ def _days_left(threshold: int) -> str:
     return f"{threshold} {unit} left"
 
 
+def _params(rule: Any) -> dict:
+    params = getattr(rule, "params", None) or {}
+    return params if isinstance(params, dict) else {}
+
+
+def _asks(rule: Any) -> bool:
+    return getattr(rule, "requires_approval", False) is True
+
+
+def _dte_days(params: dict) -> int:
+    """Days-left threshold DteRule actually uses. Missing means 21."""
+    if "dte_threshold" not in params or params.get("dte_threshold") is None:
+        return 21
+    n = _number(params.get("dte_threshold"))
+    if n is None:
+        return 21
+    return int(n)
+
+
+def _profit_bit(rule: Any, params: dict) -> str:
+    pct = _number(params.get("profit_pct"))
+    shown = _pct_label(pct) if pct is not None else None
+    asks = _asks(rule)
+    # Truthy, same as ProfitTargetRule: anything other than a real false arms the trail.
+    if params.get("trailing"):
+        gap = _number(params.get("trail_gap"))
+        gap_label = _pct_label(0.20 if gap is None else gap)
+        if shown is None:
+            prefix = "Arms at the profit target"
+            floor = "the arm"
+        else:
+            prefix = f"Arms at {shown} of the credit"
+            floor = shown
+        giveback = f"after a {gap_label} give-back from the peak, floored at {floor}"
+        if asks:
+            return f"{prefix}, then asks for approval to buy it back {giveback}."
+        return f"{prefix}, then buys it back {giveback}."
+    if shown is None:
+        if asks:
+            return "Asks for approval to close at the profit target."
+        return "Closes at the profit target."
+    if asks:
+        return f"Asks for approval to close at {shown} of the credit."
+    return f"Closes at {shown} of the credit."
+
+
+def _stop_bit(rule: Any, params: dict) -> str | None:
+    parts: list[str] = []
+    loss = _number(params.get("loss_mult"))
+    delta = _number(params.get("delta_stop"))
+    if loss is not None:
+        parts.append(f"cost reaches {_num_label(loss)}× the credit")
+    if delta is not None:
+        parts.append(f"|delta| reaches {_num_label(delta)}")
+    if not parts:
+        return None
+    joined = " or ".join(parts)
+    if _asks(rule):
+        return f"Asks for approval to buy it back if {joined}."
+    return f"Buys it back if {joined}."
+
+
+def _dte_bit(rule: Any, params: dict) -> str:
+    when = _days_left(_dte_days(params))
+    # DteRule buys back only when action == "close" exactly. "Close" and
+    # " close" are notify-only. A missing action defaults to "alert".
+    if "action" not in params or params.get("action") is None:
+        action = "alert"
+    else:
+        action = params.get("action")
+    if action == "close":
+        if _asks(rule):
+            return f"Asks for approval to buy the option back at {when}."
+        return f"Buys the option back at {when}."
+    if action == "alert":
+        return f"Alerts you at {when} and does not buy the option back."
+    label = action if isinstance(action, str) else str(action)
+    return f"At {when} it alerts you (action: {label}) and does not buy the option back."
+
+
+def _signal_bit(rule: Any) -> str:
+    if _asks(rule):
+        return "A TradingView signal closes it, with your approval."
+    # SignalMatcher forces approval when one symbol matches more than one open position.
+    return (
+        "A TradingView signal closes it. "
+        "A symbol matching more than one open position still asks for approval."
+    )
+
+
 def _rule_bits(rule: Any) -> str | None:
+    # Profit, stop, and DTE are already skipped by RulesEngine when disabled.
+    # tv-signal is not: on main, SignalProcessor ignores enabled and still closes.
+    # Leaving a disabled tv-signal out of this sentence assumes PR #13
+    # (branch cursor/rules-tab-editor-3b4c), which does not match or close when
+    # that rule is off. This card does not change the processor.
     if getattr(rule, "enabled", False) is not True:
         return None
-    params = getattr(rule, "params", None) or {}
-    if not isinstance(params, dict):
-        params = {}
+    params = _params(rule)
     kind = str(getattr(rule, "rule_type", "") or "")
-
     if kind == "PROFIT_TARGET":
-        pct = _number(params.get("profit_pct"))
-        if pct is None:
-            return "Closes at the profit target."
-        shown = f"{_points(pct)}%"
-        if params.get("trailing") is True:
-            return f"Arms at {shown} of the credit, then trails."
-        return f"Closes at {shown} of the credit."
-
+        return _profit_bit(rule, params)
     if kind == "STOP_LOSS":
-        parts: list[str] = []
-        loss = _number(params.get("loss_mult"))
-        delta = _number(params.get("delta_stop"))
-        if loss is not None:
-            parts.append(f"cost reaches {_fixed(loss, 1)}× the credit")
-        if delta is not None:
-            parts.append(f"|delta| reaches {_fixed(delta, 2)}")
-        if not parts:
-            return None
-        return "Buys it back if " + " or ".join(parts) + "."
-
+        return _stop_bit(rule, params)
     if kind == "DTE":
-        threshold = _whole(params.get("dte_threshold"))
-        when = f"at {_days_left(threshold)}" if threshold is not None else "near expiration"
-        action = params.get("action", "alert")
-        action_s = str(action if action is not None else "alert").strip().lower()
-        if action_s == "close":
-            return f"Buys the option back {when}."
-        if action_s == "alert":
-            return f"Alerts you {when} and does not buy the option back."
-        # DteRule buys the option back only when action is close. Anything else
-        # is notify-only: it alerts and never sends the close order.
-        label = str(action).strip() or "alert"
-        spot = _days_left(threshold) if threshold is not None else "expiration"
-        return (
-            f"At {spot} it alerts you (action: {label}) and does not buy the option back."
-        )
-
+        return _dte_bit(rule, params)
     if kind == "SIGNAL":
-        if getattr(rule, "requires_approval", False) is True:
-            return "A TradingView signal closes it, with your approval."
-        return "A TradingView signal closes it."
-
+        return _signal_bit(rule)
     name = str(getattr(rule, "name", "") or "").strip() or "a rule"
     return f"Runs {name}."
+
+
+def live_profit_pct(rules: list[Any] | None) -> float | None:
+    """Arm level of the first enabled profit target, or None when that rule is off.
+
+    A missing ``profit_pct`` is 0.5, the same default ProfitTargetRule uses.
+    The value is not rounded.
+    """
+    for rule in rules or []:
+        if getattr(rule, "enabled", False) is not True:
+            continue
+        if str(getattr(rule, "rule_type", "") or "") != "PROFIT_TARGET":
+            continue
+        pct = _number(_params(rule).get("profit_pct"))
+        return 0.5 if pct is None else pct
+    return None
 
 
 def holding_plan(rules: list[Any] | None) -> str:
@@ -177,6 +250,10 @@ def holding_plan(rules: list[Any] | None) -> str:
 
     When every rule is off (or none are configured), returns exactly
     ``No exit rules are on``.
+
+    A disabled tv-signal is omitted on purpose. That sentence is true once
+    PR #13 honors ``enabled`` in SignalProcessor. On main a disabled
+    tv-signal still closes. This function does not change that runtime.
     """
     bits = [bit for bit in (_rule_bits(rule) for rule in (rules or [])) if bit]
     if not bits:

@@ -5,7 +5,10 @@ Tickers in this file are synthetic (ZZZ, QQQX) only.
 from __future__ import annotations
 
 import copy
+import shutil
+import subprocess
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,37 +24,43 @@ from agentic.store.orders import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
-from agentic.web.position_cards import card_pnl_percent, holding_plan, pnl_percent
+from agentic.web.position_cards import card_pnl_percent, holding_plan, live_profit_pct, pnl_percent
 
 
 def _rules(
     *,
     profit_pct: float = 0.5,
     profit_on: bool = True,
+    profit_approval: bool = False,
     trailing: bool = False,
+    trail_gap: float | None = None,
     stop_on: bool = True,
+    stop_approval: bool = False,
     loss_mult: float | None = 2.0,
     delta_stop: float | None = 0.5,
     dte_on: bool = True,
+    dte_approval: bool = False,
     dte_threshold: int = 2,
     dte_action: str = "close",
     signal_on: bool = True,
     signal_approval: bool = True,
 ) -> list[RuleConfig]:
+    profit_params: dict = {"profit_pct": profit_pct, "trailing": trailing}
+    if trail_gap is not None:
+        profit_params["trail_gap"] = trail_gap
     return [
         RuleConfig(
             name="profit-target", rule_type="PROFIT_TARGET", enabled=profit_on,
-            requires_approval=False,
-            params={"profit_pct": profit_pct, "trailing": trailing},
+            requires_approval=profit_approval, params=profit_params,
         ),
         RuleConfig(
             name="stop-loss", rule_type="STOP_LOSS", enabled=stop_on,
-            requires_approval=False,
+            requires_approval=stop_approval,
             params={"loss_mult": loss_mult, "delta_stop": delta_stop},
         ),
         RuleConfig(
             name="dte-close", rule_type="DTE", enabled=dte_on,
-            requires_approval=False,
+            requires_approval=dte_approval,
             params={"dte_threshold": dte_threshold, "action": dte_action},
         ),
         RuleConfig(
@@ -63,7 +72,7 @@ def _rules(
 
 _ALL_ON_80 = (
     "Closes at 80% of the credit. "
-    "Buys it back if cost reaches 2.0× the credit or |delta| reaches 0.50. "
+    "Buys it back if cost reaches 2× the credit or |delta| reaches 0.5. "
     "Buys the option back at 2 days left. "
     "A TradingView signal closes it, with your approval."
 )
@@ -150,11 +159,11 @@ def test_plan_stop_loss_off_is_omitted():
 
 def test_plan_one_stop_trigger_off():
     only_loss = holding_plan(_rules(profit_pct=0.8, delta_stop=None))
-    assert "Buys it back if cost reaches 2.0× the credit." in only_loss
+    assert "Buys it back if cost reaches 2× the credit." in only_loss
     assert "|delta|" not in only_loss
 
     only_delta = holding_plan(_rules(profit_pct=0.8, loss_mult=None))
-    assert "Buys it back if |delta| reaches 0.50." in only_delta
+    assert "Buys it back if |delta| reaches 0.5." in only_delta
     assert "cost reaches" not in only_delta
 
 
@@ -178,16 +187,25 @@ def test_plan_dte_uses_threshold_and_real_action():
 
 
 def test_plan_tv_signal_off_and_without_approval():
+    """A disabled tv-signal is left out of the plan.
+
+    That matches SignalProcessor only after PR #13
+    (branch cursor/rules-tab-editor-3b4c), which does not match or close when
+    the rule is off. On main the processor ignores ``enabled`` and still
+    closes. This test does not change that runtime.
+    """
     off = holding_plan(_rules(profit_pct=0.8, signal_on=False))
     assert "TradingView" not in off
     assert off == (
         "Closes at 80% of the credit. "
-        "Buys it back if cost reaches 2.0× the credit or |delta| reaches 0.50. "
+        "Buys it back if cost reaches 2× the credit or |delta| reaches 0.5. "
         "Buys the option back at 2 days left."
     )
     auto = holding_plan(_rules(signal_approval=False, profit_on=False, stop_on=False, dte_on=False))
-    assert auto == "A TradingView signal closes it."
-    assert "approval" not in auto
+    assert auto == (
+        "A TradingView signal closes it. "
+        "A symbol matching more than one open position still asks for approval."
+    )
 
 
 def test_plan_all_off():
@@ -199,9 +217,92 @@ def test_plan_all_off():
     assert holding_plan(None) == "No exit rules are on"
 
 
-def test_plan_trailing_profit_target_is_not_a_fixed_close():
-    text = holding_plan(_rules(profit_pct=0.8, trailing=True, stop_on=False, dte_on=False, signal_on=False))
-    assert text == "Arms at 80% of the credit, then trails."
+def test_plan_trailing_profit_target_describes_the_exit():
+    text = holding_plan(_rules(
+        profit_pct=0.8, trailing=True, trail_gap=0.2,
+        stop_on=False, dte_on=False, signal_on=False,
+    ))
+    assert text == (
+        "Arms at 80% of the credit, then buys it back after a 20% give-back "
+        "from the peak, floored at 80%."
+    )
+    # Missing trail_gap uses the rule's 0.20 default. A truthy flag arms the trail.
+    flagged = RuleConfig(
+        name="profit-target", rule_type="PROFIT_TARGET", enabled=True,
+        requires_approval=False,
+        params={"profit_pct": 0.8, "trailing": 1},
+    )
+    assert holding_plan([flagged]) == text
+
+
+def test_plan_approval_is_not_an_automatic_close():
+    profit = holding_plan(_rules(
+        profit_pct=0.8, profit_approval=True, stop_on=False, dte_on=False, signal_on=False,
+    ))
+    assert profit == "Asks for approval to close at 80% of the credit."
+    stop = holding_plan(_rules(
+        stop_approval=True, loss_mult=2.0, delta_stop=None,
+        profit_on=False, dte_on=False, signal_on=False,
+    ))
+    assert stop == "Asks for approval to buy it back if cost reaches 2× the credit."
+    dte = holding_plan(_rules(
+        dte_approval=True, dte_threshold=2, dte_action="close",
+        profit_on=False, stop_on=False, signal_on=False,
+    ))
+    assert dte == "Asks for approval to buy the option back at 2 days left."
+    trail = holding_plan(_rules(
+        profit_pct=0.8, trailing=True, trail_gap=0.15, profit_approval=True,
+        stop_on=False, dte_on=False, signal_on=False,
+    ))
+    assert trail == (
+        "Arms at 80% of the credit, then asks for approval to buy it back "
+        "after a 15% give-back from the peak, floored at 80%."
+    )
+
+
+def test_plan_keeps_configured_threshold_precision():
+    text = holding_plan(_rules(
+        profit_pct=0.575, loss_mult=2.25, delta_stop=0.575,
+        dte_on=False, signal_on=False,
+    ))
+    assert text == (
+        "Closes at 57.5% of the credit. "
+        "Buys it back if cost reaches 2.25× the credit or |delta| reaches 0.575."
+    )
+
+
+def test_plan_dte_matches_dte_rule_exactly():
+    # Only the exact string "close" buys back. "Close" does not.
+    titled = holding_plan(_rules(
+        dte_action="Close", dte_threshold=2,
+        profit_on=False, stop_on=False, signal_on=False,
+    ))
+    assert titled == "At 2 days left it alerts you (action: Close) and does not buy the option back."
+    assert "Buys the option back" not in titled
+
+    missing = RuleConfig(
+        name="dte-close", rule_type="DTE", enabled=True, requires_approval=False,
+        params={"action": "close"},
+    )
+    assert holding_plan([missing]) == "Buys the option back at 21 days left."
+
+    no_action = RuleConfig(
+        name="dte-close", rule_type="DTE", enabled=True, requires_approval=False,
+        params={"dte_threshold": 4},
+    )
+    assert holding_plan([no_action]) == (
+        "Alerts you at 4 days left and does not buy the option back."
+    )
+
+
+def test_live_profit_pct_is_unrounded_and_off_when_disabled():
+    assert live_profit_pct(_rules(profit_pct=0.575)) == 0.575
+    assert live_profit_pct(_rules(profit_on=False)) is None
+    bare = RuleConfig(
+        name="profit-target", rule_type="PROFIT_TARGET", enabled=True,
+        requires_approval=False, params={},
+    )
+    assert live_profit_pct([bare]) == 0.5
 
 
 def _pos(underlying: str, credit: float, mark: float | None, *, strike: float) -> Position:
@@ -247,6 +348,7 @@ def test_api_cards_use_displayed_dollars(tmp_path, monkeypatch):
     ])
     body = client.get("/api/positions").json()
     assert body["plan"] == _ALL_ON_80
+    assert body["profit_pct"] == 0.8
     by = {row["underlying"]: row for row in body["positions"]}
     assert set(by) == {"ZZZ", "QQQX"}
 
@@ -300,7 +402,7 @@ def test_hot_rules_edit_changes_the_plan_without_restart(tmp_path, monkeypatch):
     before = client.get("/api/positions").json()
     assert before["plan"] == (
         "Closes at 50% of the credit. "
-        "Buys it back if cost reaches 2.0× the credit or |delta| reaches 0.50. "
+        "Buys it back if cost reaches 2× the credit or |delta| reaches 0.5. "
         "Buys the option back at 2 days left. "
         "A TradingView signal closes it, with your approval."
     )
@@ -317,6 +419,7 @@ def test_hot_rules_edit_changes_the_plan_without_restart(tmp_path, monkeypatch):
     after = client.get("/api/positions").json()
     assert after["plan"] == _ALL_ON_80
     assert "50%" not in after["plan"]
+    assert after["profit_pct"] == 0.8
     assert live.rules[0].params["profit_pct"] == 0.8
     assert live.mode == "paper"
     assert live.i_understand_live_trading is False
@@ -334,9 +437,43 @@ def test_dashboard_markup_has_fourth_square_and_drops_the_old_plan(tmp_path, mon
     assert "Percent P/L" in html
     assert "p.pnl_pct" in html
     assert "formatPnlPct" in html
+    assert "gaugeTargetLeft" in html
+    assert "data.profit_pct" in html
+    assert 'style="left:75%"' not in html
     assert "data.plan" in html
     assert "repeat(4,1fr)" in html
     assert "rolls it for a credit" not in html
     assert "auto-closes at +50% profit" not in html
     assert "pings you at 2 days" not in html
     assert "function planFor" not in html
+
+
+def test_format_pnl_pct_runs_in_javascript():
+    """Execute the dashboard's formatPnlPct and gaugeTargetLeft, not a copy."""
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node is None and Path("/exec-daemon/node").exists():
+        node = "/exec-daemon/node"
+    if node is None:
+        pytest.skip("node is not installed")
+    src = Path("src/agentic/web/dashboard.py").read_text(encoding="utf-8")
+    start = src.index("function formatPnlPct")
+    end = src.index("async function loadHolds")
+    script = src[start:end] + """
+function check(cond, msg){ if(!cond){ console.error(msg); process.exit(1); } }
+const gain = formatPnlPct(69);
+check(gain.text === "+69%" && gain.cls === "pos-c", "gain");
+const loss = formatPnlPct(-69);
+check(loss.text === "-69%" && loss.cls === "neg", "loss");
+const zero = formatPnlPct(0);
+check(zero.text === "0%" && zero.cls === "", "zero");
+const missing = formatPnlPct(null);
+check(missing.text === "\\u2014" && missing.cls === "muted", "missing");
+const bad = formatPnlPct(NaN);
+check(bad.text === "\\u2014" && bad.cls === "muted", "nan");
+const inf = formatPnlPct(Infinity);
+check(inf.text === "\\u2014" && inf.cls === "muted", "inf");
+check(gaugeTargetLeft(0.5) === 75, "half");
+check(gaugeTargetLeft(0.8) === 90, "eighty");
+check(gaugeTargetLeft(null) === null, "off");
+"""
+    subprocess.run([node, "-e", script], check=True)

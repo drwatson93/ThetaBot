@@ -22,7 +22,7 @@ from ..domain.models import utcnow
 from ..domain.order_pricing import public_close_pricing_fields, public_pricing_fields
 from ..services.stats import compute_stats, position_rows
 from .auth import require_auth, require_owner
-from .position_cards import card_pnl_percent, holding_plan
+from .position_cards import card_pnl_percent, holding_plan, live_profit_pct
 from .calc_page import CALC_PAGE
 
 if TYPE_CHECKING:
@@ -173,7 +173,12 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             row["pnl_pct"] = card_pnl_percent(
                 row.get("unrealized_pnl"), row.get("credit_received"), row.get("quantity"),
             )
-        return {"positions": rows, "plan": holding_plan(deps.settings.rules)}
+        return {
+            "positions": rows,
+            "plan": holding_plan(deps.settings.rules),
+            # Live profit-target arm (a fraction). The gauge tick uses this; null when that rule is off.
+            "profit_pct": live_profit_pct(deps.settings.rules),
+        }
 
     @router.get("/api/decisions")
     async def api_decisions(limit: int = 100) -> dict:
@@ -1743,6 +1748,11 @@ function formatPnlPct(v){
   if(v < 0) return {text:v + "%", cls:"neg"};
   return {text:"0%", cls:""};
 }
+function gaugeTargetLeft(arm){
+  // Same -1..+1 track as the marker. 0.5 sits at 75%; 0.8 sits at 90%.
+  if(typeof arm !== "number" || !isFinite(arm)) return null;
+  return Math.max(2, Math.min(98, (arm + 1) / 2 * 100));
+}
 async function loadHolds(){
   const data = await getJSON("/api/positions");
   const positions = data.positions || [];
@@ -1760,8 +1770,10 @@ async function loadHolds(){
     if(nowVal!=null && credit>0){
       const capt = upnl/credit;                 // -1..+1 of credit
       const posp = Math.max(2,Math.min(98,(capt+1)/2*100));
+      const tick = gaugeTargetLeft(data.profit_pct);
+      const target = tick==null ? "" : `<div class="target" style="left:${tick}%"></div>`;
       gauge = `<div class="gauge"><div class="gauge-lab"><span>Losing</span><span>Profit captured</span><span>Winning</span></div>
-        <div class="track"><div class="zero"></div><div class="target" style="left:75%"></div>
+        <div class="track"><div class="zero"></div>${target}
         <div class="marker ${upnl>=0?"up":""}" style="left:${posp}%"></div></div></div>`;
     }
     return `<article class="pos-item">
