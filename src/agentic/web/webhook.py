@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from ..config import get_secret
 from ..domain.enums import AuditEventType, SignalStatus
 from ..domain.models import Signal, utcnow
+from ..services.signal_processor import signal_rule_is_enabled
 from .auth import deny_viewer
 
 if TYPE_CHECKING:
@@ -105,19 +106,32 @@ def make_webhook_router(deps: "WebDeps") -> APIRouter:
         alert_id = payload.get("alert_id")
         dedup_key = str(alert_id) if alert_id else hashlib.sha256(body).hexdigest()
         ttl = deps.settings.web.signal_ttl_seconds
+        # Store as already expired when tv-signal is off. A later re-enable must
+        # not replay an alert that arrived while closes were disabled.
+        rule_off = not signal_rule_is_enabled(deps.settings)
         signal = Signal(
             raw=payload,
             dedup_key=dedup_key,
             token_ok=True,
             action=action,
-            status=SignalStatus.NEW,
+            status=SignalStatus.NO_MATCH if rule_off else SignalStatus.NEW,
             ttl_expires_at=utcnow() + timedelta(seconds=ttl),
         )
         is_new = deps.signals.insert_if_new(signal)
+        if rule_off and is_new:
+            deps.audit.record(
+                AuditEventType.SIGNAL,
+                {"expired": True, "reason": "signal_rule_disabled", "dedup_key": dedup_key},
+                source="webhook",
+            )
+            return JSONResponse(
+                {"status": "expired", "reason": "signal_rule_disabled", "dedup_key": dedup_key},
+                status_code=202,
+            )
         deps.audit.record(
             AuditEventType.SIGNAL,
-            {"queued": is_new, "duplicate": not is_new, "dedup_key": dedup_key,
-             "action": signal.action},
+            {"queued": is_new and not rule_off, "duplicate": not is_new,
+             "dedup_key": dedup_key, "action": signal.action},
             source="webhook",
         )
         return JSONResponse(

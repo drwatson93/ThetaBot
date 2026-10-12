@@ -287,7 +287,11 @@ def apply_patch(settings: Settings, patch: dict, *, overlay_path=None) -> list[s
     except ValidationError as exc:
         raise SettingsEditError(f"Invalid setting value(s): {exc.errors()}") from exc
 
+    before = settings.model_dump(mode="json")
     _apply_in_place(settings, validated, patch)
+    if not _leaf_diff(before, settings.model_dump(mode="json")):
+        log.info("Settings edit made no change; overlay not rewritten: %s", sorted(patch))
+        return sorted(patch)
 
     overlay = _deep_merge(load_overlay(overlay_path), patch)
     overlay, stripped = strip_locked_overlay(overlay)

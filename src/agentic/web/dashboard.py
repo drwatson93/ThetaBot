@@ -2078,7 +2078,11 @@ async function postConfig(patch){
   });
   const d = await r.json().catch(()=>({}));
   if(r.status === 403) throw new Error("View-only login cannot save settings.");
-  if(r.status === 409) throw new Error(d.error || "Exit rules changed. Reload the Rules tab and try again.");
+  if(r.status === 409){
+    const err = new Error(d.error || "Exit rules changed. Reload the Rules tab and try again.");
+    err.status = 409;
+    throw err;
+  }
   if(!r.ok || d.ok === false) throw new Error(d.error || ("HTTP "+r.status));
   renderOverlaySource(d);
   return d;
@@ -2566,7 +2570,17 @@ async function confirmRules(){
     say("rules-say", "Saved. The monitor picks this up on its next poll.", true);
     await loadRulesEditor(true);
   } catch(e){
-    say("rules-say", e.message || "Couldn't save.", false);
+    if(e && e.status === 409){
+      rulesFormDirty = false;
+      pendingRules = null;
+      rulesShownDiff = [];
+      if($("rules-confirm")) $("rules-confirm").hidden = true;
+      lockRulesForm(false);
+      say("rules-say", e.message || "Exit rules changed. Reload the Rules tab and try again.", false);
+      try { await loadRulesEditor(true); } catch(err){ console.error("rules-reload", err); }
+    } else {
+      say("rules-say", e.message || "Couldn't save.", false);
+    }
   } finally {
     if(btn) btn.disabled = false;
     applyRoleUI();

@@ -129,7 +129,8 @@ def test_rules_tab_reuses_owner_gate(client):
     assert "rules_base" in html
     assert "display-only" in html
     assert "lockRulesForm" in html
-    assert "status === 409" in html
+    assert "e.status === 409" in html
+    assert "loadRulesEditor(true)" in html
     assert "#pane-rules input, #pane-rules button" in html
     assert "const ROLE = \"owner\";" in html
     # Mode, live-arming, and broker are not fields on this editor.
@@ -190,13 +191,24 @@ def test_viewer_rules_save_is_403_and_changes_nothing(client, monkeypatch):
     assert load_overlay() == {}
 
 
-def test_noop_rules_post_writes_no_audit_row(client):
-    """An empty leaf diff does not ping Watchman. A real change still writes CONFIG_EDIT."""
+def test_noop_rules_post_writes_no_audit_row(client, monkeypatch):
+    """An empty leaf diff does not ping Watchman or rewrite the overlay."""
+    from agentic.web import settings as settings_mod
+
     c, settings, audit, _scanner = client
     _seed(settings)
+    writes = []
+    real_save = settings_mod.save_overlay
+
+    def _spy(overlay, path=None):
+        writes.append(overlay)
+        return real_save(overlay, path)
+
+    monkeypatch.setattr(settings_mod, "save_overlay", _spy)
     r = _post_rules(c, settings, _dump(settings))
     assert r.status_code == 200, r.text
     assert _audit_count(audit) == 0
+    assert writes == []
     assert settings.rules[1].params["loss_mult"] == 2.0
     changed = _edit(_dump(settings), "profit-target", profit_pct=0.55)
     assert _post_rules(c, settings, changed).status_code == 200

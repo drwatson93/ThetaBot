@@ -36,6 +36,11 @@ def _enabled_signal_rule(settings: Settings):
     return None
 
 
+def signal_rule_is_enabled(settings: Settings) -> bool:
+    """True only when a SIGNAL rule is present and enabled right now."""
+    return _enabled_signal_rule(settings) is not None
+
+
 def _signal_base_approval(settings: Settings) -> bool:
     rule = _enabled_signal_rule(settings)
     if rule is None:
@@ -67,15 +72,15 @@ class SignalProcessor:
         )
 
     async def process_pending(self) -> int:
-        # Rules are read live. build_rules never constructs a SIGNAL rule, so the
-        # enabled flag has to be honored here or turning tv-signal off still closes.
-        rule = _enabled_signal_rule(self.settings)
-        if rule is None:
-            self._expire_while_disabled()
-            return 0
-        self.matcher.base_requires_approval = bool(rule.requires_approval)
+        # Re-read the rule before every signal. A batch that starts enabled must
+        # not close the rest if tv-signal is turned off halfway through.
         new = self.signals.list_by_status(SignalStatus.NEW)
         for sig in new:
+            rule = _enabled_signal_rule(self.settings)
+            if rule is None:
+                self._expire_one(sig)
+                continue
+            self.matcher.base_requires_approval = bool(rule.requires_approval)
             try:
                 await self._process_one(sig)
             except Exception as exc:  # noqa: BLE001 — one bad signal must not stall the rest
@@ -86,18 +91,24 @@ class SignalProcessor:
                 )
         return len(new)
 
-    def _expire_while_disabled(self) -> None:
-        """Mark NEW signals so turning the rule back on does not replay them.
+    def _expire_one(self, sig: Signal) -> None:
+        """Drop one NEW alert. No match, no close decision, no executor, no approval."""
+        if sig.status != SignalStatus.NEW:
+            return
+        self.signals.set_status(sig.id, SignalStatus.NO_MATCH)
+        sig.status = SignalStatus.NO_MATCH
+        self.audit.record(
+            AuditEventType.SIGNAL,
+            {"expired": True, "reason": "signal_rule_disabled", "dedup_key": sig.dedup_key},
+            source="signals",
+        )
 
-        No match, no close decision, no executor, and no approval gate.
-        """
+    def _expire_while_disabled(self) -> None:
+        """Mark every NEW signal so turning the rule back on does not replay them."""
+        if signal_rule_is_enabled(self.settings):
+            return
         for sig in self.signals.list_by_status(SignalStatus.NEW):
-            self.signals.set_status(sig.id, SignalStatus.NO_MATCH)
-            self.audit.record(
-                AuditEventType.SIGNAL,
-                {"expired": True, "reason": "signal_rule_disabled", "dedup_key": sig.dedup_key},
-                source="signals",
-            )
+            self._expire_one(sig)
 
     async def _process_one(self, sig: Signal) -> None:
         if sig.ttl_expires_at is not None and utcnow() > sig.ttl_expires_at:
