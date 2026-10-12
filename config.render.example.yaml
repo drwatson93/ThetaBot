@@ -193,8 +193,10 @@ rules:
     enabled: true
     requires_approval: false
     params:
-      loss_mult: 2.0         # close when cost-to-close >= 2x credit (~ -100% of credit)
-      delta_stop: 0.5        # close when |delta| >= 0.50 (strike being breached)
+      loss_mult: 2.0         # close when cost-to-close >= 2x credit. null = this trigger off
+      delta_stop: 0.5        # close when |delta| >= 0.50. null = this trigger off
+      # Dashboard: owner can edit these live. An enabled stop must keep one trigger;
+      # both null is rejected — set enabled: false to turn the rule off. 0 is not "off".
   - name: dte-close
     rule_type: DTE
     enabled: true

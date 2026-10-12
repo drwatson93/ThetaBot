@@ -90,12 +90,16 @@ def test_indicator_alert_requires_symbol(client):
     assert r.status_code == 400
 
 
-def test_close_signal_still_queued(client):
+def test_close_signal_expires_when_tv_signal_is_off(client):
+    """A close alert is not an indicator snapshot, and it is not left NEW while tv-signal is off."""
     c, signals, tv = client
     r = c.post("/webhook/tradingview",
                json={"token": TOKEN, "action": "close", "symbol": "AAPL", "alert_id": "x1"})
     assert r.status_code == 202
-    assert len(signals.list_by_status(SignalStatus.NEW)) == 1
+    assert r.json()["status"] == "expired"
+    assert r.json()["reason"] == "signal_rule_disabled"
+    assert signals.list_by_status(SignalStatus.NEW) == []
+    assert len(signals.list_by_status(SignalStatus.NO_MATCH)) == 1
     assert tv.get_latest("AAPL") is None
 
 

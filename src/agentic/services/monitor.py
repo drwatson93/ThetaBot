@@ -127,10 +127,15 @@ class MonitorLoop:
             source="monitor",
         )
 
-        # Phase 3: drain queued TradingView signals only inside the order window —
-        # a signal close is still an exit and must wait until trading_start.
-        if can_trade and self.signal_processor is not None:
-            await self.signal_processor.process_pending()
+        # A signal close waits for the order window. Expiring alerts that arrived
+        # while tv-signal is off does not: otherwise they stay NEW until the window
+        # opens and close if the rule was turned back on in between.
+        if self.signal_processor is not None:
+            from .signal_processor import signal_rule_is_enabled
+            if not signal_rule_is_enabled(self.settings):
+                self.signal_processor._expire_while_disabled()
+            elif can_trade:
+                await self.signal_processor.process_pending()
         if self.approval_gate is not None:
             self.approval_gate.expire_stale()
 
