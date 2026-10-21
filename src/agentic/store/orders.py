@@ -1,17 +1,36 @@
 """Order repository.
 
 The executor persists an Order row in PENDING state **before** it submits to the broker,
-keyed by ``client_order_id`` (UNIQUE). This is the idempotency backstop: if we crash
-between persist and submit, the row tells us a submit may be in flight, and reusing the
-same ``client_order_id`` on retry prevents a duplicate broker order.
+keyed by ``client_order_id`` (UNIQUE). A never-submitted PENDING row keeps that id so a
+retry is idempotent at the broker. A confirmed cancel or reject does not: the next close
+gets a fresh id (``-r1``, ``-r2``, ...) and only the unfilled remainder.
 """
 from __future__ import annotations
 
+import logging
+import re
+import sqlite3
+import uuid
 from datetime import datetime
 
 from ..domain.enums import OrderStatus
-from ..domain.models import Order
+from ..domain.models import Order, utcnow
 from .db import Database
+
+log = logging.getLogger("agentic.store")
+
+_RETRY_SUFFIX = re.compile(r"-r(\d+)$")
+
+# Statuses that mean a buy-to-close has started or finished. A second close for the
+# same position is refused while any of these rows exist. REJECTED and CANCELLED are
+# absent so a failed close can be retried. Keep the partial index in db.py in sync.
+LIVE_CLOSE_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.PARTIAL,
+    OrderStatus.FILLED,
+)
+_LIVE_CLOSE_SQL = ",".join("?" for _ in LIVE_CLOSE_STATUSES)
 
 
 def _col(r, key, default=None):
@@ -73,6 +92,121 @@ class OrderStore:
         self.db.conn.commit()
         return cur.rowcount > 0
 
+    def begin_live_close(self, o: Order, *, busy: bool) -> tuple[str, Order | None]:
+        """Atomically claim ``o`` as the one live buy-to-close for its position.
+
+        Returns ``(result, order)``:
+
+        * ``inserted`` — this row is the new PENDING close. A retry after a confirmed
+          cancel or reject is a new row with a fresh ``client_order_id`` and a quantity
+          of only the contracts not already filled.
+        * ``resume`` — this decision already has a pending, submitted, or partial close.
+          The caller polls it when the broker has it, and submits only when the row
+          never left this process.
+        * ``filled`` — a buy-to-close already filled, or cancelled partials cover the
+          whole quantity.
+        * ``blocked`` — another close is pending, submitted, partial, or this process
+          is already inside ``execute_close`` for the position (``busy``).
+
+        ``busy`` is the in-process owner flag. It closes the gap where the working
+        order has been cancelled for a reprice and the replacement is not inserted yet.
+        """
+        conn = self.db.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            live = _row_to_order(row) if (row := _fetch_live_close(conn, o.position_id)) else None
+            if live is not None:
+                if live.status == OrderStatus.FILLED:
+                    _upsert_claim_tx(conn, live)
+                    conn.commit()
+                    return "filled", live
+                if busy or live.decision_id != o.decision_id:
+                    conn.commit()
+                    return "blocked", live
+                _upsert_claim_tx(conn, live)
+                conn.commit()
+                return "resume", live
+
+            if busy:
+                claimed = _order_for_claim(conn, o.position_id)
+                conn.commit()
+                return "blocked", claimed
+
+            reserved = _reserved_filled_qty(conn, o.position_id)
+            remainder = o.quantity - reserved
+            if remainder <= 0:
+                covered = _covered_close(conn, o.position_id)
+                if covered is not None and covered.status != OrderStatus.FILLED:
+                    # One FILLED row is what the unique index uses to refuse another close.
+                    conn.execute(
+                        "UPDATE orders SET status = ?, last_status_at = ? WHERE id = ?",
+                        (OrderStatus.FILLED.value, utcnow().isoformat(), covered.id),
+                    )
+                    covered.status = OrderStatus.FILLED
+                if covered is not None:
+                    _upsert_claim_tx(conn, covered)
+                conn.commit()
+                return "filled", covered
+
+            conn.execute("DELETE FROM close_claims WHERE position_id = ?", (o.position_id,))
+            existing_row = conn.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (o.client_order_id,)
+            ).fetchone()
+            fresh = o
+            if existing_row is not None:
+                existing = _row_to_order(existing_row)
+                if existing.status == OrderStatus.FILLED:
+                    _upsert_claim_tx(conn, existing)
+                    conn.commit()
+                    return "filled", existing
+                if existing.status in LIVE_CLOSE_STATUSES:
+                    _upsert_claim_tx(conn, existing)
+                    conn.commit()
+                    return "resume", existing
+                if existing.status not in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
+                    conn.commit()
+                    return "blocked", existing
+                # Confirmed cancel/reject. Do not reuse the id or zero filled_qty.
+                fresh = _replacement_order(
+                    o, _next_close_client_id(conn, o.client_order_id), remainder,
+                )
+            elif remainder != o.quantity:
+                fresh = _replacement_order(o, o.client_order_id, remainder)
+
+            _insert_order_tx(conn, fresh)
+            _upsert_claim_tx(conn, fresh)
+            conn.commit()
+            return "inserted", fresh
+        except sqlite3.IntegrityError as exc:
+            log.warning(
+                "begin_live_close lost the close claim for %s (%s): %s",
+                o.position_id, o.client_order_id, exc,
+            )
+            conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        live = _row_to_order(row) if (row := _fetch_live_close(conn, o.position_id)) else None
+        return "blocked", live
+
+    def upsert_close_claim(self, o: Order) -> None:
+        """Point the position's persisted claim at ``o`` (the order now working or filled)."""
+        _upsert_claim_tx(self.db.conn, o)
+        self.db.conn.commit()
+
+    def clear_close_claim(self, position_id: str) -> None:
+        self.db.conn.execute(
+            "DELETE FROM close_claims WHERE position_id = ?", (position_id,)
+        )
+        self.db.conn.commit()
+
+    def get_close_claim(self, position_id: str) -> str | None:
+        row = self.db.conn.execute(
+            "SELECT client_order_id FROM close_claims WHERE position_id = ?",
+            (position_id,),
+        ).fetchone()
+        return row["client_order_id"] if row else None
+
     def update(self, o: Order) -> None:
         """Persist the latest broker-reported state of an order."""
         self.db.conn.execute(
@@ -121,3 +255,144 @@ class OrderStore:
             tuple(s.value for s in statuses),
         ).fetchall()
         return [_row_to_order(r) for r in rows]
+
+
+def _order_insert_params(o: Order) -> tuple:
+    return (
+        o.id, o.decision_id, o.position_id, o.client_order_id, o.broker_order_id,
+        o.option_id, o.occ_symbol, o.side, o.order_type, o.quantity, o.limit_price,
+        o.filled_qty, o.avg_fill_price, o.status.value, 1 if o.is_paper else 0,
+        o.submitted_at.isoformat() if o.submitted_at else None,
+        o.last_status_at.isoformat() if o.last_status_at else None,
+        o.bid, o.ask, o.mid, o.time_in_force,
+    )
+
+
+def _insert_order_tx(conn, o: Order) -> None:
+    if o.last_status_at is None:
+        o.last_status_at = utcnow()
+    conn.execute(
+        """INSERT INTO orders
+             (id, decision_id, position_id, client_order_id, broker_order_id, option_id,
+              occ_symbol, side, order_type, quantity, limit_price, filled_qty, avg_fill_price,
+              status, is_paper, submitted_at, last_status_at, bid, ask, mid, time_in_force)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        _order_insert_params(o),
+    )
+
+
+def _fetch_live_close(conn, position_id: str):
+    """The filled close if there is one, otherwise any in-flight buy-to-close."""
+    return conn.execute(
+        f"""SELECT * FROM orders
+            WHERE position_id = ? AND side = 'BUY_TO_CLOSE'
+              AND status IN ({_LIVE_CLOSE_SQL})
+            ORDER BY CASE status
+                       WHEN 'FILLED' THEN 0
+                       WHEN 'PARTIAL' THEN 1
+                       WHEN 'SUBMITTED' THEN 2
+                       ELSE 3
+                     END
+            LIMIT 1""",
+        (position_id, *(s.value for s in LIVE_CLOSE_STATUSES)),
+    ).fetchone()
+
+
+def _order_for_claim(conn, position_id: str) -> Order | None:
+    claim = conn.execute(
+        "SELECT client_order_id FROM close_claims WHERE position_id = ?",
+        (position_id,),
+    ).fetchone()
+    if claim is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM orders WHERE client_order_id = ?",
+        (claim["client_order_id"],),
+    ).fetchone()
+    return _row_to_order(row) if row else None
+
+
+def _upsert_claim_tx(conn, o: Order) -> None:
+    conn.execute(
+        """INSERT INTO close_claims (position_id, client_order_id, decision_id, claimed_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(position_id) DO UPDATE SET
+             client_order_id = excluded.client_order_id,
+             decision_id = excluded.decision_id,
+             claimed_at = excluded.claimed_at""",
+        (o.position_id, o.client_order_id, o.decision_id, utcnow().isoformat()),
+    )
+
+
+def _close_id_base(client_order_id: str) -> str:
+    return _RETRY_SUFFIX.sub("", client_order_id)
+
+
+def _next_close_client_id(conn, client_order_id: str) -> str:
+    """Next unused ``-rN`` suffix. The cancelled id itself is never reused."""
+    base = _close_id_base(client_order_id)
+    rows = conn.execute(
+        """SELECT client_order_id FROM orders
+           WHERE client_order_id = ? OR client_order_id LIKE ?""",
+        (base, base + "-r%"),
+    ).fetchall()
+    highest = 0
+    taken: set[str] = set()
+    prefix = base + "-r"
+    for row in rows:
+        cid = row["client_order_id"]
+        taken.add(cid)
+        if not cid.startswith(prefix):
+            continue
+        match = re.fullmatch(r"-r(\d+)", cid[len(base):])
+        if match:
+            highest = max(highest, int(match.group(1)))
+    n = highest + 1
+    while True:
+        candidate = f"{base}-r{n}"
+        if candidate not in taken:
+            return candidate
+        n += 1
+
+
+def _reserved_filled_qty(conn, position_id: str) -> int:
+    """Contracts already bought to close. A later close submits only the rest."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(filled_qty), 0) AS n FROM orders
+           WHERE position_id = ? AND side = 'BUY_TO_CLOSE'""",
+        (position_id,),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _covered_close(conn, position_id: str) -> Order | None:
+    row = conn.execute(
+        """SELECT * FROM orders
+           WHERE position_id = ? AND side = 'BUY_TO_CLOSE' AND filled_qty > 0
+           ORDER BY CASE status WHEN 'FILLED' THEN 0 ELSE 1 END, filled_qty DESC
+           LIMIT 1""",
+        (position_id,),
+    ).fetchone()
+    return _row_to_order(row) if row else None
+
+
+def _replacement_order(o: Order, client_order_id: str, quantity: int) -> Order:
+    """A new pending close. The cancelled row, including its filled_qty, stays put."""
+    return Order(
+        id=uuid.uuid4().hex,
+        decision_id=o.decision_id,
+        position_id=o.position_id,
+        occ_symbol=o.occ_symbol,
+        option_id=o.option_id,
+        quantity=quantity,
+        limit_price=o.limit_price,
+        is_paper=o.is_paper,
+        client_order_id=client_order_id,
+        side=o.side,
+        order_type=o.order_type,
+        bid=o.bid,
+        ask=o.ask,
+        mid=o.mid,
+        time_in_force=o.time_in_force,
+        status=OrderStatus.PENDING,
+    )

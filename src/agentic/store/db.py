@@ -10,8 +10,13 @@ synchronous; if they ever get heavy, wrap them in ``asyncio.to_thread``.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger("agentic.store")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
@@ -90,6 +95,16 @@ CREATE TABLE IF NOT EXISTS orders (
     time_in_force   TEXT                    -- e.g. gfd; null on rows written before this existed
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client ON orders(client_order_id);
+
+-- One owner of a position's close. Removed when that close is rejected or cancelled
+-- so a later exit can retry. Live/filled orders are also unique per position
+-- (idx_orders_one_live_close, created in migrate).
+CREATE TABLE IF NOT EXISTS close_claims (
+    position_id     TEXT PRIMARY KEY,
+    client_order_id TEXT NOT NULL,
+    decision_id     TEXT,
+    claimed_at      TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS entry_decisions (
     id              TEXT PRIMARY KEY,
@@ -323,13 +338,111 @@ CREATE TABLE IF NOT EXISTS control (
 INSERT OR IGNORE INTO control (id, paused) VALUES (1, 0);
 """
 
+_ONE_LIVE_CLOSE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_one_live_close
+   ON orders(position_id)
+   WHERE side = 'BUY_TO_CLOSE'
+     AND status IN ('PENDING', 'SUBMITTED', 'PARTIAL', 'FILLED')
+"""
+
+_LIVE_CLOSE_RANK = {"FILLED": 0, "PARTIAL": 1, "SUBMITTED": 2, "PENDING": 3}
+
+
+class _SerializedConnection:
+    """One sqlite connection shared by monitor threads.
+
+    A write opens an implicit transaction and holds the lock until commit or
+    rollback, so two threads cannot interleave ``execute`` and ``commit`` on
+    the same connection. Reads release the lock as soon as the statement
+    finishes.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+        self._lock = threading.RLock()
+        self._held = threading.local()
+
+    def _enter(self) -> None:
+        self._lock.acquire()
+        self._held.depth = getattr(self._held, "depth", 0) + 1
+
+    def _leave_all(self) -> None:
+        depth = getattr(self._held, "depth", 0)
+        self._held.depth = 0
+        for _ in range(depth):
+            self._lock.release()
+
+    def execute(self, *args, **kwargs):
+        self._enter()
+        already = self._conn.in_transaction
+        try:
+            cursor = self._conn.execute(*args, **kwargs)
+        except BaseException:
+            if not already:
+                self._leave_all()
+            raise
+        if not self._conn.in_transaction:
+            self._leave_all()
+        return cursor
+
+    def executemany(self, *args, **kwargs):
+        self._enter()
+        already = self._conn.in_transaction
+        try:
+            cursor = self._conn.executemany(*args, **kwargs)
+        except BaseException:
+            if not already:
+                self._leave_all()
+            raise
+        if not self._conn.in_transaction:
+            self._leave_all()
+        return cursor
+
+    def executescript(self, script: str):
+        self._enter()
+        try:
+            return self._conn.executescript(script)
+        finally:
+            self._leave_all()
+
+    def commit(self) -> None:
+        if getattr(self._held, "depth", 0) == 0:
+            self._enter()
+        try:
+            self._conn.commit()
+        finally:
+            self._leave_all()
+
+    def rollback(self) -> None:
+        if getattr(self._held, "depth", 0) == 0:
+            self._enter()
+        try:
+            self._conn.rollback()
+        finally:
+            self._leave_all()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _live_close_rank(row) -> tuple:
+    """Prefer a fill, then a broker-accepted order, then the earliest submit."""
+    status_rank = _LIVE_CLOSE_RANK.get(row["status"], 9)
+    has_broker = 0 if row["broker_order_id"] else 1
+    submitted = row["submitted_at"] or "9999"
+    return (status_rank, has_broker, submitted, row["id"])
+
 
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        raw = sqlite3.connect(str(self.path), check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        self.conn = _SerializedConnection(raw)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self.conn.execute("PRAGMA busy_timeout=5000;")
@@ -419,7 +532,80 @@ class Database:
                 )
         except sqlite3.OperationalError:
             pass
+        # One live or filled buy-to-close per position. REJECTED/CANCELLED stay out of
+        # the index so a failed close can be retried. A partial fill that later cancels
+        # keeps its filled_qty on that terminal row; the replacement is the one live row.
+        # Duplicate live rows (index cannot be created) are quarantined, then the index
+        # is created.
+        self._ensure_one_live_close_index()
         self.conn.commit()
+
+    def _ensure_one_live_close_index(self) -> None:
+        try:
+            self.conn.execute(_ONE_LIVE_CLOSE_INDEX)
+            return
+        except sqlite3.OperationalError as exc:
+            log.warning("one-live-close index not created: %s", exc)
+            return
+        except sqlite3.IntegrityError as exc:
+            log.warning("one-live-close index blocked by duplicate rows: %s", exc)
+        self._rollback_quietly()
+        quarantined = self._quarantine_duplicate_live_closes()
+        log.warning(
+            "quarantined %d duplicate live close(s) so the one-live-close index can be created: %s",
+            len(quarantined), quarantined,
+        )
+        try:
+            self.conn.execute(_ONE_LIVE_CLOSE_INDEX)
+        except sqlite3.Error as exc:
+            log.error("one-live-close index still not created after quarantine: %s", exc)
+
+    def _rollback_quietly(self) -> None:
+        try:
+            self.conn.rollback()
+        except sqlite3.Error:
+            pass
+
+    def _quarantine_duplicate_live_closes(self) -> list[str]:
+        """Keep one live close per position. Extra rows leave the unique index as CANCELLED.
+
+        filled_qty is left as reported so a partial fill stays reserved. The kept row is
+        the fill if there is one, otherwise the order the broker has accepted.
+        """
+        rows = self.conn.execute(
+            """SELECT id, position_id, client_order_id, decision_id, status,
+                      broker_order_id, submitted_at
+               FROM orders
+               WHERE side = 'BUY_TO_CLOSE'
+                 AND status IN ('PENDING', 'SUBMITTED', 'PARTIAL', 'FILLED')
+               ORDER BY rowid"""
+        ).fetchall()
+        groups: dict[str, list] = {}
+        for row in rows:
+            groups.setdefault(row["position_id"], []).append(row)
+        quarantined: list[str] = []
+        now = datetime.now(timezone.utc).isoformat()
+        for position_id, group in groups.items():
+            if len(group) < 2:
+                continue
+            winner = min(group, key=_live_close_rank)
+            for row in group:
+                if row["id"] == winner["id"]:
+                    continue
+                self.conn.execute(
+                    "UPDATE orders SET status = 'CANCELLED', last_status_at = ? WHERE id = ?",
+                    (now, row["id"]),
+                )
+                self.conn.execute(
+                    """UPDATE close_claims
+                       SET client_order_id = ?, decision_id = ?
+                       WHERE position_id = ? AND client_order_id = ?""",
+                    (winner["client_order_id"], winner["decision_id"],
+                     position_id, row["client_order_id"]),
+                )
+                quarantined.append(row["client_order_id"])
+        self.conn.commit()
+        return quarantined
 
     def close(self) -> None:
         self.conn.close()

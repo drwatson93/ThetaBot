@@ -8,7 +8,9 @@ Each cycle (and once at startup) it diffs the broker against the store and repai
                   left as a TODO hook (still recorded as CLOSED for now, flagged in audit).
   * Qty drift   — present both sides, quantity differs -> external partial close; update.
   * Orphans     — orders left SUBMITTED/PARTIAL -> refresh from broker and finalize; a
-                  late FILL also closes its position.
+                  late FILL also closes its position. A PENDING buy-to-close that never
+                  received a broker id and is older than the grace window is expired so
+                  it cannot block the position after a crash.
 
 Runs on its own slower cadence; safe to run while the monitor runs (single asyncio loop).
 """
@@ -24,6 +26,7 @@ from ..domain.enums import AuditEventType, DecisionStatus, OptionType, OrderStat
 from ..domain.models import utcnow
 from ..notify.base import Notifier
 from ..store.audit import AuditStore
+from ..store.decisions import DecisionStore
 from ..store.entry_decisions import EntryDecisionStore
 from ..store.orders import OrderStore
 from ..store.positions import PositionStore
@@ -33,6 +36,10 @@ from .killswitch import KillSwitch
 from .stats import assignment_realized_pnl, filled_close, position_pnl
 
 log = logging.getLogger("agentic.reconcile")
+
+# A PENDING close with no broker id is either in the middle of submit or a crash
+# leftover. Don't cancel one that was written moments ago.
+UNSUBMITTED_CLOSE_GRACE_SECONDS = 30
 
 
 class ReconcileLoop:
@@ -48,6 +55,7 @@ class ReconcileLoop:
         trade_journal: TradeJournalStore | None = None,
         entry_decisions: EntryDecisionStore | None = None,
         market_data=None,
+        decisions: DecisionStore | None = None,
     ):
         self.settings = settings
         self.broker = broker
@@ -59,6 +67,7 @@ class ReconcileLoop:
         self.trade_journal = trade_journal
         self.entry_decisions = entry_decisions
         self.market_data = market_data
+        self.decisions = decisions
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -229,11 +238,20 @@ class ReconcileLoop:
         return healed
 
     async def _finalize_orphan_orders(self) -> list[dict]:
-        """Refresh any orders stuck SUBMITTED/PARTIAL and apply their terminal state."""
+        """Refresh working orders, and drop a PENDING close the broker never saw."""
         if self.orders is None:
             return []
         finalized: list[dict] = []
-        for order in self.orders.list_by_status(OrderStatus.SUBMITTED, OrderStatus.PARTIAL):
+        for order in self.orders.list_by_status(
+            OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL,
+        ):
+            if order.status == OrderStatus.PENDING and order.side == "BUY_TO_CLOSE":
+                if not order.broker_order_id and order.filled_qty <= 0:
+                    if _unsubmitted_close_is_stale(order):
+                        finalized.append(self._expire_unsubmitted_close(order))
+                    continue
+                if not order.broker_order_id:
+                    continue
             try:
                 refreshed = await self.broker.get_order(order)
             except Exception as exc:  # noqa: BLE001
@@ -248,6 +266,26 @@ class ReconcileLoop:
             if refreshed.status == OrderStatus.FILLED:
                 self.positions.set_status(refreshed.position_id, PositionStatus.CLOSED)
         return finalized
+
+    def _expire_unsubmitted_close(self, order) -> dict:
+        """A PENDING close with no broker id will never complete. Free the position."""
+        order.status = OrderStatus.CANCELLED
+        order.last_status_at = utcnow()
+        self.orders.update(order)
+        if self.orders.get_close_claim(order.position_id) == order.client_order_id:
+            self.orders.clear_close_claim(order.position_id)
+        current = self.positions.get(order.position_id)
+        if current is not None and current.status == PositionStatus.CLOSING:
+            self.positions.set_status(order.position_id, PositionStatus.OPEN)
+        if self.decisions is not None and order.decision_id:
+            decision = self.decisions.get(order.decision_id)
+            if decision is not None and decision.status == DecisionStatus.EXECUTING:
+                self.decisions.set_status(decision.id, DecisionStatus.FAILED)
+        log.info(
+            "Expired never-submitted close %s for %s",
+            order.client_order_id, order.occ_symbol,
+        )
+        return {"client_order_id": order.client_order_id, "status": "EXPIRED_UNSUBMITTED"}
 
     async def _underlying_price(self, symbol: str) -> float | None:
         if self.market_data is None:
@@ -300,3 +338,11 @@ class ReconcileLoop:
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def _unsubmitted_close_is_stale(order) -> bool:
+    """True when a never-submitted PENDING close is old enough to be a crash leftover."""
+    if order.last_status_at is None:
+        return True
+    age = (utcnow() - order.last_status_at).total_seconds()
+    return age >= UNSUBMITTED_CLOSE_GRACE_SECONDS

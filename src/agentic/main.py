@@ -214,7 +214,7 @@ async def main_async(config_path: str | None = None) -> None:
     reconcile = ReconcileLoop(
         settings, broker, positions, audit, orders=orders, killswitch=killswitch,
         notifier=notifier, trade_journal=trade_journal, entry_decisions=entry_decisions,
-        market_data=market_data,
+        market_data=market_data, decisions=decisions,
     )
 
     tax_reserve = TaxReserveLoop(

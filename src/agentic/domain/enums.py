@@ -45,6 +45,7 @@ class DecisionStatus(str, Enum):
     EXECUTING = "EXECUTING"
     DONE = "DONE"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"      # terminal: a close already in flight or filled; do not retry
 
 
 class Autonomy(str, Enum):

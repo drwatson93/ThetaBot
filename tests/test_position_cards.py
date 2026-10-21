@@ -25,6 +25,7 @@ from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
 from agentic.web.position_cards import card_pnl_percent, holding_plan, live_profit_pct, pnl_percent
+from agentic.web.settings import rules_signature
 
 
 def _rules(
@@ -412,7 +413,9 @@ def test_hot_rules_edit_changes_the_plan_without_restart(tmp_path, monkeypatch):
     for rule in rules:
         if rule["name"] == "profit-target":
             rule["params"]["profit_pct"] = 0.8
-    saved = client.post("/api/config", json={"rules": rules})
+    saved = client.post("/api/config", json={
+        "rules": rules, "rules_base": rules_signature(live.rules),
+    })
     assert saved.status_code == 200, saved.text
     assert saved.json()["ok"] is True
 
