@@ -6,10 +6,14 @@ Safety pipeline (every order goes through all of it):
                                ``settings.is_live`` (mode=live AND i_understand_live_trading).
   3. Fresh-quote stale guard — reject missing / invalid / stale quotes (no blind orders).
   4. Limit-price calc        — mid + buffer, capped at ask*(1+slippage_cap), tick-rounded.
-  5. Persist-before-submit   — write the Order PENDING keyed by a deterministic
+  5. One close per position  — atomic claim (in-process lock + persisted claim /
+                               unique live-close index). A second rule or task skips while
+                               a close is pending, submitted, partial, or filled. A rejected
+                               or cancelled close clears the claim so a retry can run.
+  6. Persist-before-submit   — write the Order PENDING keyed by a deterministic
                                client_order_id; reuse it on retry (idempotency).
-  6. Submit + await fill     — poll to fill_timeout; bounded re-price on no-fill/partial.
-  7. Settle                  — on FILLED mark Position CLOSED + Decision DONE; audit + notify.
+  7. Submit + await fill     — poll to fill_timeout; bounded re-price on no-fill/partial.
+  8. Settle                  — on FILLED mark Position CLOSED + Decision DONE; audit + notify.
 
 The limit math is a free function so it can be unit-tested without a broker.
 """
@@ -40,6 +44,7 @@ from ..store.entry_decisions import EntryDecisionStore
 from ..store.orders import OrderStore
 from ..store.positions import PositionStore
 from ..store.trade_journal import TradeJournalStore
+from .close_guard import CloseGuard
 from .killswitch import KillSwitch
 from .market_hours import is_order_window
 from .stats import position_pnl
@@ -139,6 +144,7 @@ class OrderExecutor:
         self.trade_journal = trade_journal
         self.trade_alerts = trade_alerts
         self.poll_interval = poll_interval_seconds
+        self.close_guard = CloseGuard(orders)
 
     async def execute_close(
         self, position: Position, decision: CloseDecision, quote: OptionQuote | None = None
@@ -183,7 +189,9 @@ class OrderExecutor:
             )
             return None
 
-        # 5. Persist-before-submit (idempotent on a deterministic client_order_id).
+        # 5–6. One-close claim, then persist-before-submit. The claim is the
+        # check-and-set: in-process lock plus the persisted close row. It is held
+        # only around the synchronous DB section, never across await.
         order = Order(
             decision_id=decision.id,
             position_id=position.id,
@@ -202,83 +210,109 @@ class OrderExecutor:
             )
             self.decisions.set_status(decision.id, DecisionStatus.FAILED)
             return None
-        self.decisions.set_order_snapshot(decision.id, **pricing_kwargs(order))
-        if not self.orders.insert_if_new(order):
-            existing = self.orders.get_by_client_order_id(order.client_order_id)
-            if existing is not None:
-                if existing.status == OrderStatus.FILLED:
-                    return existing  # already done; never double-submit
-                order = existing     # resume an in-flight order
 
-        self.decisions.set_status(decision.id, DecisionStatus.EXECUTING)
-        self.positions.set_status(position.id, PositionStatus.CLOSING)
-        self.audit.record(
-            AuditEventType.ORDER_SUBMIT,
-            {"occ": order.occ_symbol, "qty": order.quantity, "limit": order.limit_price,
-             "limit_price": order.limit_price, "order_type": pricing_kwargs(order)["order_type"],
-             "bid": order.bid, "ask": order.ask, "mid": order.mid,
-             "time_in_force": order.time_in_force,
-             "is_paper": order.is_paper, "client_order_id": order.client_order_id},
-            source="executor", position_id=position.id,
-            decision_id=decision.id, order_id=order.id,
-        )
-
-        # 6. Submit + await fill.
+        acquired = False
+        outcome: Order | None = None
+        skip_reason: str | None = None
         try:
-            order.submitted_at = order.submitted_at or utcnow()
-            submitted = await self.broker.submit_close_order(order)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("submit_close_order failed: %s", exc)
-            order.status = OrderStatus.REJECTED
-            order.last_status_at = utcnow()
-            self.orders.update(order)
-            self.decisions.set_status(decision.id, DecisionStatus.FAILED)
-            self.audit.record(
-                AuditEventType.ERROR, {"where": "executor.submit", **describe_exception(exc)},
-                source="executor", position_id=position.id,
-                decision_id=decision.id, order_id=order.id,
-            )
-            await self._notify("Close FAILED", f"{position.occ_symbol}: submit error: {exc}",
-                               priority="high")
-            return order
+            with self.close_guard.claim(order) as (result, owned):
+                if (
+                    result == "filled"
+                    and owned is not None
+                    and owned.decision_id == decision.id
+                ):
+                    return owned  # already done; never double-submit
+                if result in ("blocked", "filled"):
+                    status = owned.status.value if owned is not None else "started"
+                    other = owned.client_order_id if owned is not None else "another close"
+                    skip_reason = (
+                        f"rule {decision.rule_name} skipped; close already {status} ({other})"
+                    )
+                else:
+                    order = owned or order
+                    acquired = True
+                    outcome = order
+                    self.decisions.set_order_snapshot(decision.id, **pricing_kwargs(order))
+                    self.decisions.set_status(decision.id, DecisionStatus.EXECUTING)
+                    self.positions.set_status(position.id, PositionStatus.CLOSING)
+                    self.audit.record(
+                        AuditEventType.ORDER_SUBMIT,
+                        {"occ": order.occ_symbol, "qty": order.quantity,
+                         "limit": order.limit_price, "limit_price": order.limit_price,
+                         "order_type": pricing_kwargs(order)["order_type"],
+                         "bid": order.bid, "ask": order.ask, "mid": order.mid,
+                         "time_in_force": order.time_in_force,
+                         "is_paper": order.is_paper, "client_order_id": order.client_order_id},
+                        source="executor", position_id=position.id,
+                        decision_id=decision.id, order_id=order.id,
+                    )
+            if skip_reason is not None:
+                await self._block(position, decision, skip_reason, status=DecisionStatus.FAILED)
+                return None
 
-        submitted.last_status_at = utcnow()
-        self.orders.update(submitted)
-        final = await self._await_fill(submitted, position)
+            # 7. Submit + await fill.
+            try:
+                order.submitted_at = order.submitted_at or utcnow()
+                submitted = await self.broker.submit_close_order(order)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("submit_close_order failed: %s", exc)
+                order.status = OrderStatus.REJECTED
+                order.last_status_at = utcnow()
+                self.orders.update(order)
+                outcome = order
+                self.decisions.set_status(decision.id, DecisionStatus.FAILED)
+                self.audit.record(
+                    AuditEventType.ERROR, {"where": "executor.submit", **describe_exception(exc)},
+                    source="executor", position_id=position.id,
+                    decision_id=decision.id, order_id=order.id,
+                )
+                await self._notify("Close FAILED", f"{position.occ_symbol}: submit error: {exc}",
+                                   priority="high")
+                return order
 
-        # 7. Settle.
-        if final.status == OrderStatus.FILLED:
-            self.positions.set_status(position.id, PositionStatus.CLOSED)
-            self.decisions.set_status(decision.id, DecisionStatus.DONE)
-            self.audit.record(
-                AuditEventType.ORDER_FILL,
-                {"occ": final.occ_symbol, "filled_qty": final.filled_qty,
-                 "avg_fill_price": final.avg_fill_price, "is_paper": final.is_paper},
-                source="executor", position_id=position.id,
-                decision_id=decision.id, order_id=final.id,
-            )
-            self._journal_outcome(position, final, decision.rule_name)
-            self._alert_close(position, final)
-            tag = "(paper)" if final.is_paper else "(LIVE)"
-            await self._notify(
-                f"Closed {position.underlying} {tag}",
-                f"{decision.rule_name}: bought to close {final.filled_qty}x "
-                f"{position.occ_symbol} @ {final.avg_fill_price}",
-                priority="high",
-            )
-        else:
-            cancelled = await self._cancel_working(final)
-            if cancelled is not None:
-                final = cancelled
-            self.decisions.set_status(decision.id, DecisionStatus.FAILED)
-            await self._notify(
-                "Close did not fill",
-                f"{position.occ_symbol}: order {final.status.value} after "
-                f"{ex.fill_timeout_seconds}s (broker_id={final.broker_order_id}); "
-                f"working close cancelled.",
-                priority="high",
-            )
-        return final
+            submitted.last_status_at = utcnow()
+            self.orders.update(submitted)
+            outcome = submitted
+            final = await self._await_fill(submitted, position)
+            outcome = final
+
+            # 8. Settle.
+            if final.status == OrderStatus.FILLED:
+                self.positions.set_status(position.id, PositionStatus.CLOSED)
+                self.decisions.set_status(decision.id, DecisionStatus.DONE)
+                self.audit.record(
+                    AuditEventType.ORDER_FILL,
+                    {"occ": final.occ_symbol, "filled_qty": final.filled_qty,
+                     "avg_fill_price": final.avg_fill_price, "is_paper": final.is_paper},
+                    source="executor", position_id=position.id,
+                    decision_id=decision.id, order_id=final.id,
+                )
+                self._journal_outcome(position, final, decision.rule_name)
+                self._alert_close(position, final)
+                tag = "(paper)" if final.is_paper else "(LIVE)"
+                await self._notify(
+                    f"Closed {position.underlying} {tag}",
+                    f"{decision.rule_name}: bought to close {final.filled_qty}x "
+                    f"{position.occ_symbol} @ {final.avg_fill_price}",
+                    priority="high",
+                )
+            else:
+                cancelled = await self._cancel_working(final)
+                if cancelled is not None:
+                    final = cancelled
+                    outcome = final
+                self.decisions.set_status(decision.id, DecisionStatus.FAILED)
+                await self._notify(
+                    "Close did not fill",
+                    f"{position.occ_symbol}: order {final.status.value} after "
+                    f"{ex.fill_timeout_seconds}s (broker_id={final.broker_order_id}); "
+                    f"working close cancelled.",
+                    priority="high",
+                )
+            return final
+        finally:
+            if acquired:
+                self.close_guard.release(position.id, outcome, self.positions)
 
     # ------------------------------------------------------------------ open (entry)
     async def execute_open(
@@ -574,7 +608,26 @@ class OrderExecutor:
                 exc, new_order, decision_id=order.decision_id, position_id=position.id
             )
             return order
-        self.orders.insert_if_new(new_order)
+        if not self.orders.insert_if_new(new_order):
+            existing = self.orders.get_by_client_order_id(new_order.client_order_id)
+            if existing is None:
+                # Unique live-close index: another buy-to-close is already pending,
+                # submitted, partial, or filled. Do not send a second order.
+                log.info(
+                    "Close suppressed for %s: reprice skipped; another close is already "
+                    "in flight or filled",
+                    new_order.occ_symbol,
+                )
+                self.audit.record(
+                    AuditEventType.DECISION,
+                    {"suppressed": True, "reprice": True, "occ": new_order.occ_symbol,
+                     "reason": "another close is already in flight or filled"},
+                    source="executor", position_id=position.id, decision_id=order.decision_id,
+                )
+                return order
+            new_order = existing
+        else:
+            self.close_guard.note_order(new_order)
         self.audit.record(
             AuditEventType.ORDER_SUBMIT,
             {"reprice": True, "from": order.limit_price, "to": new_limit, "qty": remaining,

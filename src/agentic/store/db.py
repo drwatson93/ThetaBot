@@ -10,8 +10,11 @@ synchronous; if they ever get heavy, wrap them in ``asyncio.to_thread``.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
+
+log = logging.getLogger("agentic.store")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
@@ -90,6 +93,16 @@ CREATE TABLE IF NOT EXISTS orders (
     time_in_force   TEXT                    -- e.g. gfd; null on rows written before this existed
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client ON orders(client_order_id);
+
+-- One owner of a position's close. Removed when that close is rejected or cancelled
+-- so a later exit can retry. Live/filled orders are also unique per position
+-- (idx_orders_one_live_close, created in migrate).
+CREATE TABLE IF NOT EXISTS close_claims (
+    position_id     TEXT PRIMARY KEY,
+    client_order_id TEXT NOT NULL,
+    decision_id     TEXT,
+    claimed_at      TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS entry_decisions (
     id              TEXT PRIMARY KEY,
@@ -419,6 +432,21 @@ class Database:
                 )
         except sqlite3.OperationalError:
             pass
+        # One live or filled buy-to-close per position. REJECTED/CANCELLED stay out of
+        # the index so a failed close can be retried. IntegrityError means this database
+        # already has duplicates; leave the index off and still refuse new doubles in
+        # OrderStore.begin_live_close.
+        try:
+            self.conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_one_live_close
+                   ON orders(position_id)
+                   WHERE side = 'BUY_TO_CLOSE'
+                     AND status IN ('PENDING', 'SUBMITTED', 'PARTIAL', 'FILLED')"""
+            )
+        except sqlite3.IntegrityError as exc:
+            log.warning("one-live-close index not created: %s", exc)
+        except sqlite3.OperationalError as exc:
+            log.warning("one-live-close index not created: %s", exc)
         self.conn.commit()
 
     def close(self) -> None:

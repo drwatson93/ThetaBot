@@ -102,6 +102,12 @@ class DecisionStore:
         )
         self.db.conn.commit()
 
+    def get_by_dedup(self, dedup_key: str) -> CloseDecision | None:
+        r = self.db.conn.execute(
+            "SELECT * FROM decisions WHERE dedup_key = ?", (dedup_key,)
+        ).fetchone()
+        return _row_to_decision(r) if r else None
+
     def get(self, decision_id: str) -> CloseDecision | None:
         r = self.db.conn.execute(
             "SELECT * FROM decisions WHERE id = ?", (decision_id,)

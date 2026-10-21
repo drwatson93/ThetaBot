@@ -11,7 +11,7 @@ import asyncio
 import logging
 
 from ..config import Settings
-from ..domain.enums import AuditEventType
+from ..domain.enums import AuditEventType, DecisionStatus
 from ..marketdata.base import MarketDataProvider
 from ..brokers.base import ExecutionBroker
 from ..notify.base import Notifier
@@ -143,32 +143,93 @@ class MonitorLoop:
         return len(broker_positions)
 
     async def _evaluate(self, pos, quote) -> None:
-        """Evaluate rules for one position. New decisions are persisted (dedup'd),
-        audited, and notified. Phase 1 NEVER executes — even auto rules only notify;
-        Phase 2 plugs the executor in here for requires_approval=false decisions.
+        """Evaluate rules for one position.
+
+        New decisions are persisted (dedup'd), audited, and notified. Auto rules
+        (``requires_approval`` false, not notify-only) go to the executor. When
+        several close rules fire in one tick, the first in config order is the one
+        that may close; the rest are logged as suppressed. A notify-only decision
+        (a DTE alert) never closes. A close that already failed today is retried
+        once the guard is clear — the executor drops the claim on reject/cancel.
         """
-        decisions = self.rules_engine.evaluate(pos, quote)
+        decisions = self._one_close_per_tick(pos, self.rules_engine.evaluate(pos, quote))
         for decision in decisions:
-            if not self.decisions.insert_if_new(decision):
-                continue  # already decided this position+rule today
-            self.audit.record(
-                AuditEventType.DECISION,
-                {"rule": decision.rule_name, "reason": decision.reason,
-                 "requires_approval": decision.requires_approval,
-                 "occ": pos.occ_symbol},
-                source="monitor",
-                position_id=pos.id,
-                decision_id=decision.id,
-            )
-            # Hybrid autonomy: auto rules (requires_approval=false) go straight to the executor,
-            # which owns its own audit + notify; approval-gated decisions are notified here and
-            # picked up by the Phase 3 approval gate. A notify_only decision (e.g. a DTE alert)
-            # NEVER executes regardless of requires_approval — it must not buy back a tested put at
-            # a loss; the roll manager or assignment handles a position moving against us.
+            action = self._admit_decision(decision)
+            if action == "skip":
+                continue
+            if action == "new":
+                self.audit.record(
+                    AuditEventType.DECISION,
+                    {"rule": decision.rule_name, "reason": decision.reason,
+                     "requires_approval": decision.requires_approval,
+                     "occ": pos.occ_symbol},
+                    source="monitor",
+                    position_id=pos.id,
+                    decision_id=decision.id,
+                )
+            else:
+                self.audit.record(
+                    AuditEventType.DECISION,
+                    {"retry": True, "rule": decision.rule_name, "occ": pos.occ_symbol,
+                     "reason": "prior close was rejected or cancelled"},
+                    source="monitor",
+                    position_id=pos.id,
+                    decision_id=decision.id,
+                )
+            # Hybrid autonomy: auto rules go straight to the executor, which owns its
+            # own audit + notify; approval-gated decisions are notified here. A
+            # notify_only decision NEVER executes — it must not buy back a tested put
+            # at a loss; the roll manager or assignment handles a position moving against us.
             if self.executor is not None and not decision.requires_approval and not decision.notify_only:
                 await self.executor.execute_close(pos, decision, quote)
             else:
                 await self._notify_decision(pos, decision)
+
+    def _one_close_per_tick(self, pos, decisions):
+        """Pick one executable close per position per tick.
+
+        Order is the rules-engine order, which is config order: stable and chosen
+        by the operator. Notify-only alerts are not closes and are left in place.
+        With no executor wired, every decision is still recorded (nothing submits).
+        """
+        if self.executor is None:
+            return decisions
+        closes = [d for d in decisions if not d.notify_only]
+        if len(closes) <= 1:
+            return decisions
+        chosen = closes[0]
+        for skipped in closes[1:]:
+            log.info(
+                "Close suppressed for %s: rule %s skipped; %s already selected this tick",
+                pos.occ_symbol, skipped.rule_name, chosen.rule_name,
+            )
+            self.audit.record(
+                AuditEventType.DECISION,
+                {"suppressed": True, "rule": skipped.rule_name, "kept": chosen.rule_name,
+                 "occ": pos.occ_symbol,
+                 "reason": "another exit rule already selected this tick"},
+                source="monitor", position_id=pos.id,
+            )
+        chosen_key = id(chosen)
+        return [d for d in decisions if d.notify_only or id(d) == chosen_key]
+
+    def _admit_decision(self, decision) -> str:
+        """``new`` if this is the first time today, ``retry`` if the prior close failed,
+        ``skip`` if it was already handled."""
+        if self.decisions.insert_if_new(decision):
+            return "new"
+        if self.executor is None or decision.notify_only or decision.requires_approval:
+            return "skip"
+        existing = self.decisions.get_by_dedup(decision.dedup_key)
+        if existing is None or existing.status != DecisionStatus.FAILED:
+            return "skip"
+        # Reuse the original id so the close client_order_id stays stable.
+        decision.id = existing.id
+        log.info(
+            "Retrying close for %s rule %s after a rejected or cancelled close",
+            decision.position_id, decision.rule_name,
+        )
+        return "retry"
 
     async def _notify_decision(self, pos, decision) -> None:
         if self.notifier is None:
