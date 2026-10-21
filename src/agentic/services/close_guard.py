@@ -11,6 +11,8 @@ Two layers stop that:
 * A ``close_claims`` row plus the partial unique index on live buy-to-close orders
   (pending, submitted, partial, filled) still blocks a second close after a restart.
   A rejected or cancelled close deletes the claim so the position can be retried.
+  Contracts already filled on that cancelled row stay reserved; the retry submits
+  only the remainder, under a new client order id.
 """
 from __future__ import annotations
 
@@ -74,6 +76,7 @@ class CloseGuard:
         A pending, submitted, partial, or filled order keeps the persisted claim.
         Anything else (rejected, cancelled, or no order) clears it and, if the
         position was left ``CLOSING``, puts it back to ``OPEN`` so a retry can run.
+        Clearing the claim does not zero ``filled_qty`` on a partial cancel.
         """
         with self._lock_for(position_id):
             self._set_busy(position_id, False)

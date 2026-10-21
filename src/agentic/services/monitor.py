@@ -12,6 +12,7 @@ import logging
 
 from ..config import Settings
 from ..domain.enums import AuditEventType, DecisionStatus
+from ..domain.models import utcnow
 from ..marketdata.base import MarketDataProvider
 from ..brokers.base import ExecutionBroker
 from ..notify.base import Notifier
@@ -147,10 +148,10 @@ class MonitorLoop:
 
         New decisions are persisted (dedup'd), audited, and notified. Auto rules
         (``requires_approval`` false, not notify-only) go to the executor. When
-        several close rules fire in one tick, the first in config order is the one
-        that may close; the rest are logged as suppressed. A notify-only decision
-        (a DTE alert) never closes. A close that already failed today is retried
-        once the guard is clear — the executor drops the claim on reject/cancel.
+        several of those fire in one tick, the first in config order is the one
+        that may close. Approval-gated and notify-only decisions are not closes:
+        they are still notified, and they do not suppress an auto rule. A close
+        that already failed today is retried once the guard is clear.
         """
         decisions = self._one_close_per_tick(pos, self.rules_engine.evaluate(pos, quote))
         for decision in decisions:
@@ -185,33 +186,64 @@ class MonitorLoop:
             else:
                 await self._notify_decision(pos, decision)
 
+    def _executes_close(self, decision) -> bool:
+        """A rule that will actually send a buy-to-close this tick.
+
+        Approval-gated rules wait for a person. Notify-only alerts never send.
+        Neither one should take the single close slot from an auto rule.
+        """
+        return not decision.notify_only and not decision.requires_approval
+
     def _one_close_per_tick(self, pos, decisions):
         """Pick one executable close per position per tick.
 
-        Order is the rules-engine order, which is config order: stable and chosen
-        by the operator. Notify-only alerts are not closes and are left in place.
-        With no executor wired, every decision is still recorded (nothing submits).
+        Winner is the first decision in the list that will actually execute.
+        That list is the rules-engine order, which is config order. Approval
+        and alert decisions stay in the list so they still notify. With no
+        executor wired, every decision is still recorded (nothing submits).
         """
         if self.executor is None:
             return decisions
-        closes = [d for d in decisions if not d.notify_only]
-        if len(closes) <= 1:
+        executable = [(i, d) for i, d in enumerate(decisions) if self._executes_close(d)]
+        if len(executable) <= 1:
             return decisions
-        chosen = closes[0]
-        for skipped in closes[1:]:
-            log.info(
-                "Close suppressed for %s: rule %s skipped; %s already selected this tick",
-                pos.occ_symbol, skipped.rule_name, chosen.rule_name,
-            )
-            self.audit.record(
-                AuditEventType.DECISION,
-                {"suppressed": True, "rule": skipped.rule_name, "kept": chosen.rule_name,
-                 "occ": pos.occ_symbol,
-                 "reason": "another exit rule already selected this tick"},
-                source="monitor", position_id=pos.id,
-            )
-        chosen_key = id(chosen)
-        return [d for d in decisions if d.notify_only or id(d) == chosen_key]
+        chosen_at, chosen = executable[0]
+        for _index, skipped in executable[1:]:
+            self._audit_suppressed(pos, skipped, chosen)
+        return [
+            d for i, d in enumerate(decisions)
+            if i == chosen_at or not self._executes_close(d)
+        ]
+
+    def _audit_suppressed(self, pos, skipped, chosen) -> None:
+        """Log a suppressed auto-close once per position, rule, and UTC day."""
+        if self._suppressed_already(pos.id, skipped.rule_name):
+            return
+        log.info(
+            "Close suppressed for %s: rule %s skipped; %s already selected this tick",
+            pos.occ_symbol, skipped.rule_name, chosen.rule_name,
+        )
+        self.audit.record(
+            AuditEventType.DECISION,
+            {"suppressed": True, "rule": skipped.rule_name, "kept": chosen.rule_name,
+             "occ": pos.occ_symbol,
+             "reason": "another exit rule already selected this tick"},
+            source="monitor", position_id=pos.id,
+        )
+
+    def _suppressed_already(self, position_id: str, rule_name: str) -> bool:
+        day = utcnow().date().isoformat()
+        row = self.audit.db.conn.execute(
+            """SELECT 1 FROM audit
+               WHERE source = 'monitor' AND position_id = ?
+                 AND event_type = ?
+                 AND substr(ts, 1, 10) = ?
+                 AND json_extract(payload, '$.suppressed') = 1
+                 AND json_extract(payload, '$.rule') = ?
+               LIMIT 1""",
+            (position_id, AuditEventType.DECISION.value, day, rule_name),
+        ).fetchone()
+        return row is not None
 
     def _admit_decision(self, decision) -> str:
         """``new`` if this is the first time today, ``retry`` if the prior close failed,
@@ -223,7 +255,8 @@ class MonitorLoop:
         existing = self.decisions.get_by_dedup(decision.dedup_key)
         if existing is None or existing.status != DecisionStatus.FAILED:
             return "skip"
-        # Reuse the original id so the close client_order_id stays stable.
+        # Same decision row. The executor mints a new client_order_id when the
+        # last close was cancelled or rejected; a never-submitted pending id is reused.
         decision.id = existing.id
         log.info(
             "Retrying close for %s rule %s after a rejected or cancelled close",

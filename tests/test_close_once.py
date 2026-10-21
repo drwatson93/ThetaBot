@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +21,7 @@ from agentic.brokers.robinhood_mcp import (
 )
 from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import (
+    DecisionStatus,
     Direction,
     OptionType,
     OrderStatus,
@@ -28,7 +29,7 @@ from agentic.domain.enums import (
     RuleType,
     Strategy,
 )
-from agentic.domain.models import CloseDecision, Order, Position
+from agentic.domain.models import CloseDecision, Order, Position, utcnow
 from agentic.marketdata.base import PaperMarketData
 from agentic.marketdata.quote import OptionQuote
 from agentic.rules.engine import RulesEngine
@@ -36,6 +37,7 @@ from agentic.services.close_guard import CloseGuard
 from agentic.services.executor import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.services.monitor import MonitorLoop
+from agentic.services.reconcile import ReconcileLoop
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
@@ -309,6 +311,7 @@ async def test_concurrent_gather_submits_one_close(tmp_path):
 
 
 def test_concurrent_threads_submit_one_close(tmp_path):
+    """Both threads enter orders.update at once. The connection lock keeps that safe."""
     wiring = _wiring(tmp_path)
     _db, _audit, positions, decisions, orders, _ks = wiring
     pos = _position()
@@ -318,16 +321,45 @@ def test_concurrent_threads_submit_one_close(tmp_path):
     d_dte = _decision(pos, "dte-close", RuleType.DTE)
     decisions.insert_if_new(d_profit)
     decisions.insert_if_new(d_dte)
+    side = Order(
+        decision_id="d-side", position_id=pos.id, occ_symbol=OCC, quantity=1,
+        limit_price=2.0, is_paper=True, client_order_id="side-ticket",
+        side="SELL_TO_OPEN", status=OrderStatus.FILLED, filled_qty=1,
+    )
+    assert orders.insert_if_new(side)
     broker = _GateBroker()
     ex = _executor(wiring, broker)
     quote = _quote()
     errors: list[BaseException] = []
     finished = threading.Semaphore(0)
+    barrier = threading.Barrier(2)
+    inside_update = threading.Event()
+    overlapped = threading.Event()
+    seen = threading.local()
+    real_update = orders.update
+
+    def _update(order):
+        if not getattr(seen, "hit", False):
+            seen.hit = True
+            inside_update.set()
+            barrier.wait(3)
+            overlapped.set()
+        return real_update(order)
+
+    orders.update = _update
 
     def _run(decision):
         try:
             asyncio.run(ex.execute_close(pos, decision, quote))
         except BaseException as exc:  # noqa: BLE001 — surface thread failures in the assert
+            errors.append(exc)
+        finally:
+            finished.release()
+
+    def _race_update():
+        try:
+            orders.update(orders.get_by_client_order_id("side-ticket"))
+        except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
         finally:
             finished.release()
@@ -339,15 +371,20 @@ def test_concurrent_threads_submit_one_close(tmp_path):
     for thread in threads:
         thread.start()
     assert broker.started.wait(3)
-    # The winner is blocked inside submit. The first finish is the loser, whose
-    # writes are done before the winner touches the database again.
-    assert finished.acquire(timeout=3)
+    racer = threading.Thread(target=_race_update)
+    racer.start()
+    # The racer is blocked inside orders.update. Releasing the winner makes its
+    # orders.update run at the same time, instead of after the loser has finished.
+    assert inside_update.wait(3)
     broker.hold.set()
     assert finished.acquire(timeout=3)
-    for thread in threads:
+    assert finished.acquire(timeout=3)
+    assert finished.acquire(timeout=3)
+    for thread in (*threads, racer):
         thread.join(3)
 
     assert errors == []
+    assert overlapped.is_set()
     assert not any(thread.is_alive() for thread in threads)
     assert len(broker.submits) == 1
     assert len(_live_closes(orders, pos.id)) == 1
@@ -376,7 +413,8 @@ async def test_rejected_close_can_be_retried(tmp_path):
 
     stored = positions.get_by_occ(OCC)
     assert len(broker.submits) == 2
-    assert broker.submits[0] == broker.submits[1]
+    assert broker.submits[0] != broker.submits[1]
+    assert broker.submits[1].endswith("-r1")
     assert stored.status == PositionStatus.CLOSED
     live = _live_closes(orders, stored.id)
     assert len(live) == 1 and live[0].status == OrderStatus.FILLED
@@ -468,6 +506,503 @@ def test_unique_index_rejects_a_second_live_close(tmp_path):
     assert orders.get_by_client_order_id("close-2") is None
     assert orders.insert_if_new(opened) is True
     assert orders.insert_if_new(failed) is True
+
+
+class _Recorder:
+    def __init__(self):
+        self.messages: list[tuple[str, str]] = []
+
+    async def send(self, title, message, *, priority="normal", actions=None):
+        self.messages.append((title, message))
+
+
+class _PartialCancelBroker:
+    """First close cancels after one contract fills. The next close fills whatever is left."""
+
+    def __init__(self):
+        self.submits: list[tuple[str, int]] = []
+
+    def capabilities(self):
+        return BrokerCapabilities("paper-partial", supports_options_orders=True, is_paper=True)
+
+    async def connect(self):
+        return None
+
+    async def get_open_positions(self):
+        return []
+
+    async def get_order(self, order):
+        return order
+
+    async def cancel_order(self, order):
+        order.status = OrderStatus.CANCELLED
+
+    async def submit_close_order(self, order):
+        self.submits.append((order.client_order_id, order.quantity))
+        if len(self.submits) == 1:
+            order.status = OrderStatus.CANCELLED
+            order.filled_qty = 1
+            order.broker_order_id = "sim-partial"
+            return order
+        order.status = OrderStatus.FILLED
+        order.filled_qty = order.quantity
+        order.avg_fill_price = order.limit_price
+        order.broker_order_id = "sim-rest"
+        return order
+
+
+class _FillDuringCancelBroker:
+    def __init__(self):
+        self.submits: list[str] = []
+        self.cancels = 0
+
+    def capabilities(self):
+        return BrokerCapabilities("paper-fill-cancel", supports_options_orders=True, is_paper=True)
+
+    async def connect(self):
+        return None
+
+    async def get_open_positions(self):
+        return []
+
+    async def get_order(self, order):
+        return order
+
+    async def cancel_order(self, order):
+        self.cancels += 1
+        order.status = OrderStatus.FILLED
+        order.filled_qty = order.quantity
+        order.avg_fill_price = order.limit_price
+
+    async def submit_close_order(self, order):
+        self.submits.append(order.client_order_id)
+        order.status = OrderStatus.SUBMITTED
+        order.broker_order_id = "sim-working"
+        return order
+
+
+class _PollBroker:
+    """get_order fills. submit_close_order records a call and must not be used."""
+
+    def __init__(self):
+        self.submits: list[str] = []
+        self.polls = 0
+
+    def capabilities(self):
+        return BrokerCapabilities("paper-poll", supports_options_orders=True, is_paper=True)
+
+    async def connect(self):
+        return None
+
+    async def get_open_positions(self):
+        return []
+
+    async def get_order(self, order):
+        self.polls += 1
+        order.status = OrderStatus.FILLED
+        order.filled_qty = order.quantity
+        order.avg_fill_price = order.limit_price
+        return order
+
+    async def cancel_order(self, order):
+        return None
+
+    async def submit_close_order(self, order):
+        self.submits.append(order.client_order_id)
+        order.status = OrderStatus.FILLED
+        order.filled_qty = order.quantity
+        order.avg_fill_price = order.limit_price
+        order.broker_order_id = "sim-should-not-submit"
+        return order
+
+
+def _loss_position() -> Position:
+    pos = _position()
+    pos.quantity = 1
+    pos.credit_received = 2.00
+    pos.current_bid = 4.00
+    pos.current_ask = 4.20
+    pos.current_mark = 4.10
+    pos.delta = -0.60
+    return pos
+
+
+# ----------------------------------------------------------------- review fixes
+@pytest.mark.asyncio
+async def test_paper_retry_after_cancel_uses_a_fresh_client_id(tmp_path):
+    """PaperBroker is idempotent on client_order_id, so a retry must not reuse a cancelled id."""
+    wiring = _wiring(tmp_path)
+    _db, _audit, positions, decisions, orders, _ks = wiring
+    pos = _position()
+    positions.upsert(pos)
+    pos = positions.get(pos.id)
+    decision = _decision(pos, "profit-target", RuleType.PROFIT_TARGET)
+    decisions.insert_if_new(decision)
+    cancelled_id = f"close-{decision.id}"
+    cancelled = Order(
+        decision_id=decision.id, position_id=pos.id, occ_symbol=OCC, quantity=1,
+        limit_price=0.45, is_paper=True, client_order_id=cancelled_id,
+        side="BUY_TO_CLOSE", status=OrderStatus.CANCELLED, broker_order_id="paper-old",
+    )
+    assert orders.insert_if_new(cancelled)
+    broker = PaperBroker()
+    broker._orders[cancelled_id] = cancelled
+    ex = _executor(wiring, broker)
+
+    result = await ex.execute_close(pos, decision, _quote())
+
+    assert result is not None
+    assert result.status == OrderStatus.FILLED
+    assert result.client_order_id != cancelled_id
+    assert result.client_order_id.endswith("-r1")
+    assert broker._orders[cancelled_id].status == OrderStatus.CANCELLED
+    stored_old = orders.get_by_client_order_id(cancelled_id)
+    assert stored_old is not None and stored_old.status == OrderStatus.CANCELLED
+    assert len(_live_closes(orders, pos.id)) == 1
+    assert _live_closes(orders, pos.id)[0].client_order_id == result.client_order_id
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_then_cancel_keeps_the_fill_and_closes_the_rest(tmp_path):
+    wiring = _wiring(tmp_path)
+    _db, _audit, positions, decisions, orders, _ks = wiring
+    pos = _position()
+    pos.quantity = 2
+    positions.upsert(pos)
+    pos = positions.get(pos.id)
+    decision = _decision(pos, "profit-target", RuleType.PROFIT_TARGET)
+    decisions.insert_if_new(decision)
+    broker = _PartialCancelBroker()
+    settings = Settings(
+        mode="paper", broker="paper", market_data="paper",
+        execution={"fill_timeout_seconds": 0, "reprice_after_seconds": 3600},
+    )
+    ex = _executor(wiring, broker, settings)
+
+    first = await ex.execute_close(pos, decision, _quote())
+    assert first is not None and first.status == OrderStatus.CANCELLED
+    assert first.filled_qty == 1
+    assert orders.get_close_claim(pos.id) is None
+    assert positions.get(pos.id).status == PositionStatus.OPEN
+    # The filled contract stays reserved, so a second live close is still just one row
+    # once the remainder is working. Nothing is live between the cancel and the retry.
+    assert _live_closes(orders, pos.id) == []
+
+    second = await ex.execute_close(pos, decision, _quote())
+    assert second is not None and second.status == OrderStatus.FILLED
+    assert broker.submits[0][1] == 2
+    assert broker.submits[1][1] == 1
+    assert broker.submits[0][0] != broker.submits[1][0]
+    original = orders.get_by_client_order_id(broker.submits[0][0])
+    assert original is not None and original.filled_qty == 1
+    assert original.status == OrderStatus.CANCELLED
+    live = _live_closes(orders, pos.id)
+    assert len(live) == 1 and live[0].quantity == 1 and live[0].status == OrderStatus.FILLED
+    extra = Order(
+        decision_id="d-extra", position_id=pos.id, occ_symbol=OCC, quantity=1,
+        limit_price=0.45, is_paper=True, client_order_id="close-extra",
+        side="BUY_TO_CLOSE", status=OrderStatus.PENDING,
+    )
+    assert orders.insert_if_new(extra) is False
+
+
+@pytest.mark.asyncio
+async def test_unsubmitted_pending_resumes_in_a_new_process(tmp_path):
+    """A new process has an empty in-memory guard. A PENDING row with no broker id is submitted."""
+    wiring = _wiring(tmp_path)
+    _db, _audit, positions, decisions, orders, _ks = wiring
+    pos = _position()
+    positions.upsert(pos)
+    pos = positions.get(pos.id)
+    decision = _decision(pos, "profit-target", RuleType.PROFIT_TARGET)
+    decisions.insert_if_new(decision)
+    decisions.set_status(decision.id, DecisionStatus.EXECUTING)
+    pending_id = f"close-{decision.id}"
+    pending = Order(
+        decision_id=decision.id, position_id=pos.id, occ_symbol=OCC, quantity=1,
+        limit_price=0.45, is_paper=True, client_order_id=pending_id,
+        side="BUY_TO_CLOSE", status=OrderStatus.PENDING, last_status_at=utcnow(),
+    )
+    assert orders.insert_if_new(pending)
+    orders.upsert_close_claim(pending)
+    positions.set_status(pos.id, PositionStatus.CLOSING)
+    broker = _PollBroker()
+    fresh = _executor(wiring, broker)
+
+    result = await fresh.execute_close(pos, decision, _quote())
+
+    assert broker.submits == [pending_id]
+    assert broker.polls == 0
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert result.client_order_id == pending_id
+    assert positions.get(pos.id).status == PositionStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_submitted_close_is_polled_not_resubmitted(tmp_path):
+    wiring = _wiring(tmp_path)
+    _db, _audit, positions, decisions, orders, _ks = wiring
+    pos = _position()
+    positions.upsert(pos)
+    pos = positions.get(pos.id)
+    decision = _decision(pos, "profit-target", RuleType.PROFIT_TARGET)
+    decisions.insert_if_new(decision)
+    working_id = f"close-{decision.id}"
+    working = Order(
+        decision_id=decision.id, position_id=pos.id, occ_symbol=OCC, quantity=1,
+        limit_price=0.45, is_paper=True, client_order_id=working_id,
+        side="BUY_TO_CLOSE", status=OrderStatus.SUBMITTED, broker_order_id="sim-already",
+    )
+    assert orders.insert_if_new(working)
+    orders.upsert_close_claim(working)
+    broker = _PollBroker()
+    fresh = _executor(wiring, broker)
+
+    result = await fresh.execute_close(pos, decision, _quote())
+
+    assert broker.submits == []
+    assert broker.polls == 1
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert result.client_order_id == working_id
+    assert positions.get(pos.id).status == PositionStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_reconcile_expires_a_never_submitted_pending_close(tmp_path):
+    wiring = _wiring(tmp_path)
+    db, audit, positions, decisions, orders, killswitch = wiring
+    pos = _position()
+    pos.status = PositionStatus.CLOSING
+    positions.upsert(pos)
+    pos = positions.get(pos.id)
+    decision = _decision(pos, "profit-target", RuleType.PROFIT_TARGET)
+    decisions.insert_if_new(decision)
+    decisions.set_status(decision.id, DecisionStatus.EXECUTING)
+    stale = Order(
+        decision_id=decision.id, position_id=pos.id, occ_symbol=OCC, quantity=1,
+        limit_price=0.45, is_paper=True, client_order_id=f"close-{decision.id}",
+        side="BUY_TO_CLOSE", status=OrderStatus.PENDING,
+        last_status_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    assert orders.insert_if_new(stale)
+    orders.upsert_close_claim(stale)
+    fresh_pos = _position()
+    fresh_pos.occ_symbol = "BBB261231P00050000"
+    fresh_pos.underlying = "BBB"
+    fresh_pos.status = PositionStatus.CLOSING
+    positions.upsert(fresh_pos)
+    fresh_pos = positions.get(fresh_pos.id)
+    fresh = Order(
+        decision_id="d-fresh", position_id=fresh_pos.id, occ_symbol=fresh_pos.occ_symbol,
+        quantity=1, limit_price=0.45, is_paper=True, client_order_id="close-fresh",
+        side="BUY_TO_CLOSE", status=OrderStatus.PENDING, last_status_at=utcnow(),
+    )
+    assert orders.insert_if_new(fresh)
+    orders.upsert_close_claim(fresh)
+    broker = PaperBroker(seed_positions=[_position(), fresh_pos])
+    settings = Settings(mode="paper", broker="paper", market_data="paper")
+    reconcile = ReconcileLoop(
+        settings, broker, positions, audit, orders=orders, killswitch=killswitch,
+        decisions=decisions,
+    )
+
+    await reconcile.run_once()
+
+    expired = orders.get_by_client_order_id(stale.client_order_id)
+    assert expired is not None and expired.status == OrderStatus.CANCELLED
+    assert orders.get_close_claim(pos.id) is None
+    assert positions.get(pos.id).status == PositionStatus.OPEN
+    assert decisions.get(decision.id).status == DecisionStatus.FAILED
+    still = orders.get_by_client_order_id("close-fresh")
+    assert still is not None and still.status == OrderStatus.PENDING
+    assert orders.get_close_claim(fresh_pos.id) == "close-fresh"
+
+
+@pytest.mark.asyncio
+async def test_notify_only_alert_still_fires_beside_one_close(tmp_path):
+    pos = _position()
+    broker = PaperBroker(seed_positions=[pos])
+    rules = [
+        RuleConfig(
+            name="profit-target", rule_type="PROFIT_TARGET", requires_approval=False,
+            params={"profit_pct": 0.5},
+        ),
+        RuleConfig(
+            name="dte-alert", rule_type="DTE", requires_approval=False,
+            params={"dte_threshold": 45, "action": "alert"},
+        ),
+    ]
+    wiring = _wiring(tmp_path)
+    _db, audit, positions, decisions, orders, killswitch = wiring
+    settings = Settings(mode="paper", broker="paper", market_data="paper", rules=rules)
+    notifier = _Recorder()
+    monitor = MonitorLoop(
+        settings, broker, PaperMarketData(), positions, audit, killswitch,
+        rules_engine=RulesEngine.from_configs(rules), decisions=decisions,
+        executor=_executor(wiring, broker, settings), notifier=notifier,
+    )
+
+    await monitor.run_once()
+
+    stored = positions.get_by_occ(OCC)
+    assert len(_live_closes(orders, stored.id)) == 1
+    assert len(broker._orders) == 1
+    names = {d.rule_name: d.status for d in decisions.recent()}
+    assert names["profit-target"] == DecisionStatus.DONE
+    assert names["dte-alert"] == DecisionStatus.PROPOSED
+    assert any("ALERT" in message for _title, message in notifier.messages)
+    assert not any(payload.get("rule") == "dte-alert" and payload.get("suppressed")
+                   for payload in _suppressed(audit))
+
+
+@pytest.mark.asyncio
+async def test_approval_rule_ahead_of_stop_loss_does_not_suppress_it(tmp_path):
+    pos = _loss_position()
+    broker = PaperBroker(seed_positions=[pos])
+    rules = [
+        RuleConfig(
+            name="dte-approval", rule_type="DTE", requires_approval=True,
+            params={"dte_threshold": 45, "action": "close"},
+        ),
+        RuleConfig(
+            name="stop-loss", rule_type="STOP_LOSS", requires_approval=False,
+            params={"loss_mult": 2.0},
+        ),
+    ]
+    wiring = _wiring(tmp_path)
+    _db, audit, positions, decisions, orders, killswitch = wiring
+    settings = Settings(mode="paper", broker="paper", market_data="paper", rules=rules)
+    notifier = _Recorder()
+    monitor = MonitorLoop(
+        settings, broker, PaperMarketData(), positions, audit, killswitch,
+        rules_engine=RulesEngine.from_configs(rules), decisions=decisions,
+        executor=_executor(wiring, broker, settings), notifier=notifier,
+    )
+
+    await monitor.run_once()
+
+    stored = positions.get_by_occ(OCC)
+    live = _live_closes(orders, stored.id)
+    assert len(live) == 1 and live[0].status == OrderStatus.FILLED
+    by_name = {d.rule_name: d for d in decisions.recent()}
+    assert by_name["stop-loss"].status == DecisionStatus.DONE
+    assert by_name["dte-approval"].status == DecisionStatus.PROPOSED
+    assert any("NEEDS APPROVAL" in message for _title, message in notifier.messages)
+    assert _suppressed(audit) == []
+
+
+@pytest.mark.asyncio
+async def test_fill_during_cancel_settles_as_filled(tmp_path):
+    wiring = _wiring(tmp_path)
+    _db, _audit, positions, decisions, orders, _ks = wiring
+    pos = _position()
+    positions.upsert(pos)
+    pos = positions.get(pos.id)
+    decision = _decision(pos, "profit-target", RuleType.PROFIT_TARGET)
+    decisions.insert_if_new(decision)
+    broker = _FillDuringCancelBroker()
+    settings = Settings(
+        mode="paper", broker="paper", market_data="paper",
+        execution={"fill_timeout_seconds": 0, "reprice_after_seconds": 3600},
+    )
+    ex = _executor(wiring, broker, settings)
+
+    result = await ex.execute_close(pos, decision, _quote())
+
+    assert broker.cancels == 1
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert positions.get(pos.id).status == PositionStatus.CLOSED
+    assert decisions.get(decision.id).status == DecisionStatus.DONE
+    assert orders.get_close_claim(pos.id) == result.client_order_id
+
+
+@pytest.mark.asyncio
+async def test_blocked_second_decision_is_a_terminal_skip(tmp_path):
+    wiring = _wiring(tmp_path)
+    _db, audit, positions, decisions, orders, killswitch = wiring
+    pos = _position()
+    positions.upsert(pos)
+    pos = positions.get(pos.id)
+    first = _decision(pos, "profit-target", RuleType.PROFIT_TARGET)
+    second = _decision(pos, "dte-close", RuleType.DTE)
+    decisions.insert_if_new(first)
+    decisions.insert_if_new(second)
+    notifier = _Recorder()
+    ex = _executor(wiring, PaperBroker())
+    ex.notifier = notifier
+    quote = _quote()
+
+    filled = await ex.execute_close(pos, first, quote)
+    assert filled is not None and filled.status == OrderStatus.FILLED
+    after_fill = len(notifier.messages)
+    skipped = await ex.execute_close(pos, second, quote)
+    assert skipped is None
+    assert decisions.get(second.id).status == DecisionStatus.SKIPPED
+    assert len(notifier.messages) == after_fill + 1
+
+    settings = Settings(mode="paper", broker="paper", market_data="paper")
+    monitor = MonitorLoop(
+        settings, PaperBroker(), PaperMarketData(), positions, audit, killswitch,
+        decisions=decisions, executor=ex,
+    )
+    again = _decision(pos, "dte-close", RuleType.DTE)
+    again.dedup_key = second.dedup_key
+    assert monitor._admit_decision(again) == "skip"
+    assert len(notifier.messages) == after_fill + 1
+
+
+@pytest.mark.asyncio
+async def test_suppressed_skip_is_audited_once_per_day(tmp_path):
+    pos = _position()
+    broker = _ScriptedBroker(pos, first="reject")
+    monitor, _decisions, _orders, _positions, audit = _monitor(
+        tmp_path, broker, _rules("profit-target", "dte-close"),
+    )
+
+    await monitor.run_once()
+    await monitor.run_once()
+
+    suppressed = [p for p in _suppressed(audit) if p.get("rule") == "dte-close"]
+    assert len(suppressed) == 1
+
+
+def test_duplicate_live_closes_are_quarantined_and_the_index_is_created(tmp_path):
+    db, _audit, _positions, _decisions, orders, _ks = _wiring(tmp_path)
+    db.conn.execute("DROP INDEX IF EXISTS idx_orders_one_live_close")
+    db.conn.commit()
+    pending = Order(
+        decision_id="d-pending", position_id="pos-aaa", occ_symbol=OCC, quantity=2,
+        limit_price=0.45, is_paper=True, client_order_id="close-pending",
+        side="BUY_TO_CLOSE", status=OrderStatus.PENDING, filled_qty=1,
+    )
+    submitted = Order(
+        decision_id="d-submitted", position_id="pos-aaa", occ_symbol=OCC, quantity=2,
+        limit_price=0.46, is_paper=True, client_order_id="close-submitted",
+        side="BUY_TO_CLOSE", status=OrderStatus.SUBMITTED, broker_order_id="sim-kept",
+    )
+    assert orders.insert_if_new(pending) is True
+    assert orders.insert_if_new(submitted) is True
+    orders.upsert_close_claim(pending)
+
+    db.migrate()
+
+    live = _live_closes(orders, "pos-aaa")
+    assert [o.client_order_id for o in live] == ["close-submitted"]
+    quarantined = orders.get_by_client_order_id("close-pending")
+    assert quarantined is not None
+    assert quarantined.status == OrderStatus.CANCELLED
+    assert quarantined.filled_qty == 1
+    assert orders.get_close_claim("pos-aaa") == "close-submitted"
+    index = db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_orders_one_live_close'"
+    ).fetchone()
+    assert index is not None
+    extra = Order(
+        decision_id="d-extra", position_id="pos-aaa", occ_symbol=OCC, quantity=1,
+        limit_price=0.47, is_paper=True, client_order_id="close-extra",
+        side="BUY_TO_CLOSE", status=OrderStatus.PENDING,
+    )
+    assert orders.insert_if_new(extra) is False
 
 
 def test_real_orders_lock_unchanged():

@@ -11,7 +11,8 @@ Safety pipeline (every order goes through all of it):
                                a close is pending, submitted, partial, or filled. A rejected
                                or cancelled close clears the claim so a retry can run.
   6. Persist-before-submit   — write the Order PENDING keyed by a deterministic
-                               client_order_id; reuse it on retry (idempotency).
+                               client_order_id. Resume that id only when the broker never
+                               saw it. A confirmed cancel or reject gets a fresh id.
   7. Submit + await fill     — poll to fill_timeout; bounded re-price on no-fill/partial.
   8. Settle                  — on FILLED mark Position CLOSED + Decision DONE; audit + notify.
 
@@ -50,6 +51,20 @@ from .market_hours import is_order_window
 from .stats import position_pnl
 
 log = logging.getLogger("agentic.executor")
+
+
+def _reached_broker(order: Order) -> bool:
+    """True when this close was sent. A PENDING row with no broker id was not."""
+    if order.broker_order_id:
+        return True
+    return order.status in (OrderStatus.SUBMITTED, OrderStatus.PARTIAL, OrderStatus.FILLED)
+
+
+def _order_filled(order: Order) -> bool:
+    """Filled, or a cancel/reject that actually bought the whole order."""
+    if order.status == OrderStatus.FILLED:
+        return True
+    return order.quantity > 0 and order.filled_qty >= order.quantity
 
 
 def round_to_tick(price: float, tick: float = 0.01) -> float:
@@ -214,15 +229,20 @@ class OrderExecutor:
         acquired = False
         outcome: Order | None = None
         skip_reason: str | None = None
+        covered: Order | None = None
         try:
             with self.close_guard.claim(order) as (result, owned):
                 if (
                     result == "filled"
                     and owned is not None
                     and owned.decision_id == decision.id
+                    and self._position_already_closed(position)
                 ):
                     return owned  # already done; never double-submit
-                if result in ("blocked", "filled"):
+                if result == "filled" and owned is not None and owned.decision_id == decision.id:
+                    # Filled, or cancelled partials that cover the position. Settle once.
+                    covered = owned
+                elif result in ("blocked", "filled"):
                     status = owned.status.value if owned is not None else "started"
                     other = owned.client_order_id if owned is not None else "another close"
                     skip_reason = (
@@ -235,25 +255,36 @@ class OrderExecutor:
                     self.decisions.set_order_snapshot(decision.id, **pricing_kwargs(order))
                     self.decisions.set_status(decision.id, DecisionStatus.EXECUTING)
                     self.positions.set_status(position.id, PositionStatus.CLOSING)
-                    self.audit.record(
-                        AuditEventType.ORDER_SUBMIT,
-                        {"occ": order.occ_symbol, "qty": order.quantity,
-                         "limit": order.limit_price, "limit_price": order.limit_price,
-                         "order_type": pricing_kwargs(order)["order_type"],
-                         "bid": order.bid, "ask": order.ask, "mid": order.mid,
-                         "time_in_force": order.time_in_force,
-                         "is_paper": order.is_paper, "client_order_id": order.client_order_id},
-                        source="executor", position_id=position.id,
-                        decision_id=decision.id, order_id=order.id,
-                    )
+                    if result == "inserted" or not _reached_broker(order):
+                        self.audit.record(
+                            AuditEventType.ORDER_SUBMIT,
+                            {"occ": order.occ_symbol, "qty": order.quantity,
+                             "limit": order.limit_price, "limit_price": order.limit_price,
+                             "order_type": pricing_kwargs(order)["order_type"],
+                             "bid": order.bid, "ask": order.ask, "mid": order.mid,
+                             "time_in_force": order.time_in_force,
+                             "is_paper": order.is_paper,
+                             "client_order_id": order.client_order_id},
+                            source="executor", position_id=position.id,
+                            decision_id=decision.id, order_id=order.id,
+                        )
+            if covered is not None:
+                await self._settle_filled(position, decision, covered)
+                return covered
             if skip_reason is not None:
-                await self._block(position, decision, skip_reason, status=DecisionStatus.FAILED)
+                # Terminal: retrying would notify again on every tick.
+                await self._block(
+                    position, decision, skip_reason, status=DecisionStatus.SKIPPED,
+                )
                 return None
 
-            # 7. Submit + await fill.
+            # 7. Submit only if this id never reached the broker. A pending/submitted
+            # row that already has a broker id (or left PENDING) is polled.
             try:
-                order.submitted_at = order.submitted_at or utcnow()
-                submitted = await self.broker.submit_close_order(order)
+                if _reached_broker(order):
+                    final = await self._poll_existing(order, position)
+                else:
+                    final = await self._submit_new(order, position)
             except Exception as exc:  # noqa: BLE001
                 log.exception("submit_close_order failed: %s", exc)
                 order.status = OrderStatus.REJECTED
@@ -270,45 +301,31 @@ class OrderExecutor:
                                    priority="high")
                 return order
 
-            submitted.last_status_at = utcnow()
-            self.orders.update(submitted)
-            outcome = submitted
-            final = await self._await_fill(submitted, position)
             outcome = final
 
-            # 8. Settle.
-            if final.status == OrderStatus.FILLED:
-                self.positions.set_status(position.id, PositionStatus.CLOSED)
-                self.decisions.set_status(decision.id, DecisionStatus.DONE)
-                self.audit.record(
-                    AuditEventType.ORDER_FILL,
-                    {"occ": final.occ_symbol, "filled_qty": final.filled_qty,
-                     "avg_fill_price": final.avg_fill_price, "is_paper": final.is_paper},
-                    source="executor", position_id=position.id,
-                    decision_id=decision.id, order_id=final.id,
-                )
-                self._journal_outcome(position, final, decision.rule_name)
-                self._alert_close(position, final)
-                tag = "(paper)" if final.is_paper else "(LIVE)"
-                await self._notify(
-                    f"Closed {position.underlying} {tag}",
-                    f"{decision.rule_name}: bought to close {final.filled_qty}x "
-                    f"{position.occ_symbol} @ {final.avg_fill_price}",
-                    priority="high",
-                )
+            # 8. Settle. A fill that lands while we cancel is still a fill.
+            if _order_filled(final):
+                final = self._mark_filled(final)
+                outcome = final
+                await self._settle_filled(position, decision, final)
             else:
                 cancelled = await self._cancel_working(final)
                 if cancelled is not None:
                     final = cancelled
                     outcome = final
-                self.decisions.set_status(decision.id, DecisionStatus.FAILED)
-                await self._notify(
-                    "Close did not fill",
-                    f"{position.occ_symbol}: order {final.status.value} after "
-                    f"{ex.fill_timeout_seconds}s (broker_id={final.broker_order_id}); "
-                    f"working close cancelled.",
-                    priority="high",
-                )
+                if _order_filled(final):
+                    final = self._mark_filled(final)
+                    outcome = final
+                    await self._settle_filled(position, decision, final)
+                else:
+                    self.decisions.set_status(decision.id, DecisionStatus.FAILED)
+                    await self._notify(
+                        "Close did not fill",
+                        f"{position.occ_symbol}: order {final.status.value} after "
+                        f"{ex.fill_timeout_seconds}s (broker_id={final.broker_order_id}); "
+                        f"working close cancelled.",
+                        priority="high",
+                    )
             return final
         finally:
             if acquired:
@@ -532,6 +549,62 @@ class OrderExecutor:
         )
 
     # ------------------------------------------------------------------ fill loop
+    async def _submit_new(self, order: Order, position: Position) -> Order:
+        """Send a close the broker has not seen. The client id is new or still PENDING."""
+        order.submitted_at = order.submitted_at or utcnow()
+        submitted = await self.broker.submit_close_order(order)
+        submitted.last_status_at = utcnow()
+        self.orders.update(submitted)
+        return await self._await_fill(submitted, position)
+
+    async def _poll_existing(self, order: Order, position: Position) -> Order:
+        """The broker already has this close. Refresh it; do not submit again."""
+        try:
+            refreshed = await self.broker.get_order(order)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_order failed resuming %s: %s", order.client_order_id, exc)
+            return order
+        refreshed.last_status_at = utcnow()
+        self.orders.update(refreshed)
+        if refreshed.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED):
+            return refreshed
+        return await self._await_fill(refreshed, position)
+
+    def _position_already_closed(self, position: Position) -> bool:
+        if position.status == PositionStatus.CLOSED:
+            return True
+        stored = self.positions.get(position.id)
+        return stored is not None and stored.status == PositionStatus.CLOSED
+
+    def _mark_filled(self, order: Order) -> Order:
+        """A fill reported as a cancel still counts. Persist FILLED so the claim sticks."""
+        if order.status == OrderStatus.FILLED:
+            return order
+        order.status = OrderStatus.FILLED
+        order.last_status_at = utcnow()
+        self.orders.update(order)
+        return order
+
+    async def _settle_filled(self, position: Position, decision: CloseDecision, final: Order) -> None:
+        self.positions.set_status(position.id, PositionStatus.CLOSED)
+        self.decisions.set_status(decision.id, DecisionStatus.DONE)
+        self.audit.record(
+            AuditEventType.ORDER_FILL,
+            {"occ": final.occ_symbol, "filled_qty": final.filled_qty,
+             "avg_fill_price": final.avg_fill_price, "is_paper": final.is_paper},
+            source="executor", position_id=position.id,
+            decision_id=decision.id, order_id=final.id,
+        )
+        self._journal_outcome(position, final, decision.rule_name)
+        self._alert_close(position, final)
+        tag = "(paper)" if final.is_paper else "(LIVE)"
+        await self._notify(
+            f"Closed {position.underlying} {tag}",
+            f"{decision.rule_name}: bought to close {final.filled_qty}x "
+            f"{position.occ_symbol} @ {final.avg_fill_price}",
+            priority="high",
+        )
+
     async def _await_fill(self, order: Order, position: Position) -> Order:
         """Poll the broker until the order fills, is terminally rejected/cancelled, or the
         fill timeout elapses. On no-fill past ``reprice_after_seconds`` it re-prices once
