@@ -28,7 +28,7 @@ from ..store.audit import AuditStore
 from ..store.entry_decisions import EntryDecisionStore
 from ..store.trade_journal import TradeJournalStore
 from .alert_score import (
-    as_utc, exit_due, expiry_at, parse_time, play_pnl, profit_fraction,
+    as_utc, clears_anytime, exit_due, expiry_at, parse_time, play_pnl, profit_fraction,
 )
 from .risk_breaker import apply_sector_cap, evaluate_risk_breaker
 from .executor import OrderExecutor
@@ -512,6 +512,11 @@ class OpportunityScanner:
             return self._skip_scan(feed_problem)
         if self._quotes_stale(quote_by_occ):
             return self._skip_scan("stale quote")
+        # A held name that was not on this scan is quoted for the exit check.
+        # A stale quote there is the same gate: nothing goes out, and prior
+        # alerts are not reconciled.
+        if await self._stale_held_quote(open_positions, quote_by_occ, chain_cache):
+            return self._skip_scan("stale quote")
 
         # Persist the full scan disposition (approved + reasoned rejections) — the negative-example
         # dataset for refining entry logic. Best-effort: a logging failure must not break the scan.
@@ -609,6 +614,28 @@ class OpportunityScanner:
         max_age = self.settings.max_quote_age_seconds
         now = utcnow()
         return any(q.is_stale(max_age, now) for q in quotes.values())
+
+    async def _stale_held_quote(self, positions, quote_by_occ, chain_cache) -> bool:
+        """True when a held short's quote, fetched for the exit check, is too old.
+
+        Quotes already on this scan were checked with the rest. A name read only
+        because it is held uses that same rule.
+        """
+        now = utcnow()
+        max_age = self.settings.max_quote_age_seconds
+        for position in positions or []:
+            if not _is_short_open(position):
+                continue
+            occ = getattr(position, "occ_symbol", None)
+            if not occ or occ in quote_by_occ:
+                continue
+            try:
+                quote, fresh = await self._quote_for_held(position, quote_by_occ, chain_cache)
+            except Exception:  # noqa: BLE001 — the exit pass notes a bad read
+                continue
+            if quote is not None and fresh and quote.is_stale(max_age, now):
+                return True
+        return False
 
     def _skip_scan(self, reason: str) -> int:
         """Send nothing and record a skipped scan_runs row."""
@@ -748,21 +775,16 @@ class OpportunityScanner:
         return inserted, confirmed
 
     async def _exit_decision(self, position, quote_by_occ, chain_cache, notes, now):
-        """The exit play to emit, or None. A missing quote or open time is a note."""
+        """The exit play to emit, or None.
+
+        80% of the credit does not need an open time. The 50% clause does, and
+        a missing open time is noted. A missing quote is noted and skipped.
+        """
         occ = position.occ_symbol
-        quote, fresh = await self._quote_for_held(position, quote_by_occ, chain_cache)
+        quote, _fresh = await self._quote_for_held(position, quote_by_occ, chain_cache)
         if quote is None or quote.midpoint is None:
             notes.append(f"exit skipped: {occ} missing quote")
             log.info("exit skipped: %s missing quote", occ)
-            return None
-        if fresh and quote.is_stale(self.settings.max_quote_age_seconds, now):
-            notes.append(f"exit skipped: {occ} stale quote")
-            log.info("exit skipped: %s stale quote", occ)
-            return None
-        opened = self._opened_at(position)
-        if opened is None:
-            notes.append(f"exit skipped: {occ} missing open time")
-            log.info("exit skipped: %s missing open time", occ)
             return None
         credit = self._exit_credit(position)
         profit = profit_fraction(credit, quote.midpoint)
@@ -770,9 +792,16 @@ class OpportunityScanner:
             notes.append(f"exit skipped: {occ} missing credit")
             log.info("exit skipped: %s missing credit", occ)
             return None
-        expiry = expiry_at(position.expiration, opened)
-        if not exit_due(profit, as_utc(now), as_utc(opened), expiry):
-            return None
+        opened = self._opened_at(position)
+        if opened is None:
+            notes.append(f"exit skipped: {occ} missing open time")
+            log.info("exit skipped: %s missing open time", occ)
+            if not clears_anytime(profit):
+                return None
+        else:
+            expiry = expiry_at(position.expiration, opened)
+            if not exit_due(profit, as_utc(now), as_utc(opened), expiry):
+                return None
         return dict(
             dedup_key=f"exit:{position.underlying}:{occ}", kind="exit",
             underlying=position.underlying, occ=occ, strike=position.strike,

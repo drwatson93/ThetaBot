@@ -24,17 +24,21 @@ def _bps(profit: float) -> int:
     return int(round(float(profit) * 10000))
 
 
+def clears_anytime(profit: float) -> bool:
+    """80% of the credit. This clause does not need an open time."""
+    return _bps(profit) >= _ANYTIME_BPS
+
+
 def exit_due(profit: float, now: datetime, opened: datetime, expiry: datetime) -> bool:
     """True when a held short should get its one exit alert.
 
     80% of the credit fires at any time. 50% fires on or before the halfway
     point from open to expiry, and not after.
     """
-    bps = _bps(profit)
-    if bps >= _ANYTIME_BPS:
+    if clears_anytime(profit):
         return True
     half = opened + (expiry - opened) / 2
-    return bps >= _HALF_BPS and now <= half
+    return _bps(profit) >= _HALF_BPS and now <= half
 
 
 def as_utc(dt: datetime) -> datetime:

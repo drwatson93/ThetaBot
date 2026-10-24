@@ -5,6 +5,7 @@ No live broker is constructed. A write method on the book fails the test.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -304,20 +305,49 @@ async def test_after_expiry_a_match_is_expired(tmp_path, _open, monkeypatch):
     assert await scanner.run_once() == 0
     assert scanner.alerts.all()[0]["status"] == "stale"
 
-    later = datetime.combine(
-        put.expiration + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc,
-    ) + timedelta(hours=16)
-    put.as_of = later
-    monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: later)
+    clock = {"now": datetime.combine(
+        put.expiration, datetime.min.time(), tzinfo=timezone.utc,
+    ) + timedelta(hours=16)}
+    monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: clock["now"])
+
+    # On the expiration date itself a stale alert is not expired. `>=` would fail here.
+    put.as_of = clock["now"]
+    assert await scanner.run_once() == 0
+    assert scanner.alerts.all()[0]["status"] == "stale"
+
+    # A match on that date is still a late take.
     alert = scanner.alerts.all()[0]
     book.positions = [_short(
         alert["occ_symbol"], "AAA", "put", 40, put.expiration, alert["contracts"],
         average=1.10,
     )]
     assert await scanner.run_once() == 0
-    row = scanner.alerts.all()[0]
-    assert row["status"] == "expired"
-    assert row["taken_at"] is None and row["fill_price"] is None
+    taken = scanner.alerts.all()[0]
+    assert taken["status"] == "taken" and taken["late"] == 1
+    assert taken["fill_price"] == pytest.approx(1.10)
+
+    # The next calendar day, a still-stale alert expires, and a match does not take it.
+    bbb_exp = put.expiration
+    bbb_occ = f"BBB{bbb_exp:%y%m%d}P{int(round(40 * 1000)):08d}"
+    scanner.alerts.insert_if_new({
+        "dedup_key": f"CSP:BBB:{bbb_occ}",
+        "kind": "CSP", "underlying": "BBB", "occ_symbol": bbb_occ,
+        "strike": 40.0, "expiration": bbb_exp.isoformat(), "contracts": 1,
+        "premium": 1.20, "bid": 1.10, "ask": 1.30,
+        "created_at": clock["now"].isoformat(),
+    })
+    bbb = scanner.alerts.get_by_dedup(f"CSP:BBB:{bbb_occ}")
+    scanner.alerts.mark_stale(bbb["id"], clock["now"].isoformat())
+    book.positions.append(_short(
+        bbb_occ, "BBB", "put", 40, bbb_exp, 1, average=1.20,
+    ))
+    clock["now"] = clock["now"] + timedelta(days=1)
+    put.as_of = clock["now"]
+    assert await scanner.run_once() == 0
+    rows = {a["underlying"]: a for a in scanner.alerts.all()}
+    assert rows["AAA"]["status"] == "taken"
+    assert rows["BBB"]["status"] == "expired"
+    assert rows["BBB"]["taken_at"] is None and rows["BBB"]["fill_price"] is None
 
 
 @pytest.mark.asyncio
@@ -538,40 +568,74 @@ async def test_exit_52_percent_on_day_20_does_not_fire(tmp_path, _open, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_missing_quote_or_open_time_does_not_crash(tmp_path, _open, monkeypatch):
+async def test_missing_quote_does_not_crash(tmp_path, _open, monkeypatch):
     t0 = datetime(2026, 4, 1, 15, 0, tzinfo=timezone.utc)
     now = t0 + timedelta(days=10)
     monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: now)
-    quote = _exit_quote(t0, dte_days=30, bid=0.10, ask=0.10)  # would be an 80%+ exit
+    quote = _exit_quote(t0, dte_days=30, bid=0.10, ask=0.10)
     quote.as_of = now
     held = _held_put(quote.occ_symbol, quote.expiration, opened_at=t0, average=1.0)
-
-    no_quote = _Book(buying_power=50_000, account_value=50_000, positions=[held])
-    scanner = _scanner(tmp_path, no_quote, {"AAA": []}, [])
+    book = _Book(buying_power=50_000, account_value=50_000, positions=[held])
+    scanner = _scanner(tmp_path, book, {"AAA": []}, [])
     assert await scanner.run_once() == 0
     assert scanner.alerts.all() == []
     run = scanner.alerts.runs()[-1]
     assert run["status"] == "ok" and "missing quote" in run["reason"]
-    assert no_quote.writes == []
+    assert book.writes == []
 
-    no_open = _Book(
+
+@pytest.mark.asyncio
+async def test_eighty_percent_fires_without_open_time(tmp_path, _open, monkeypatch):
+    """A manual short with no open time still exits at 90% of the broker average."""
+    t0 = datetime(2026, 4, 1, 15, 0, tzinfo=timezone.utc)
+    now = t0 + timedelta(days=10)
+    monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: now)
+    quote = _exit_quote(t0, dte_days=30, bid=0.10, ask=0.10)  # 90% of a 1.00 credit
+    quote.as_of = now
+    book = _Book(
         buying_power=50_000, account_value=50_000,
         positions=[_held_put(quote.occ_symbol, quote.expiration, opened_at=None, average=1.0)],
     )
-    blind = _scanner(tmp_path / "open", no_open, {"AAA": [quote]}, [])
-    assert await blind.run_once() == 0
-    assert blind.alerts.all() == []
-    assert "missing open time" in blind.alerts.runs()[-1]["reason"]
-    assert no_open.writes == []
+    scanner = _scanner(tmp_path, book, {"AAA": [quote]}, [])
+    assert await scanner.run_once() == 1
+    row = scanner.alerts.all()[0]
+    assert row["kind"] == "exit" and row["dedup_key"] == f"exit:AAA:{quote.occ_symbol}"
+    run = scanner.alerts.runs()[-1]
+    assert run["status"] == "ok" and "missing open time" in (run["reason"] or "")
+    assert book.writes == []
+
+
+@pytest.mark.asyncio
+async def test_sixty_percent_without_open_time_does_not_fire(tmp_path, _open, monkeypatch):
+    """60% with no open time cannot use the halfway clause, so it does not fire."""
+    t0 = datetime(2026, 4, 1, 15, 0, tzinfo=timezone.utc)
+    now = t0 + timedelta(days=10)
+    monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: now)
+    quote = _exit_quote(t0, dte_days=30, bid=0.40, ask=0.40)  # 60% of a 1.00 credit
+    quote.as_of = now
+    book = _Book(
+        buying_power=50_000, account_value=50_000,
+        positions=[_held_put(quote.occ_symbol, quote.expiration, opened_at=None, average=1.0)],
+    )
+    scanner = _scanner(tmp_path, book, {"AAA": [quote]}, [])
+    assert await scanner.run_once() == 0
+    assert scanner.alerts.all() == []
+    run = scanner.alerts.runs()[-1]
+    assert run["status"] == "ok" and "missing open time" in run["reason"]
+    assert book.writes == []
 
 
 @pytest.mark.asyncio
 async def test_exit_uses_fill_price_when_the_alert_was_taken(tmp_path, _open, monkeypatch):
-    """Past halfway, 85% of the fill fires and 70% of the broker average does not."""
+    """Past halfway, only the fill clears 80%. The recommended mid and the average do not.
+
+    Close mid is 0.50. Fill 5.00 is 90%. Recommended mid 2.00 is 75%.
+    Broker average 1.00 is 50%, and day 20 is past halfway.
+    """
     t0 = datetime(2026, 4, 1, 15, 0, tzinfo=timezone.utc)
     now = t0 + timedelta(days=20)
     monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: now)
-    quote = _exit_quote(t0, dte_days=30, bid=0.30, ask=0.30)
+    quote = _exit_quote(t0, dte_days=30, bid=0.50, ask=0.50)
     quote.as_of = now
     db = Database(tmp_path / "fill.db")
     alerts = AlertStore(db)
@@ -579,17 +643,17 @@ async def test_exit_uses_fill_price_when_the_alert_was_taken(tmp_path, _open, mo
     alerts.insert_if_new({
         "dedup_key": f"CSP:AAA:{quote.occ_symbol}",
         "kind": "CSP", "underlying": "AAA", "occ_symbol": quote.occ_symbol,
-        "strike": 40.0, "expiration": exp, "contracts": 1, "premium": 1.50,
-        "bid": 1.40, "ask": 1.60, "created_at": t0.isoformat(),
+        "strike": 40.0, "expiration": exp, "contracts": 1, "premium": 2.00,
+        "bid": 1.90, "ask": 2.10, "created_at": t0.isoformat(),
     })
     row = alerts.get_by_dedup(f"CSP:AAA:{quote.occ_symbol}")
     alerts.mark_taken(
-        row["id"], fill_price=2.0, taken_at=t0.isoformat(), late=False, partial=False,
+        row["id"], fill_price=5.0, taken_at=t0.isoformat(), late=False, partial=False,
     )
     book = _Book(
         buying_power=50_000, account_value=50_000,
         positions=[_held_put(
-            quote.occ_symbol, quote.expiration, opened_at=None, average=1.0,
+            quote.occ_symbol, quote.expiration, opened_at=t0, average=1.0,
         )],
     )
     audit = AuditStore(db)
@@ -603,6 +667,41 @@ async def test_exit_uses_fill_price_when_the_alert_was_taken(tmp_path, _open, mo
     kinds = [a["kind"] for a in scanner.alerts.all()]
     assert kinds.count("exit") == 1
     assert len(scanner.alerts.scorecards()) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_quote_on_a_held_name_skips_the_scan(tmp_path, _open):
+    """A stale quote fetched for a held name sends nothing and does not reconcile."""
+    put = _put("AAA")
+    book = _csp_book()
+    chains = {"AAA": [put]}
+    scanner = _scanner(tmp_path, book, chains, ["AAA"])
+    assert await scanner.run_once() == 1
+    alert = scanner.alerts.all()[0]
+    book.positions = [_short(
+        alert["occ_symbol"], "AAA", "put", 40, put.expiration, alert["contracts"],
+        average=1.10,
+    )]
+    held_exp = put.expiration
+    held_occ = f"BBB{held_exp:%y%m%d}P{int(round(40 * 1000)):08d}"
+    held_quote = OptionContractQuote(
+        occ_symbol=held_occ, underlying="BBB", option_id=None, option_type="put",
+        strike=40.0, expiration=held_exp, bid=0.10, ask=0.10, mark=0.10,
+        delta=-0.25, iv=0.35, open_interest=400, volume=80,
+        as_of=utcnow() - timedelta(seconds=120),
+    )
+    chains["BBB"] = [held_quote]
+    book.positions.append(_short(
+        held_occ, "BBB", "put", 40, held_exp, 1, average=1.0, opened_at=utcnow(),
+    ))
+    assert await scanner.run_once() == 0
+    assert len(scanner.alerts.all()) == 1
+    assert scanner.alerts.all()[0]["status"] == "new"
+    assert scanner.alerts.all()[0]["kind"] == "CSP"
+    run = scanner.alerts.runs()[-1]
+    assert run["status"] == "skipped" and run["reason"] == "stale quote"
+    assert run["alerts_sent"] == 0
+    assert book.writes == []
 
 
 @pytest.mark.asyncio
@@ -665,3 +764,59 @@ async def test_one_scorecard_row_and_taken_versus_hypothetical(tmp_path, _open, 
 
     reopened = Database(tmp_path / "alerts.db")
     assert len(AlertStore(reopened).scorecards()) == 2
+
+
+def test_migration_backfills_one_scorecard_row_per_alert(tmp_path):
+    """An alerts table from before the scorecard gains the new columns and one row each."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE alerts (
+            id TEXT PRIMARY KEY,
+            dedup_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            underlying TEXT NOT NULL,
+            occ_symbol TEXT NOT NULL,
+            strike REAL NOT NULL,
+            expiration TEXT NOT NULL,
+            contracts INTEGER NOT NULL,
+            premium REAL,
+            bid REAL,
+            ask REAL,
+            created_at TEXT NOT NULL,
+            delivery_status TEXT NOT NULL DEFAULT 'pending'
+        )"""
+    )
+    conn.executemany(
+        """INSERT INTO alerts
+             (id, dedup_key, kind, underlying, occ_symbol, strike, expiration,
+              contracts, premium, bid, ask, created_at, delivery_status)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [
+            ("a1", "CSP:AAA:AAA260101P00040000", "CSP", "AAA", "AAA260101P00040000",
+             40.0, "2026-01-01", 2, 1.45, 1.40, 1.50, "2026-01-01T15:00:00+00:00", "sent"),
+            ("b1", "CC:BBB:BBB260101C00025000", "CC", "BBB", "BBB260101C00025000",
+             25.0, "2026-01-01", 1, 0.80, 0.75, 0.85, "2026-01-01T15:00:00+00:00", "pending"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    cols = {row["name"] for row in db.conn.execute("PRAGMA table_info(alerts)")}
+    assert {"status", "fill_price", "taken_at", "stale_at", "late", "partial"} <= cols
+    stored = {
+        row["id"]: row
+        for row in db.conn.execute("SELECT * FROM alerts ORDER BY id")
+    }
+    assert stored["a1"]["status"] == "new" and stored["a1"]["delivery_status"] == "sent"
+    assert stored["b1"]["status"] == "new" and stored["b1"]["late"] == 0
+    assert stored["b1"]["partial"] == 0 and stored["a1"]["fill_price"] is None
+    cards = {card["alert_id"]: card for card in AlertStore(db).scorecards()}
+    assert set(cards) == {"a1", "b1"}
+    assert cards["a1"]["strike"] == 40.0 and cards["a1"]["contracts"] == 2
+    assert cards["a1"]["expiration"] == "2026-01-01"
+    assert cards["a1"]["mid"] == pytest.approx(1.45) and cards["a1"]["taken"] == 0
+    assert cards["a1"]["pnl"] is None and cards["a1"]["graded_at"] is None
+    assert cards["b1"]["strike"] == 25.0 and cards["b1"]["contracts"] == 1
+    assert cards["b1"]["mid"] == pytest.approx(0.80) and cards["b1"]["taken"] == 0
