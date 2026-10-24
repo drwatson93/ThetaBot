@@ -164,7 +164,7 @@ async def main_async(config_path: str | None = None) -> None:
         company_data=build_company_data(settings, data_broker or broker),
         entry_candidates=entry_candidates,
         news_provider=build_news_provider(settings), news=news,
-        setup_events=setup_events,
+        setup_events=setup_events, trade_alerts=trade_alerts,
     )
     approval_gate = ApprovalGate(
         settings, decisions, positions, executor, audit, notifier=notifier

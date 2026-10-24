@@ -139,6 +139,8 @@ async def test_scanner_fill_creates_journal_row(tmp_path, monkeypatch):
     scanner = OpportunityScanner(settings, broker, md, entry_decisions, ex, audit, killswitch,
                                  trade_journal=journal)
     await scanner.run_once()
+    # The scan alerts and does not fill. The order path still journals a fill when driven.
+    await scanner._submit(scanner.last_csp_approved, scanner.last_quotes, "csp-screener", "")
     je = journal.recent()
     assert len(je) == 1
     row = je[0]

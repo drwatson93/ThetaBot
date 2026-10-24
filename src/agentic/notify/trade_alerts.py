@@ -236,6 +236,51 @@ def format_close_line(
     )
 
 
+def build_scan_alert_payload(
+    *,
+    alert_id: str,
+    kind: str,
+    underlying: str,
+    occ: str,
+    strike: float,
+    expiration: date,
+    contracts: int,
+    bid: float | None,
+    ask: float | None,
+    mid: float | None,
+) -> dict[str, Any]:
+    """Webhook body for a new scan alert.
+
+    The play only: ticker, contract, size, and the quote. No account balances
+    and no secrets — the URL and sender key stay in the transport, from env.
+    """
+    right = "C" if kind == "CC" else "P"
+    limit = float(mid or 0.0)
+    premium = round(limit * int(contracts) * 100, 2)
+    expiry = _expiry_mmdd(expiration, occ)
+    ticker = _ticker(underlying, occ)
+    return {
+        "event": "scan_alert",
+        "trade_id": alert_id,
+        "summary": format_open_line(
+            action="STO", contracts=int(contracts), ticker=ticker, strike=float(strike),
+            right=right, expiry=expiry, limit_price=limit, premium=premium,
+        ),
+        "kind": kind,
+        "ticker": ticker,
+        "occ": occ,
+        "action": "STO",
+        "contracts": int(contracts),
+        "strike": float(strike),
+        "right": right,
+        "expiry": expiry,
+        "limit_price": limit,
+        "premium": premium,
+        "bid": bid,
+        "ask": ask,
+    }
+
+
 def build_open_payload(decision: EntryDecision, order: Order, *, mode: str) -> dict[str, Any]:
     contracts = _contracts(order)
     limit = float(order.limit_price)

@@ -2,10 +2,10 @@
 
 Each cycle (market-hours only, when entry.enabled): scan the watchlist for option chains,
 screen for CSP candidates, run the risk/sizing layer against live buying power + open
-positions, then auto-enter approved candidates via the executor (behind all the usual gates).
+positions, then record one alert per new play and send it on the webhook.
 
-Opened positions are NOT created here — the broker reports them and reconcile discovers them,
-after which the existing close-management rules take over (the wheel handoff).
+The order path (``_submit``, the executor, the weekly throttle, approval parking) is still
+here. The scan does not call it.
 """
 from __future__ import annotations
 
@@ -16,12 +16,14 @@ from datetime import timedelta
 
 from ..config import Settings
 from ..brokers.base import ExecutionBroker
+from ..brokers.factory import broker_degraded
 from ..errors import describe_exception
 from ..domain.enums import AuditEventType, DecisionStatus, OrderStatus
 from ..domain.models import EntryDecision, TradeJournalEntry, utcnow
 from ..domain.order_pricing import pricing_kwargs
 from ..marketdata.base import MarketDataProvider
 from ..marketdata.quote import OptionContractQuote
+from ..store.alerts import AlertStore
 from ..store.audit import AuditStore
 from ..store.entry_decisions import EntryDecisionStore
 from ..store.trade_journal import TradeJournalStore
@@ -87,6 +89,8 @@ class OpportunityScanner:
         news_provider=None,         # marketdata.news.NewsProvider | None (pull)
         news=None,                  # store.news.NewsStore | None
         setup_events=None,          # store.setup_events.SetupEventStore | None (setup-accuracy tracker)
+        alerts=None,                # store.alerts.AlertStore | None
+        trade_alerts=None,          # notify.trade_alerts.TradeAlerts | None
     ):
         self.setup_events = setup_events
         self.settings = settings
@@ -105,6 +109,8 @@ class OpportunityScanner:
         self.company_data = company_data or NullCompanyDataProvider()
         self.news_provider = news_provider
         self.news = news
+        self.alerts = alerts if alerts is not None else AlertStore(audit.db)
+        self.trade_alerts = trade_alerts
         self.sizer = RiskSizer(settings.entry.sizing)
         self._stop = asyncio.Event()
         # Latest scan snapshot for the dashboard.
@@ -120,7 +126,10 @@ class OpportunityScanner:
         self.last_breaker: dict | None = None                 # loss circuit breaker state (freezes new entries)
         self.last_setups: dict[str, dict] = {}                # per-symbol technical setup read (for /api/setups)
         self.last_risk_profile: dict[str, dict] = {}          # per-symbol strike-survival profile (daily)
-        self.last_reserve: dict | None = None                 # tax-reserve holding (walled off from sizing)
+        self.last_reserve: dict | None = None                 # tax-reserve holding (shown, not subtracted)
+        self.last_csp_approved: list = []                     # sized CSPs from the latest scan
+        self.last_cc_approved: list = []                      # sized CCs from the latest scan
+        self.last_quotes: dict = {}                           # occ -> quote from the latest scan
         self.last_tier_proposals: list[dict] = []             # quality names the account can now afford
         self.last_cc_clock: dict[str, dict] = {}              # per held name: days since assignment, below-basis allowed
         self.tax_reserve_store = None                         # set by main.py (ledger; for the dashboard)
@@ -224,7 +233,7 @@ class OpportunityScanner:
                 pass
 
     async def run_once(self) -> int:
-        """One scan cycle: a CSP pass (watchlist) + a CC pass (shares held). Returns entries submitted."""
+        """One scan cycle: a CSP pass (watchlist) + a CC pass (shares held). Returns new alerts."""
         cfg = self.settings.entry
         if not cfg.enabled:
             return 0
@@ -235,8 +244,10 @@ class OpportunityScanner:
             return 0
         if not is_order_window(start=self.settings.trading_start):
             return 0
+        if self._broker_down():
+            return self._skip_scan("broker degraded")
 
-        # Account state for sizing.
+        # Account state for sizing. Reads only — this cycle does not place an order.
         buying_power = await self.broker.get_buying_power()
         account_value = await self.broker.get_account_value()
 
@@ -253,14 +264,12 @@ class OpportunityScanner:
         holdings = await self.broker.get_equity_positions()
         self.last_holdings = holdings
 
-        # Tax reserve is walled off: its value never counts as capital for sizing, the breaker or
-        # the sector cap, and its shares are never written against or read as an assignment.
+        # The tax-reserve ETF is still not written against. Its market value is NOT subtracted
+        # from buying power or account value — CSP size uses the broker's buying power.
         from .holdings import reserve_symbols, tradable_holdings
         reserve = reserve_symbols(self.settings)
         holdings_tradable = tradable_holdings(holdings, reserve)
-        reserve_val = await self._reserve_value(holdings, reserve)
-        buying_power = max(0.0, buying_power - reserve_val)
-        account_value = max(0.0, account_value - reserve_val)
+        await self._reserve_value(holdings, reserve)
         self.last_account_value = account_value
         await self._refresh_tiers(account_value)
 
@@ -424,6 +433,11 @@ class OpportunityScanner:
         )
         cc_approved = cc_result.approved
         self.last_scan_at = utcnow()
+        self.last_csp_approved = list(csp_approved)
+        self.last_cc_approved = list(cc_approved)
+        self.last_quotes = quote_by_occ
+        if self._quotes_stale(quote_by_occ):
+            return self._skip_scan("stale quote")
 
         # Persist the full scan disposition (approved + reasoned rejections) — the negative-example
         # dataset for refining entry logic. Best-effort: a logging failure must not break the scan.
@@ -451,10 +465,78 @@ class OpportunityScanner:
 
         self.expire_stale_entry_approvals()  # sweep any approval requests that timed out
 
-        submitted = await self._submit(csp_approved, quote_by_occ, "csp-screener", "",
-                                       review=True, account_value=account_value)
-        submitted += await self._submit(cc_approved, quote_by_occ, "cc-screener", "CC")
-        return submitted
+        created = self._emit_alerts(csp_approved, quote_by_occ, "CSP")
+        created += self._emit_alerts(cc_approved, quote_by_occ, "CC")
+        self.alerts.record_run(
+            status="ok", reason=None, alerts_sent=created, scanned_at=self.last_scan_at,
+        )
+        return created
+
+    def _broker_down(self) -> bool:
+        """True when the broker is disconnected or live-armed but running on the paper simulator."""
+        if getattr(self.broker, "_connected", None) is False:
+            return True
+        return broker_degraded(self.settings, self.broker)
+
+    def _quotes_stale(self, quotes: dict) -> bool:
+        """True when any quote on this scan is older than max_quote_age_seconds."""
+        if not quotes:
+            return False
+        max_age = self.settings.max_quote_age_seconds
+        now = utcnow()
+        return any(q.is_stale(max_age, now) for q in quotes.values())
+
+    def _skip_scan(self, reason: str) -> int:
+        """Send nothing and record a skipped scan_runs row."""
+        self.last_scan_at = utcnow()
+        self.alerts.record_run(
+            status="skipped", reason=reason, alerts_sent=0, scanned_at=self.last_scan_at,
+        )
+        log.info("Scan skipped: %s", reason)
+        return 0
+
+    def _emit_alerts(self, approved, quote_by_occ, kind: str) -> int:
+        """Insert one alert per new play and send it. A repeat play inserts nothing and sends nothing."""
+        n = 0
+        for entry in approved:
+            c = entry.candidate
+            quote = quote_by_occ.get(c.occ_symbol)
+            if quote is None:
+                continue
+            dedup_key = f"{kind}:{c.underlying}:{c.occ_symbol}"
+            alert_id = self.alerts.insert_if_new({
+                "dedup_key": dedup_key,
+                "kind": kind,
+                "underlying": c.underlying,
+                "occ_symbol": c.occ_symbol,
+                "strike": c.strike,
+                "expiration": c.expiration.isoformat(),
+                "contracts": entry.contracts,
+                "premium": c.premium,
+                "bid": quote.bid,
+                "ask": quote.ask,
+                "created_at": utcnow().isoformat(),
+            })
+            if alert_id is None:
+                continue
+            n += 1
+            self._send_alert(alert_id, kind, c, quote, entry.contracts)
+        return n
+
+    def _send_alert(self, alert_id: str, kind: str, candidate, quote, contracts: int) -> None:
+        """Hand the play to the existing webhook transport. Never raises into the scan."""
+        if self.trade_alerts is None:
+            return
+        try:
+            from ..notify.trade_alerts import build_scan_alert_payload
+            self.trade_alerts.notify_fill(build_scan_alert_payload(
+                alert_id=alert_id, kind=kind, underlying=candidate.underlying,
+                occ=candidate.occ_symbol, strike=candidate.strike,
+                expiration=candidate.expiration, contracts=contracts,
+                bid=quote.bid, ask=quote.ask, mid=candidate.premium,
+            ))
+        except Exception:  # noqa: BLE001 — a webhook failure must not break the scan
+            log.warning("scan alert dispatch failed")
 
     async def _submit(self, approved, quote_by_occ, rule_name: str, tag: str,
                       review: bool = False, account_value: float = 0.0) -> int:

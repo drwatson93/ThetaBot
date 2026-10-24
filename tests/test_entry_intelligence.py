@@ -129,6 +129,8 @@ async def test_scanner_attaches_context_to_journal(tmp_path, monkeypatch):
     closes = [10 + i * 0.1 for i in range(260)]          # uptrend -> passes any gate
     sc, journal, *_ = _scanner(tmp_path, closes, CRIT)
     await sc.run_once()
+    # The scan only alerts. Drive the order path so the fill still journals this context.
+    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")
     row = journal.recent()[0]
     assert row.context.get("above_sma200") is True and row.context.get("rsi") == 100.0
 
@@ -151,6 +153,7 @@ async def test_scanner_overlays_tv_features_into_context(tmp_path, monkeypatch):
     closes = [10 + i * 0.1 for i in range(260)]          # uptrend -> enters, journals context
     sc, journal, *_ = _scanner(tmp_path, closes, CRIT, tv_seed={"adx": 31.5, "bb_percent_b": 62.0})
     await sc.run_once()
+    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")  # order path journals
     row = journal.recent()[0]
     assert row.context.get("adx") == 31.5 and row.context.get("bb_percent_b") == 62.0
 
@@ -220,6 +223,7 @@ async def test_scanner_overlays_setups_into_context_and_cache(tmp_path, monkeypa
     closes = [10 + i * 0.1 for i in range(260)]          # uptrend -> enters, journals context
     sc, journal, *_ = _scanner(tmp_path, closes, CRIT)
     await sc.run_once()
+    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")  # order path journals
     read = sc.last_setups["X"]                           # cached for /api/setups
     assert set(read) >= {"flags", "features", "setups", "fired_now", "live", "bias", "score",
                          "primary", "partial_bar"}
@@ -289,6 +293,7 @@ async def test_scanner_merges_fresh_tv_setup_flags(tmp_path, monkeypatch):
     (sc, journal, settings, killswitch, positions, orders, decisions,
      entry_decisions, audit, signals) = _scanner(tmp_path, closes, CRIT, tv_seed=seed)
     await sc.run_once()
+    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")  # order path journals
     ctx = sc.last_context["X"]
     assert "breakout_confirmed" in ctx.setups and ctx.live_breakout_attempt is True
     assert ctx.tv_setups["breakout"] is True and "tv_daily:breakout_confirmed" in ctx.setup_sources

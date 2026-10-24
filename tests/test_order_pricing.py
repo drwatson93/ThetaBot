@@ -151,6 +151,10 @@ async def test_paper_entry_records_limit_snapshot_on_journal_and_entry_decisions
         stores["killswitch"], trade_journal=stores["journal"],
     )
     await scanner.run_once()
+    # The scan alerts and does not fill. Drive the order path to keep the snapshot coverage.
+    await scanner._submit(
+        scanner.last_csp_approved, scanner.last_quotes, "csp-screener", "",
+    )
 
     row = stores["journal"].recent()[0]
     assert row.order_type == "limit"
