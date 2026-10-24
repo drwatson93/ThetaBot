@@ -260,6 +260,34 @@ CREATE TABLE IF NOT EXISTS iv_history (
     PRIMARY KEY (symbol, date)
 );
 
+-- One row per play the scanner has alerted. dedup_key is kind:underlying:occ
+-- with no date, so a play alerts at most once.
+CREATE TABLE IF NOT EXISTS alerts (
+    id           TEXT PRIMARY KEY,
+    dedup_key    TEXT NOT NULL,
+    kind         TEXT NOT NULL,             -- CSP | CC
+    underlying   TEXT NOT NULL,
+    occ_symbol   TEXT NOT NULL,
+    strike       REAL NOT NULL,
+    expiration   TEXT NOT NULL,             -- ISO date
+    contracts    INTEGER NOT NULL,
+    premium      REAL,                      -- recommended mid, per share
+    bid          REAL,
+    ask          REAL,
+    created_at   TEXT NOT NULL,
+    delivery_status TEXT NOT NULL DEFAULT 'pending'  -- pending | sent | failed
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_dedup ON alerts(dedup_key);
+
+-- One row per scan that reached the health gate. status is ok or skipped.
+CREATE TABLE IF NOT EXISTS scan_runs (
+    id           TEXT PRIMARY KEY,
+    scanned_at   TEXT NOT NULL,
+    status       TEXT NOT NULL,             -- ok | skipped
+    reason       TEXT,                      -- why a skipped run sent nothing
+    alerts_sent  INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS signals (
     id              TEXT PRIMARY KEY,
     raw             TEXT NOT NULL,
@@ -514,6 +542,7 @@ class Database:
             ("control", "alerts_last_sent_at", "TEXT"),
             ("control", "alerts_last_status", "TEXT"),
             ("control", "alerts_last_error", "TEXT"),
+            ("alerts", "delivery_status", "TEXT NOT NULL DEFAULT 'pending'"),
         ):
             try:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")

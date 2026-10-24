@@ -51,6 +51,46 @@ from .store.tv_indicators import TVIndicatorStore
 log = logging.getLogger("agentic.main")
 
 
+async def connect_brokers(settings: Settings):
+    """Return ``(execution, data_or_none, read_session_or_none)``.
+
+    ``execution`` is what orders would use. ``data`` is a connected Robinhood
+    session for chains and quotes, or None. ``read_session`` is that Robinhood
+    session even when the probe failed, so the scanner can fail closed on it.
+    """
+    if settings.is_live:
+        broker = await build_broker(settings)
+        read_session = broker if hasattr(broker, "_call_tool") else None
+        connected = read_session is not None and getattr(read_session, "_connected", False)
+        data_broker = read_session if connected else None
+        return broker, data_broker, read_session
+    return await build_paper_runtime(settings)
+
+
+def make_scanner(
+    settings: Settings,
+    broker,
+    market_data,
+    read_session,
+    entry_decisions,
+    executor,
+    audit,
+    killswitch,
+    **kwargs,
+):
+    """Build the process scanner.
+
+    When ``market_data`` is robinhood, account reads (buying power, open
+    options, share holdings) and the health gate use ``read_session``. The
+    execution broker stays the one orders would use.
+    """
+    read_broker = read_session if settings.market_data == "robinhood" else None
+    return OpportunityScanner(
+        settings, broker, market_data, entry_decisions, executor, audit, killswitch,
+        read_broker=read_broker, **kwargs,
+    )
+
+
 def build_market_data(settings: Settings, broker=None) -> MarketDataProvider:
     if settings.market_data == "robinhood":
         # Reuse the trading broker's Robinhood MCP session for market data — one login, no Alpaca.
@@ -136,13 +176,7 @@ async def main_async(config_path: str | None = None) -> None:
     signals = SignalStore(db)
     killswitch = KillSwitch(db, audit, auto_trip_threshold=settings.auto_trip_after_errors)
 
-    data_broker = None
-    if settings.is_live:
-        broker = await build_broker(settings)
-        if hasattr(broker, "_call_tool") and getattr(broker, "_connected", False):
-            data_broker = broker
-    else:
-        broker, data_broker = await build_paper_runtime(settings)
+    broker, data_broker, read_session = await connect_brokers(settings)
     market_data = build_market_data(settings, data_broker or broker)
     rh_connected = bool(data_broker is not None and getattr(data_broker, "_connected", False))
     if settings.market_data == "robinhood" and not rh_connected:
@@ -157,14 +191,15 @@ async def main_async(config_path: str | None = None) -> None:
         notifier=notifier, entry_decisions=entry_decisions, trade_journal=trade_journal,
         trade_alerts=trade_alerts,
     )
-    scanner = OpportunityScanner(
-        settings, broker, market_data, entry_decisions, executor, audit, killswitch,
+    scanner = make_scanner(
+        settings, broker, market_data, read_session, entry_decisions, executor, audit,
+        killswitch,
         trade_journal=trade_journal, ai_reviewer=ai_reviewer, tv_indicators=tv_indicators,
         ai_reviews=ai_reviews, earnings=build_earnings_provider(settings, data_broker or broker),
         company_data=build_company_data(settings, data_broker or broker),
         entry_candidates=entry_candidates,
         news_provider=build_news_provider(settings), news=news,
-        setup_events=setup_events,
+        setup_events=setup_events, trade_alerts=trade_alerts,
     )
     approval_gate = ApprovalGate(
         settings, decisions, positions, executor, audit, notifier=notifier

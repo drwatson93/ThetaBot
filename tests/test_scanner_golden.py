@@ -2,13 +2,17 @@
 
 The fixture is synthetic (fake tickers, made-up prices). The scan runs through
 OpportunityScanner.run_once — the same screen, rank, and size path the bot uses —
-and the executor double records the pick and returns without placing an order.
+and the sized picks are written as alerts. The executor is not called.
 No broker write method is callable from this test.
 
 Captured against the scanner as it stands: buying power 20_000, account value
 110_000, tax-reserve holding absent (reserve value 0), default criteria and sizing.
 The 10% buying-power reserve is what holds BBB at 1 contract; the per-name cap
 would allow 2.
+
+PR 2 stops subtracting a tax-reserve holding from buying power. This fixture's
+reserve value was already 0, so the pinned contracts are unchanged. The sizer's
+10% buying-power reserve is a different cap and is still applied.
 """
 from __future__ import annotations
 
@@ -212,15 +216,6 @@ class _RecordPicks:
         return None
 
 
-def _pick(decision) -> dict:
-    return {
-        "underlying": decision.underlying,
-        "strike": decision.strike,
-        "expiration": decision.expiration,
-        "contracts": decision.contracts,
-    }
-
-
 @pytest.fixture()
 def _frozen_clock(monkeypatch):
     monkeypatch.setattr("agentic.services.scanner.utcnow", _frozen_now)
@@ -248,11 +243,25 @@ async def test_golden_csp_and_cc_picks(tmp_path, _frozen_clock):
 
     await scanner.run_once()
 
-    csp = [_pick(d) for d in picks.opened if d.rule_name == "csp-screener"]
-    cc = [_pick(d) for d in picks.opened if d.rule_name == "cc-screener"]
+    # The scan alerts. It does not hand the picks to the executor.
+    assert picks.opened == []
+    assert book.writes == []
+
+    def _from_alert(row) -> dict:
+        return {
+            "underlying": row["underlying"],
+            "strike": row["strike"],
+            "expiration": date.fromisoformat(row["expiration"]),
+            "contracts": row["contracts"],
+        }
+
+    alert_rows = list(db.conn.execute(
+        "SELECT kind, underlying, strike, expiration, contracts FROM alerts ORDER BY rowid"
+    ))
+    csp = [_from_alert(r) for r in alert_rows if r["kind"] == "CSP"]
+    cc = [_from_alert(r) for r in alert_rows if r["kind"] == "CC"]
     assert csp == [dict(row) for row in GOLDEN_CSP]
     assert cc == [dict(row) for row in GOLDEN_CC]
-    assert book.writes == []
 
     logged = list(db.conn.execute(
         """SELECT kind, underlying, strike, expiration, contracts

@@ -76,13 +76,13 @@ async def test_covered_call_entry_end_to_end(tmp_path, monkeypatch):
     submitted = await scanner.run_once()
     assert submitted == 1
 
-    d = entry_decisions.recent()[0]
-    assert d.rule_name == "cc-screener" and d.contracts == 1 and d.strike == 45.0
-    # The new short call (covered call) now exists at the broker.
-    pos = await broker.get_open_positions()
-    cc = [p for p in pos if p.underlying == "X" and p.option_type is OptionType.CALL]
-    assert len(cc) == 1 and cc[0].strategy is Strategy.COVERED_CALL
-    assert cc[0].direction is Direction.SHORT
+    alerts = scanner.alerts.all()
+    assert len(alerts) == 1
+    assert alerts[0]["kind"] == "CC" and alerts[0]["contracts"] == 1
+    assert alerts[0]["strike"] == 45.0
+    # The scan alerts the covered call. It does not open one at the broker.
+    assert await broker.get_open_positions() == []
+    assert entry_decisions.recent() == []
 
 
 @pytest.mark.asyncio

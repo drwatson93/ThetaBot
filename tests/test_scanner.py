@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from agentic.brokers.paper_broker import PaperBroker
 from agentic.config import EntryConfig, Settings
-from agentic.domain.enums import DecisionStatus, OptionType, OrderStatus, PositionStatus
+from agentic.domain.enums import OptionType, PositionStatus
 from agentic.domain.models import utcnow
 from agentic.marketdata.base import MarketDataProvider
 from agentic.marketdata.quote import OptionContractQuote
@@ -76,26 +76,20 @@ def ctx(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_scan_enters_csp_on_paper(ctx):
+async def test_scan_alerts_instead_of_entering(ctx):
     submitted = await ctx["scanner"].run_once()
     assert submitted == 1
 
-    entries = ctx["entry_decisions"].recent()
-    assert len(entries) == 1
-    d = entries[0]
-    assert d.underlying == "X" and d.contracts == 2 and d.status == DecisionStatus.DONE
+    alerts = ctx["scanner"].alerts.all()
+    assert len(alerts) == 1
+    assert alerts[0]["underlying"] == "X" and alerts[0]["contracts"] == 2
+    assert alerts[0]["kind"] == "CSP"
 
-    # The sell-to-open order filled...
-    order = ctx["orders"].get_by_client_order_id(f"open-{d.id}")
-    assert order is not None and order.status == OrderStatus.FILLED
-    assert order.side == "SELL_TO_OPEN" and order.filled_qty == 2
-
-    # ...and the broker now reports the new short put (reconcile would discover it).
+    # The scan does not write an entry decision or an order.
+    assert ctx["entry_decisions"].recent() == []
+    assert ctx["orders"].list_all() == []
     pos = await ctx["broker"].get_open_positions()
-    new = [p for p in pos if p.underlying == "X"]
-    assert len(new) == 1
-    assert new[0].option_type is OptionType.PUT and new[0].direction.value == "SHORT"
-    assert new[0].status is PositionStatus.OPEN
+    assert [p for p in pos if p.underlying == "X"] == []
 
 
 @pytest.mark.asyncio
@@ -142,9 +136,9 @@ async def test_rejected_candidate_logged_with_reason(ctx):
 @pytest.mark.asyncio
 async def test_scan_is_idempotent(ctx):
     await ctx["scanner"].run_once()
-    submitted2 = await ctx["scanner"].run_once()  # same contract, same day -> dedup
+    submitted2 = await ctx["scanner"].run_once()  # same play again -> no second alert
     assert submitted2 == 0
-    assert len(ctx["entry_decisions"].recent()) == 1
+    assert len(ctx["scanner"].alerts.all()) == 1
 
 
 @pytest.mark.asyncio
@@ -167,8 +161,7 @@ async def test_dashboard_surfaces_candidates_and_entries(ctx):
     cands = client.get("/api/candidates").json()
     assert len(cands["candidates"]) >= 1 and cands["candidates"][0]["underlying"] == "X"
     entries = client.get("/api/entry-decisions").json()["entries"]
-    assert len(entries) == 1 and entries[0]["status"] == "DONE"
-    assert entries[0]["id"]  # id exposed so it can be targeted by /control/heal-decision
+    assert entries == []  # the scan alerts; it does not write an entry decision
 
     tech = client.get("/api/technicals").json()
     assert "X" in tech["symbols"] and "sma200" in tech["symbols"]["X"]  # trend inputs surfaced
@@ -186,7 +179,8 @@ async def test_loss_breaker_freezes_new_entries(ctx):
     ctx["scanner"].trade_journal = _LosingJournal()
 
     submitted = await ctx["scanner"].run_once()
-    assert submitted == 0                                   # no new entries opened
+    assert submitted == 0                                   # no new alerts
     assert ctx["entry_decisions"].recent() == []            # nothing written
+    assert ctx["scanner"].alerts.all() == []
     brk = ctx["scanner"].last_breaker
     assert brk is not None and brk["tripped"] is True and "consecutive" in brk["reason"]

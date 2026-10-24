@@ -2,10 +2,10 @@
 
 Each cycle (market-hours only, when entry.enabled): scan the watchlist for option chains,
 screen for CSP candidates, run the risk/sizing layer against live buying power + open
-positions, then auto-enter approved candidates via the executor (behind all the usual gates).
+positions, then record one alert per new play and send it on the webhook.
 
-Opened positions are NOT created here — the broker reports them and reconcile discovers them,
-after which the existing close-management rules take over (the wheel handoff).
+The order path (``_submit``, the executor, the weekly throttle, approval parking) is still
+here. The scan does not call it.
 """
 from __future__ import annotations
 
@@ -16,12 +16,14 @@ from datetime import timedelta
 
 from ..config import Settings
 from ..brokers.base import ExecutionBroker
+from ..brokers.factory import broker_degraded
 from ..errors import describe_exception
 from ..domain.enums import AuditEventType, DecisionStatus, OrderStatus
 from ..domain.models import EntryDecision, TradeJournalEntry, utcnow
 from ..domain.order_pricing import pricing_kwargs
 from ..marketdata.base import MarketDataProvider
 from ..marketdata.quote import OptionContractQuote
+from ..store.alerts import AlertStore
 from ..store.audit import AuditStore
 from ..store.entry_decisions import EntryDecisionStore
 from ..store.trade_journal import TradeJournalStore
@@ -87,6 +89,9 @@ class OpportunityScanner:
         news_provider=None,         # marketdata.news.NewsProvider | None (pull)
         news=None,                  # store.news.NewsStore | None
         setup_events=None,          # store.setup_events.SetupEventStore | None (setup-accuracy tracker)
+        alerts=None,                # store.alerts.AlertStore | None
+        trade_alerts=None,          # notify.trade_alerts.TradeAlerts | None
+        read_broker=None,           # account reads (buying power, options, shares)
     ):
         self.setup_events = setup_events
         self.settings = settings
@@ -105,6 +110,11 @@ class OpportunityScanner:
         self.company_data = company_data or NullCompanyDataProvider()
         self.news_provider = news_provider
         self.news = news
+        self.alerts = alerts if alerts is not None else AlertStore(audit.db)
+        self.trade_alerts = trade_alerts
+        # Robinhood session for account reads when market_data is robinhood.
+        # None on the paper-data path: those scans keep reading ``broker``.
+        self.read_broker = read_broker
         self.sizer = RiskSizer(settings.entry.sizing)
         self._stop = asyncio.Event()
         # Latest scan snapshot for the dashboard.
@@ -120,7 +130,10 @@ class OpportunityScanner:
         self.last_breaker: dict | None = None                 # loss circuit breaker state (freezes new entries)
         self.last_setups: dict[str, dict] = {}                # per-symbol technical setup read (for /api/setups)
         self.last_risk_profile: dict[str, dict] = {}          # per-symbol strike-survival profile (daily)
-        self.last_reserve: dict | None = None                 # tax-reserve holding (walled off from sizing)
+        self.last_reserve: dict | None = None                 # tax-reserve holding (caps only)
+        self.last_csp_approved: list = []                     # sized CSPs from the latest scan
+        self.last_cc_approved: list = []                      # sized CCs from the latest scan
+        self.last_quotes: dict = {}                           # occ -> quote from the latest scan
         self.last_tier_proposals: list[dict] = []             # quality names the account can now afford
         self.last_cc_clock: dict[str, dict] = {}              # per held name: days since assignment, below-basis allowed
         self.tax_reserve_store = None                         # set by main.py (ledger; for the dashboard)
@@ -129,8 +142,13 @@ class OpportunityScanner:
         self.last_account_value: float | None = None
 
     async def _reserve_value(self, holdings, reserve: set[str]) -> float:
-        """Market value of the tax-reserve holding (0 when none). Price read is best-effort; falls
-        back to cost basis so the reserve is ALWAYS netted out even without a quote."""
+        """Market value of the tax-reserve holding (0 when none).
+
+        The price read is best-effort and falls back to cost basis. The caller
+        subtracts this from account value, which is the base for the per-name
+        and portfolio caps. Buying power passed to the sizer is the broker
+        figure, and this value is not taken out of it.
+        """
         held = [h for h in holdings if h.symbol.upper() in reserve]
         if not held:
             self.last_reserve = None
@@ -224,7 +242,7 @@ class OpportunityScanner:
                 pass
 
     async def run_once(self) -> int:
-        """One scan cycle: a CSP pass (watchlist) + a CC pass (shares held). Returns entries submitted."""
+        """One scan cycle: a CSP pass (watchlist) + a CC pass (shares held). Returns new alerts."""
         cfg = self.settings.entry
         if not cfg.enabled:
             return 0
@@ -235,10 +253,14 @@ class OpportunityScanner:
             return 0
         if not is_order_window(start=self.settings.trading_start):
             return 0
+        if self._broker_down():
+            return self._skip_scan("broker degraded")
 
-        # Account state for sizing.
-        buying_power = await self.broker.get_buying_power()
-        account_value = await self.broker.get_account_value()
+        # Account state for sizing. Reads only — this cycle does not place an order.
+        # With market_data robinhood these hit that session's read methods.
+        book = self._account_broker()
+        buying_power = await book.get_buying_power()
+        account_value = await book.get_account_value()
 
         # Loss circuit breaker: freeze NEW entries when realized losses pile up. Does NOT close
         # anything — the monitor keeps managing/closing existing positions. Evaluated fresh each
@@ -249,17 +271,17 @@ class OpportunityScanner:
             log.warning("Loss circuit breaker ENGAGED — freezing new entries: %s", breaker["reason"])
             return 0
 
-        open_positions = await self.broker.get_open_positions()
-        holdings = await self.broker.get_equity_positions()
+        open_positions = await book.get_open_positions()
+        holdings = await book.get_equity_positions()
         self.last_holdings = holdings
 
-        # Tax reserve is walled off: its value never counts as capital for sizing, the breaker or
-        # the sector cap, and its shares are never written against or read as an assignment.
+        # The tax-reserve ETF is not written against. Its market value comes out of
+        # account value (the cap base) and stays inside buying power. CSP size uses
+        # the broker buying-power figure.
         from .holdings import reserve_symbols, tradable_holdings
         reserve = reserve_symbols(self.settings)
         holdings_tradable = tradable_holdings(holdings, reserve)
         reserve_val = await self._reserve_value(holdings, reserve)
-        buying_power = max(0.0, buying_power - reserve_val)
         account_value = max(0.0, account_value - reserve_val)
         self.last_account_value = account_value
         await self._refresh_tiers(account_value)
@@ -277,7 +299,8 @@ class OpportunityScanner:
                 ch = await self.market_data.get_chain(symbol)
                 chain_cache[symbol] = ch
                 for c in ch:
-                    quote_by_occ[c.occ_symbol] = c
+                    if c.occ_symbol:
+                        quote_by_occ[c.occ_symbol] = c
             return chain_cache[symbol]
 
         context_by_underlying: dict[str, UnderlyingContext] = {}
@@ -424,6 +447,14 @@ class OpportunityScanner:
         )
         cc_approved = cc_result.approved
         self.last_scan_at = utcnow()
+        self.last_csp_approved = list(csp_approved)
+        self.last_cc_approved = list(cc_approved)
+        self.last_quotes = quote_by_occ
+        feed_problem = self._feed_problem(chain_cache, quote_by_occ)
+        if feed_problem:
+            return self._skip_scan(feed_problem)
+        if self._quotes_stale(quote_by_occ):
+            return self._skip_scan("stale quote")
 
         # Persist the full scan disposition (approved + reasoned rejections) — the negative-example
         # dataset for refining entry logic. Best-effort: a logging failure must not break the scan.
@@ -451,10 +482,139 @@ class OpportunityScanner:
 
         self.expire_stale_entry_approvals()  # sweep any approval requests that timed out
 
-        submitted = await self._submit(csp_approved, quote_by_occ, "csp-screener", "",
-                                       review=True, account_value=account_value)
-        submitted += await self._submit(cc_approved, quote_by_occ, "cc-screener", "CC")
-        return submitted
+        inserted, confirmed = await self._emit_alerts(csp_approved, quote_by_occ, "CSP")
+        more_inserted, more_confirmed = await self._emit_alerts(cc_approved, quote_by_occ, "CC")
+        self.alerts.record_run(
+            status="ok", reason=None, alerts_sent=confirmed + more_confirmed,
+            scanned_at=self.last_scan_at,
+        )
+        return inserted + more_inserted
+
+    def _account_broker(self):
+        """Broker the scan reads for buying power, open options, and share holdings.
+
+        ``market_data: robinhood`` uses that session and never the paper book.
+        A missing session is returned as None so the health gate can fail closed.
+        """
+        if self.settings.market_data == "robinhood":
+            return self.read_broker
+        return self.read_broker if self.read_broker is not None else self.broker
+
+    def _broker_down(self) -> bool:
+        """True when the account session is missing, disconnected, or unreadable.
+
+        A ``capabilities()`` exception fails closed. A book with no
+        ``capabilities`` method (the golden fixture) is not treated as down.
+        """
+        broker = self._account_broker()
+        if broker is None:
+            return True
+        if getattr(broker, "_connected", None) is False:
+            return True
+        caps = getattr(broker, "capabilities", None)
+        if callable(caps):
+            try:
+                caps()
+            except Exception:  # noqa: BLE001 — an unreadable session must not scan
+                log.warning("broker capabilities() failed; skipping the scan")
+                return True
+        return broker_degraded(self.settings, broker)
+
+    def _feed_problem(self, chain_cache: dict, quotes: dict) -> str | None:
+        """Why this scan's chains are unusable, or None when the feed looks healthy.
+
+        Nothing fetched (empty watchlist, no covered shares) is not a failure.
+        An empty chain, or a chain that produced no quotes, is.
+        """
+        if not chain_cache:
+            return None
+        if any(len(chain) == 0 for chain in chain_cache.values()):
+            return "empty chain"
+        if not quotes:
+            return "empty quote map"
+        return None
+
+    def _quotes_stale(self, quotes: dict) -> bool:
+        """True when any quote on this scan is older than max_quote_age_seconds."""
+        if not quotes:
+            return False
+        max_age = self.settings.max_quote_age_seconds
+        now = utcnow()
+        return any(q.is_stale(max_age, now) for q in quotes.values())
+
+    def _skip_scan(self, reason: str) -> int:
+        """Send nothing and record a skipped scan_runs row."""
+        self.last_scan_at = utcnow()
+        self.alerts.record_run(
+            status="skipped", reason=reason, alerts_sent=0, scanned_at=self.last_scan_at,
+        )
+        log.info("Scan skipped: %s", reason)
+        return 0
+
+    async def _emit_alerts(self, approved, quote_by_occ, kind: str) -> tuple[int, int]:
+        """Insert a new play once, and deliver it.
+
+        Returns ``(inserted, confirmed)``. A row that is already ``sent`` is
+        left alone. A ``pending`` or ``failed`` row is posted again. ``confirmed``
+        counts only webhooks ``_deliver`` accepted.
+        """
+        inserted = 0
+        confirmed = 0
+        for entry in approved:
+            c = entry.candidate
+            quote = quote_by_occ.get(c.occ_symbol)
+            if quote is None:
+                continue
+            dedup_key = f"{kind}:{c.underlying}:{c.occ_symbol}"
+            existing = self.alerts.get_by_dedup(dedup_key)
+            if existing is not None and existing.get("delivery_status") == "sent":
+                continue
+            if existing is None:
+                alert_id = self.alerts.insert_if_new({
+                    "dedup_key": dedup_key,
+                    "kind": kind,
+                    "underlying": c.underlying,
+                    "occ_symbol": c.occ_symbol,
+                    "strike": c.strike,
+                    "expiration": c.expiration.isoformat(),
+                    "contracts": entry.contracts,
+                    "premium": c.premium,
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "created_at": utcnow().isoformat(),
+                })
+                if alert_id is None:
+                    continue
+                inserted += 1
+            else:
+                alert_id = existing["id"]
+            ok = await self._send_alert(alert_id, kind, c, quote, entry.contracts)
+            if ok is True:
+                self.alerts.set_delivery_status(alert_id, "sent")
+                confirmed += 1
+            elif ok is False:
+                self.alerts.set_delivery_status(alert_id, "failed")
+        return inserted, confirmed
+
+    async def _send_alert(self, alert_id: str, kind: str, candidate, quote, contracts: int):
+        """Hand the play to the webhook transport. Never raises into the scan.
+
+        True means the POST was accepted, False means it failed, None means
+        there was nothing to send.
+        """
+        if self.trade_alerts is None:
+            return None
+        try:
+            from ..notify.trade_alerts import build_scan_alert_payload
+            return await self.trade_alerts.deliver_scan_alert(build_scan_alert_payload(
+                alert_id=alert_id, kind=kind, underlying=candidate.underlying,
+                occ=candidate.occ_symbol, strike=candidate.strike,
+                expiration=candidate.expiration, contracts=contracts,
+                bid=quote.bid, ask=quote.ask, mid=candidate.premium,
+            ))
+        except Exception:  # noqa: BLE001 — a webhook failure must not break the scan
+            log.warning("scan alert dispatch failed")
+            return False
 
     async def _submit(self, approved, quote_by_occ, rule_name: str, tag: str,
                       review: bool = False, account_value: float = 0.0) -> int:
