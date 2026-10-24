@@ -194,8 +194,8 @@ def test_health_reports_synthetic_when_rh_down(tmp_path):
     )
     body = TestClient(create_app(deps)).get("/health").json()
     assert body["status"] == "ok"
-    assert body["mode"] == "paper"
-    assert body["live_armed"] is False
+    assert "mode" not in body and "live_armed" not in body
+    assert body["orders_hard_disabled"] is True
     assert body["robinhood_connected"] is False
     assert body["market_data"] == "paper"
     assert body["practice"] is True

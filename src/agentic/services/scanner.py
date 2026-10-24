@@ -303,9 +303,8 @@ class OpportunityScanner:
         cfg = self.settings.entry
         if not cfg.enabled:
             return 0
-        if self.killswitch.is_paused():
-            log.debug("Scanner skipped: killswitch paused.")
-            return 0
+        # Pause does not skip the scan. It mutes the webhook in _emit_play.
+        # Rows stay pending and the next unpaused scan sends each one once.
         if not is_market_hours():
             return 0
         if not is_order_window(start=self.settings.trading_start):
@@ -893,6 +892,10 @@ class OpportunityScanner:
             inserted = 1
         else:
             alert_id = existing["id"]
+        if self.killswitch.is_paused():
+            # Hold the row. pending stays pending; failed stays failed.
+            # Neither is posted, so a paused scan cannot burn the one send.
+            return inserted, 0
         ok = await self._send_alert(
             alert_id, kind, underlying=underlying, occ=occ, strike=strike,
             expiration=expiration, contracts=contracts, bid=bid, ask=ask, mid=mid,

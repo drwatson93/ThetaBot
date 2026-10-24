@@ -12,7 +12,6 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from ..brokers.robinhood_mcp import ORDERS_HARD_DISABLED, REAL_ORDERS_LOCK_LABEL
 from ..config import Settings
 from ..services.approval import ApprovalGate
 from ..services.killswitch import KillSwitch
@@ -26,6 +25,7 @@ from ..store.trade_journal import TradeJournalStore
 from ..store.tv_indicators import TVIndicatorStore
 from .control import make_control_router
 from .dashboard import make_dashboard_router
+from .health import build_health
 from .settings import make_settings_router
 from .webhook import make_webhook_router
 
@@ -60,18 +60,8 @@ def create_app(deps: WebDeps) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict:
-        out = {
-            "status": "ok",
-            "mode": deps.settings.mode,
-            "live_armed": deps.settings.is_live,
-            "paused": deps.killswitch.is_paused(),
-        }
-        if deps.practice:
-            out.update(deps.practice)
-        if ORDERS_HARD_DISABLED:
-            out["real_orders"] = "HARD DISABLED in code"
-            out["real_orders_lock"] = REAL_ORDERS_LOCK_LABEL
-        return out
+        # 200 whenever the process is up. A closed market or an old quote is a field.
+        return build_health(deps)
 
     app.include_router(make_webhook_router(deps))
     app.include_router(make_control_router(deps))
