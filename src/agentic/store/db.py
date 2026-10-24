@@ -274,7 +274,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     premium      REAL,                      -- recommended mid, per share
     bid          REAL,
     ask          REAL,
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    delivery_status TEXT NOT NULL DEFAULT 'pending'  -- pending | sent | failed
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_dedup ON alerts(dedup_key);
 
@@ -541,6 +542,7 @@ class Database:
             ("control", "alerts_last_sent_at", "TEXT"),
             ("control", "alerts_last_status", "TEXT"),
             ("control", "alerts_last_error", "TEXT"),
+            ("alerts", "delivery_status", "TEXT NOT NULL DEFAULT 'pending'"),
         ):
             try:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")

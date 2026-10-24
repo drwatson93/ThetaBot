@@ -43,19 +43,26 @@ def _construct(name: str, settings: Settings) -> ExecutionBroker:
     return cls()
 
 
-async def build_paper_runtime(settings: Settings) -> tuple[ExecutionBroker, ExecutionBroker | None]:
-    """Paper-mode runtime: simulated fills, optional live Robinhood market-data session.
+async def build_paper_runtime(
+    settings: Settings,
+) -> tuple[ExecutionBroker, ExecutionBroker | None, ExecutionBroker | None]:
+    """Paper-mode runtime: simulated fills, optional live Robinhood session.
 
-    Orders always go to ``PaperBroker`` (the live-order guard still blocks any RH write).
-    When ``market_data: robinhood`` and the MCP session connects, that session is returned
-    as the data broker so chains/quotes/earnings use real Robinhood data.
+    Returns ``(paper, data, read_session)``. Orders always go to ``PaperBroker``
+    (the live-order guard still blocks any RH write). ``data`` is the Robinhood
+    session only when ``market_data: robinhood`` and the probe connected, so
+    chains and quotes use that login. ``read_session`` is that same object even
+    when the probe failed, so the scanner can fail closed on it. Both are None
+    when market data is not Robinhood.
     """
     data: ExecutionBroker | None = None
+    read_session: ExecutionBroker | None = None
     if settings.market_data == "robinhood":
         rh = RobinhoodMCPBroker(
             account_number=settings.robinhood.account_number, settings=settings
         )
         await rh.connect()
+        read_session = rh
         if getattr(rh, "_connected", False):
             data = rh
             log.info(
@@ -70,7 +77,7 @@ async def build_paper_runtime(settings: Settings) -> tuple[ExecutionBroker, Exec
             )
     paper = _construct("paper", settings)
     await paper.connect()
-    return paper, data
+    return paper, data, read_session
 
 
 async def build_broker(settings: Settings) -> ExecutionBroker:

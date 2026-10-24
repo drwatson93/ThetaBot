@@ -305,7 +305,7 @@ def test_reserve_line_for_reports(tmp_path):
     assert reserve_line(SimpleNamespace(settings=Settings())) is None                 # disabled -> no line
 
 
-# --- scanner integration: reserve value is not subtracted; its shares are not written against --
+# --- scanner integration: reserve value leaves buying power, nets account value; shares not written --
 
 @pytest.mark.asyncio
 async def test_scanner_nets_reserve_and_excludes_it_from_calls(tmp_path, monkeypatch):
@@ -328,6 +328,6 @@ async def test_scanner_nets_reserve_and_excludes_it_from_calls(tmp_path, monkeyp
     px = closes[-1]
     assert sc.last_reserve["symbol"] == "SGOV" and sc.last_reserve["shares"] == 10.0
     assert abs(sc.last_reserve["value"] - 10 * px) < 0.01
-    assert abs(sc.last_account_value - gross_av) < 0.01                       # reserve value is not subtracted
+    assert abs(sc.last_account_value - (gross_av - 10 * px)) < 0.01           # caps use net account value
     assert "SGOV" not in sc.last_cc_clock and "X" in sc.last_cc_clock        # calls only on tradable shares
     assert sc.last_cc_clock["X"]["below_basis_allowed"] is False              # clock off by default

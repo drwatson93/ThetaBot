@@ -41,10 +41,11 @@ async def test_paper_runtime_uses_rh_data_and_paper_execution(monkeypatch):
         mode="paper", broker="robinhood_mcp", market_data="robinhood",
         paper_seed_positions=False, paper_buying_power=25_000,
     )
-    exec_b, data_b = await build_paper_runtime(settings)
+    exec_b, data_b, read_b = await build_paper_runtime(settings)
     assert exec_b.capabilities().is_paper is True
     assert isinstance(exec_b, PaperBroker)
     assert data_b is not None and data_b._connected is True
+    assert read_b is data_b
     md = build_market_data(settings, data_b)
     assert isinstance(md, RobinhoodMarketData)
     assert md.is_realtime is True
@@ -65,9 +66,10 @@ async def test_paper_runtime_without_rh_is_synthetic(monkeypatch):
     monkeypatch.setattr(RobinhoodMCPBroker, "connect", fake_connect)
     settings = Settings(mode="paper", broker="robinhood_mcp", market_data="robinhood",
                         paper_seed_positions=False)
-    exec_b, data_b = await build_paper_runtime(settings)
+    exec_b, data_b, read_b = await build_paper_runtime(settings)
     assert exec_b.capabilities().is_paper is True
     assert data_b is None
+    assert read_b is not None and read_b._connected is False
     md = build_market_data(settings, data_b or exec_b)
     assert isinstance(md, PaperMarketData)
 

@@ -1,7 +1,8 @@
 """Alerts the scanner emits, and the scan_runs log.
 
-A play's dedup key is ``kind:underlying:occ`` with no date. Inserting the same
-key again is a no-op, so a repeat scan does not create a second alert.
+A play's dedup key is ``kind:underlying:occ`` with no date. The row is inserted
+once. ``delivery_status`` is pending, sent, or failed. A later scan retries a
+row that is not sent, and does not post one that already was.
 """
 from __future__ import annotations
 
@@ -17,23 +18,39 @@ class AlertStore:
         self.db = db
 
     def insert_if_new(self, row: dict[str, Any]) -> str | None:
-        """Insert one alert. Returns its id, or None if this play was already alerted."""
+        """Insert one alert as pending. Returns its id, or None if this play exists."""
         alert_id = uuid.uuid4().hex
         cur = self.db.conn.execute(
             """INSERT OR IGNORE INTO alerts
                  (id, dedup_key, kind, underlying, occ_symbol, strike, expiration,
-                  contracts, premium, bid, ask, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  contracts, premium, bid, ask, created_at, delivery_status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 alert_id, row["dedup_key"], row["kind"], row["underlying"], row["occ_symbol"],
                 row["strike"], row["expiration"], row["contracts"], row.get("premium"),
                 row.get("bid"), row.get("ask"), row.get("created_at") or utcnow().isoformat(),
+                "pending",
             ),
         )
         self.db.conn.commit()
         if cur.rowcount <= 0:
             return None
         return alert_id
+
+    def get_by_dedup(self, dedup_key: str) -> dict[str, Any] | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM alerts WHERE dedup_key = ?", (dedup_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_delivery_status(self, alert_id: str, status: str) -> None:
+        if status not in ("pending", "sent", "failed"):
+            raise ValueError(f"bad delivery status {status!r}")
+        self.db.conn.execute(
+            "UPDATE alerts SET delivery_status = ? WHERE id = ?",
+            (status, alert_id),
+        )
+        self.db.conn.commit()
 
     def all(self) -> list[dict[str, Any]]:
         rows = self.db.conn.execute("SELECT * FROM alerts ORDER BY rowid").fetchall()

@@ -477,6 +477,55 @@ class TradeAlerts:
         log.info("alerts mode %s -> %s", previous, wanted)
         return wanted
 
+    async def deliver_scan_alert(self, payload: dict[str, Any]) -> bool | None:
+        """POST one scan alert and report whether the webhook accepted it.
+
+        None when delivery is not attempted (alerts off, or no webhook).
+        False when the POST failed, including its one retry. True only after
+        ``_deliver`` returns ok. Background mode — the production default —
+        runs that POST on the same daemon thread as a fill alert, then applies
+        the result on the event loop before this returns.
+        """
+        try:
+            if not self.should_send():
+                return None
+            url = _webhook_url()
+            if not url:
+                return None
+            if not self._background:
+                ok, err = _deliver(url, payload)
+                self._finish_delivery(payload, ok, err)
+                return ok
+            loop = asyncio.get_running_loop()
+            box: dict[str, bool] = {}
+            event = asyncio.Event()
+
+            def _apply(ok: bool, err: str | None) -> None:
+                try:
+                    self._finish_delivery(payload, ok, err)
+                finally:
+                    box["ok"] = ok
+                    event.set()
+
+            def _run() -> None:
+                try:
+                    ok, err = _deliver(url, payload)
+                except Exception as exc:  # noqa: BLE001
+                    ok, err = False, sanitize_error(exc, url)
+                try:
+                    loop.call_soon_threadsafe(_apply, ok, err)
+                except Exception:  # noqa: BLE001
+                    log.warning("scan alert status schedule failed")
+
+            threading.Thread(
+                target=_run, daemon=True, name="trade-alert",
+            ).start()
+            await asyncio.wait_for(event.wait(), timeout=HTTP_TIMEOUT_S * 2 + 4)
+            return bool(box.get("ok"))
+        except Exception:  # noqa: BLE001 — a webhook failure must not break the scan
+            log.warning("scan alert dispatch failed")
+            return False
+
     def notify_fill(self, payload: dict[str, Any]) -> None:
         """Fire-and-forget. Never raises into the caller (trading path)."""
         try:

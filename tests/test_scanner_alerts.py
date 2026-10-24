@@ -151,9 +151,14 @@ async def test_csp_sized_to_buying_power_ignores_tax_reserve(tmp_path, _open):
     # 100 SGOV shares at $100 would have wiped the $10,000 buying power if subtracted.
     assert scanner.last_reserve["symbol"] == "SGOV"
     assert scanner.last_reserve["value"] == 10_000
-    assert scanner.last_account_value == 200_000
+    # Caps see account value net of the reserve. Buying power does not, so the
+    # $10,000 SGOV holding still leaves room for 2 contracts.
+    assert scanner.last_account_value == 190_000
     runs = scanner.alerts.runs()
-    assert len(runs) == 1 and runs[0]["status"] == "ok" and runs[0]["alerts_sent"] == 1
+    assert len(runs) == 1 and runs[0]["status"] == "ok"
+    # No webhook was configured, so the row stays pending and nothing counts as sent.
+    assert runs[0]["alerts_sent"] == 0
+    assert alerts[0]["delivery_status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -221,6 +226,7 @@ async def test_repeat_scan_sends_one_webhook_and_no_second_alert(tmp_path, _open
     monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: later)
     assert await scanner.run_once() == 0
     assert len(scanner.alerts.all()) == 1
+    assert scanner.alerts.all()[0]["delivery_status"] == "sent"
     assert len(sent) == 1
     assert book.writes == []
 
@@ -258,7 +264,7 @@ async def test_stale_quote_sends_nothing_and_records_skip(tmp_path, _open, monke
 
 
 @pytest.mark.asyncio
-async def test_broker_down_sends_nothing_and_records_skip(tmp_path, _open, monkeypatch):
+async def test_broker_down_sends_nothing_and_records_skip(tmp_path, _open):
     put = _contract("ZZZ", "put", 40, 35, -0.25, 1.40, 1.50)
     book = _Book(buying_power=10_000, account_value=200_000, connected=False)
     scanner = _scanner(tmp_path, book, {"ZZZ": [put]}, ["ZZZ"])
@@ -270,11 +276,258 @@ async def test_broker_down_sends_nothing_and_records_skip(tmp_path, _open, monke
     assert len(runs) == 1 and runs[0]["status"] == "skipped"
     assert runs[0]["reason"] == "broker degraded" and runs[0]["alerts_sent"] == 0
 
-    # Live-armed but sitting on the paper simulator is the same gate.
-    live_book = _Book(buying_power=10_000, account_value=200_000)
-    live = _scanner(tmp_path / "live", live_book, {"ZZZ": [put]}, ["ZZZ"])
-    monkeypatch.setattr("agentic.services.scanner.broker_degraded", lambda settings, broker: True)
+    # Live-armed but sitting on the real paper broker is the same gate.
+    from agentic.brokers.paper_broker import PaperBroker
+    live_settings = Settings(
+        mode="live", i_understand_live_trading=True, broker="robinhood_mcp",
+        market_data="paper", entry={"enabled": True, "watchlist": ["ZZZ"]},
+    )
+    live_book = PaperBroker(seed_positions=[], buying_power=10_000)
+    db = Database(tmp_path / "live" / "alerts.db")
+    audit = AuditStore(db)
+    live = OpportunityScanner(
+        live_settings, live_book, _Chain({"ZZZ": [put]}), EntryDecisionStore(db),
+        _NoOrders(), audit, KillSwitch(db, audit), alerts=AlertStore(db),
+    )
     assert await live.run_once() == 0
     assert live.alerts.all() == []
-    assert live_book.reads == [] and live_book.writes == []
     assert live.alerts.runs()[0]["status"] == "skipped"
+    assert live.alerts.runs()[0]["reason"] == "broker degraded"
+
+
+class _CapsDown:
+    """capabilities() raises. The scan must not read the account."""
+
+    def __init__(self):
+        self.reads: list[str] = []
+
+    def capabilities(self):
+        raise RuntimeError("session probe failed")
+
+    async def get_buying_power(self):
+        self.reads.append("buying_power")
+        return 10_000.0
+
+    async def get_account_value(self):
+        self.reads.append("account_value")
+        return 200_000.0
+
+    async def get_open_positions(self):
+        self.reads.append("positions")
+        return []
+
+    async def get_equity_positions(self):
+        self.reads.append("equity")
+        return []
+
+
+@pytest.mark.asyncio
+async def test_capabilities_exception_skips_the_scan(tmp_path, _open):
+    put = _contract("ZZZ", "put", 40, 35, -0.25, 1.40, 1.50)
+    book = _CapsDown()
+    scanner = _scanner(tmp_path, book, {"ZZZ": [put]}, ["ZZZ"])
+
+    assert await scanner.run_once() == 0
+    assert book.reads == []
+    assert scanner.alerts.all() == []
+    runs = scanner.alerts.runs()
+    assert len(runs) == 1 and runs[0]["status"] == "skipped"
+    assert runs[0]["reason"] == "broker degraded" and runs[0]["alerts_sent"] == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_chain_and_empty_quote_map_skip_the_scan(tmp_path, _open):
+    put = _contract("ZZZ", "put", 40, 35, -0.25, 1.40, 1.50)
+    book = _Book(buying_power=10_000, account_value=200_000)
+    scanner = _scanner(tmp_path, book, {}, ["ZZZ"])
+
+    assert await scanner.run_once() == 0
+    assert scanner.alerts.all() == []
+    assert "ZZZ" in scanner.last_context
+    runs = scanner.alerts.runs()
+    assert len(runs) == 1 and runs[0]["status"] == "skipped"
+    assert runs[0]["reason"] == "empty chain" and runs[0]["alerts_sent"] == 0
+
+    # A chain that stores no quotes is the same gate, and it records a skip.
+    blank = _contract("QQX", "call", 25, 35, 0.25, 1.00, 1.10)
+    blank.occ_symbol = ""
+    held = _Book(
+        buying_power=50_000, account_value=50_000,
+        holdings=[EquityHolding("QQX", 100, 20.0)],
+    )
+    quiet = _scanner(tmp_path / "quotes", held, {"QQX": [blank]}, [])
+    assert await quiet.run_once() == 0
+    assert quiet.alerts.all() == []
+    qruns = quiet.alerts.runs()
+    assert len(qruns) == 1 and qruns[0]["status"] == "skipped"
+    assert qruns[0]["reason"] == "empty quote map"
+    assert quiet._feed_problem({}, {}) is None
+
+
+@pytest.mark.asyncio
+async def test_failed_webhook_retries_on_the_next_scan(tmp_path, _open, monkeypatch):
+    """Production background delivery: a failed POST stays unsent and is retried once."""
+    import threading
+
+    put = _contract("ZZZ", "put", 40, 35, -0.25, 1.40, 1.50)
+    monkeypatch.setenv("TRADE_ALERT_URL", HOOK)
+    attempts: list[str] = []
+    statuses_during_post: list[str] = []
+
+    db = Database(tmp_path / "retry.db")
+
+    def _post(url, payload, timeout=3.0):
+        row = db.conn.execute("SELECT delivery_status FROM alerts").fetchone()
+        statuses_during_post.append(row["delivery_status"])
+        attempts.append(threading.current_thread().name)
+        # _deliver tries twice per scan. Fail the first scan's pair, then accept.
+        if len(attempts) <= 2:
+            raise OSError("webhook down")
+
+    monkeypatch.setattr("agentic.notify.trade_alerts._http_post", _post)
+    audit = AuditStore(db)
+    transport = TradeAlerts(db, audit, Settings(mode="paper"), background=True)
+    book = _Book(buying_power=10_000, account_value=200_000)
+    scanner = OpportunityScanner(
+        Settings(mode="paper", broker="paper", market_data="paper",
+                 entry={"enabled": True, "watchlist": ["ZZZ"]}),
+        book, _Chain({"ZZZ": [put]}), EntryDecisionStore(db), _NoOrders(),
+        audit, KillSwitch(db, audit), alerts=AlertStore(db), trade_alerts=transport,
+    )
+
+    assert await scanner.run_once() == 1
+    assert len(scanner.alerts.all()) == 1
+    assert scanner.alerts.all()[0]["delivery_status"] == "failed"
+    assert scanner.alerts.runs()[-1]["alerts_sent"] == 0
+    assert statuses_during_post == ["pending", "pending"]
+    assert attempts == ["trade-alert", "trade-alert"]
+
+    assert await scanner.run_once() == 0
+    assert len(scanner.alerts.all()) == 1
+    assert scanner.alerts.all()[0]["delivery_status"] == "sent"
+    assert scanner.alerts.runs()[-1]["alerts_sent"] == 1
+    assert len(attempts) == 3
+
+    assert await scanner.run_once() == 0
+    assert len(scanner.alerts.all()) == 1
+    assert len(attempts) == 3
+    assert scanner.alerts.runs()[-1]["alerts_sent"] == 0
+    assert book.writes == []
+
+
+@pytest.mark.asyncio
+async def test_main_wiring_reads_robinhood_holdings(tmp_path, _open, monkeypatch):
+    """The process scanner sizes off the Robinhood read client, not the paper book."""
+    from datetime import date, timedelta
+
+    from agentic.brokers.paper_broker import PaperBroker
+    from agentic.brokers.robinhood_mcp import (
+        READ_ONLY_MCP_TOOLS, RobinhoodMCPBroker, assert_mcp_tool_allowed,
+    )
+    from agentic.main import build_market_data, connect_brokers, make_scanner
+
+    exp = (date.today() + timedelta(days=15)).isoformat()
+    called: list[str] = []
+
+    async def fake_connect(self):
+        self._connected = True
+        self._tools = [
+            "get_portfolio", "get_option_positions", "get_equity_positions",
+            "get_option_instruments", "get_option_chains", "get_option_quotes",
+            "get_equity_quotes", "get_equity_historicals",
+        ]
+        self._roles = RobinhoodMCPBroker._resolve_roles(self._tools)
+
+    async def fake_call(self, name, arguments):
+        assert_mcp_tool_allowed(name)
+        called.append(name)
+        if name == "get_portfolio":
+            return {
+                "buying_power": {"buying_power": "50000.0000"},
+                "total_value": "80000.00",
+            }
+        if name == "get_option_positions":
+            return {"positions": []}
+        if name == "get_equity_positions":
+            return {"positions": [{
+                "symbol": "QQX", "quantity": "250", "average_buy_price": "20.00",
+            }]}
+        if name == "get_equity_quotes":
+            sym = (arguments.get("symbols") or ["QQX"])[0]
+            return {"results": [{"symbol": sym, "quote": {"last_trade_price": "24.00"}}]}
+        if name == "get_option_chains":
+            return {"data": {"chains": [{"expiration_dates": [exp]}]}}
+        if name == "get_option_instruments":
+            if arguments.get("type") != "call":
+                return {"results": []}
+            return {"results": [{"id": "synth-qqx-call", "strike_price": "25"}]}
+        if name == "get_option_quotes":
+            return {"results": [{"quote": {
+                "instrument_id": "synth-qqx-call",
+                "bid_price": "1.00", "ask_price": "1.10",
+                "adjusted_mark_price": "1.05", "delta": "0.25",
+                "implied_volatility": "0.35", "open_interest": "400", "volume": "80",
+            }}]}
+        return {"results": []}
+
+    monkeypatch.setattr(RobinhoodMCPBroker, "connect", fake_connect)
+    monkeypatch.setattr(RobinhoodMCPBroker, "_call_tool", fake_call)
+    settings = Settings(
+        mode="paper", broker="paper", market_data="robinhood",
+        paper_seed_positions=False, paper_buying_power=100.0,
+        entry={
+            "enabled": True, "watchlist": [], "earnings_gate": False,
+            "criteria": {"dte_min": 10, "dte_max": 20},
+            "cc_criteria": {"dte_min": 10, "dte_max": 20},
+        },
+    )
+    db = Database(tmp_path / "wire.db")
+    audit = AuditStore(db)
+    broker, data, session = await connect_brokers(settings)
+    scanner = make_scanner(
+        settings, broker, build_market_data(settings, data or broker), session,
+        EntryDecisionStore(db), _NoOrders(), audit, KillSwitch(db, audit),
+    )
+
+    assert isinstance(broker, PaperBroker)
+    assert scanner.read_broker is session and scanner.broker is broker
+    assert await broker.get_equity_positions() == []
+
+    assert await scanner.run_once() == 1
+    alerts = scanner.alerts.all()
+    assert len(alerts) == 1
+    assert alerts[0]["kind"] == "CC" and alerts[0]["underlying"] == "QQX"
+    assert alerts[0]["contracts"] == 2 and alerts[0]["strike"] == 25.0
+    assert scanner.last_holdings[0].symbol == "QQX"
+    assert scanner.last_holdings[0].quantity == 250
+    assert {"get_portfolio", "get_option_positions", "get_equity_positions"} <= set(called)
+    assert set(called) <= READ_ONLY_MCP_TOOLS
+
+    # A disconnected session is the same object the scan reads, and it skips.
+    called.clear()
+
+    async def disconnected(self):
+        self._connected = False
+
+    async def refuse(self, name, arguments):
+        called.append(name)
+        raise AssertionError(f"read a disconnected session via {name}")
+
+    monkeypatch.setattr(RobinhoodMCPBroker, "connect", disconnected)
+    monkeypatch.setattr(RobinhoodMCPBroker, "_call_tool", refuse)
+    down_db = Database(tmp_path / "down.db")
+    down_audit = AuditStore(down_db)
+    down_broker, down_data, down_session = await connect_brokers(settings)
+    down = make_scanner(
+        settings, down_broker, build_market_data(settings, down_data or down_broker),
+        down_session, EntryDecisionStore(down_db), _NoOrders(), down_audit,
+        KillSwitch(down_db, down_audit),
+    )
+    assert down_session is not None and down_session._connected is False
+    assert down.read_broker is down_session
+    assert await down.run_once() == 0
+    assert called == []
+    assert down.alerts.all() == []
+    run = down.alerts.runs()[0]
+    assert run["status"] == "skipped" and run["reason"] == "broker degraded"
+    assert run["alerts_sent"] == 0
