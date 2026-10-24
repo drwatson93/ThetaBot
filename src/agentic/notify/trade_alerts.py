@@ -254,7 +254,12 @@ def build_scan_alert_payload(
     The play only: ticker, contract, size, and the quote. No account balances
     and no secrets — the URL and sender key stay in the transport, from env.
     """
-    right = "C" if kind == "CC" else "P"
+    if kind == "exit":
+        action = "BTC"
+        right = _right(occ=occ)
+    else:
+        action = "STO"
+        right = "C" if kind == "CC" else "P"
     limit = float(mid or 0.0)
     premium = round(limit * int(contracts) * 100, 2)
     expiry = _expiry_mmdd(expiration, occ)
@@ -263,13 +268,13 @@ def build_scan_alert_payload(
         "event": "scan_alert",
         "trade_id": alert_id,
         "summary": format_open_line(
-            action="STO", contracts=int(contracts), ticker=ticker, strike=float(strike),
+            action=action, contracts=int(contracts), ticker=ticker, strike=float(strike),
             right=right, expiry=expiry, limit_price=limit, premium=premium,
         ),
         "kind": kind,
         "ticker": ticker,
         "occ": occ,
-        "action": "STO",
+        "action": action,
         "contracts": int(contracts),
         "strike": float(strike),
         "right": right,

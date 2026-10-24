@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 from ..config import Settings
 from ..brokers.base import ExecutionBroker
@@ -27,6 +27,9 @@ from ..store.alerts import AlertStore
 from ..store.audit import AuditStore
 from ..store.entry_decisions import EntryDecisionStore
 from ..store.trade_journal import TradeJournalStore
+from .alert_score import (
+    as_utc, clears_anytime, exit_due, expiry_at, parse_time, play_pnl, profit_fraction,
+)
 from .risk_breaker import apply_sector_cap, evaluate_risk_breaker
 from .executor import OrderExecutor
 from .killswitch import KillSwitch
@@ -67,6 +70,60 @@ def quality_sort_key(candidate, context_by_underlying, prefer_iv_rank: bool = Fa
         ivr = ctx.iv_rank if (ctx is not None and ctx.iv_rank is not None) else 50.0
         return (float(q_tier), float(ivr), float(candidate.theta_efficiency))
     return (float(q_tier), float(candidate.theta_efficiency), 0.0)
+
+
+def _broker_average(position) -> float | None:
+    """Broker average price per share. Falls back to the credit the mapper stored."""
+    avg = getattr(position, "open_avg_price", None)
+    if avg is not None:
+        return float(avg)
+    credit = getattr(position, "credit_received", None)
+    if credit is None:
+        return None
+    return float(credit)
+
+
+def _is_short(position) -> bool:
+    direction = getattr(position, "direction", None)
+    if direction is None:
+        return True
+    return str(getattr(direction, "value", direction)).upper() != "LONG"
+
+
+def _is_short_open(position) -> bool:
+    if not _is_short(position):
+        return False
+    try:
+        qty = int(position.quantity)
+    except (TypeError, ValueError):
+        return False
+    if qty <= 0:
+        return False
+    status = getattr(position, "status", None)
+    if status is None:
+        return True
+    return str(getattr(status, "value", status)).upper() in ("OPEN", "CLOSING")
+
+
+def _option_name(position) -> str:
+    opt = getattr(position, "option_type", "")
+    return str(getattr(opt, "value", opt)).upper()
+
+
+def _entry_match(alert: dict, positions):
+    """Open short with the same OCC and the same side as the CSP or CC alert."""
+    kind = alert["kind"]
+    occ = alert["occ_symbol"]
+    for position in positions or []:
+        if getattr(position, "occ_symbol", None) != occ or not _is_short_open(position):
+            continue
+        name = _option_name(position)
+        if kind == "CSP" and not name.startswith("P"):
+            continue
+        if kind == "CC" and not name.startswith("C"):
+            continue
+        return position
+    return None
 
 
 class OpportunityScanner:
@@ -455,6 +512,11 @@ class OpportunityScanner:
             return self._skip_scan(feed_problem)
         if self._quotes_stale(quote_by_occ):
             return self._skip_scan("stale quote")
+        # A held name that was not on this scan is quoted for the exit check.
+        # A stale quote there is the same gate: nothing goes out, and prior
+        # alerts are not reconciled.
+        if await self._stale_held_quote(open_positions, quote_by_occ, chain_cache):
+            return self._skip_scan("stale quote")
 
         # Persist the full scan disposition (approved + reasoned rejections) — the negative-example
         # dataset for refining entry logic. Best-effort: a logging failure must not break the scan.
@@ -482,13 +544,24 @@ class OpportunityScanner:
 
         self.expire_stale_entry_approvals()  # sweep any approval requests that timed out
 
+        # The health gate already returned. Reconcile the positions this scan
+        # already read, then grade and consider exits, then emit new plays.
+        now = utcnow()
+        notes: list[str] = []
+        self._reconcile_entries(open_positions, now)
+        await self._grade_scorecard(now, notes)
+        exit_inserted, exit_confirmed = await self._exit_alerts(
+            open_positions, quote_by_occ, chain_cache, notes, now,
+        )
+
         inserted, confirmed = await self._emit_alerts(csp_approved, quote_by_occ, "CSP")
         more_inserted, more_confirmed = await self._emit_alerts(cc_approved, quote_by_occ, "CC")
         self.alerts.record_run(
-            status="ok", reason=None, alerts_sent=confirmed + more_confirmed,
+            status="ok", reason="; ".join(notes) or None,
+            alerts_sent=confirmed + more_confirmed + exit_confirmed,
             scanned_at=self.last_scan_at,
         )
-        return inserted + more_inserted
+        return inserted + more_inserted + exit_inserted
 
     def _account_broker(self):
         """Broker the scan reads for buying power, open options, and share holdings.
@@ -542,6 +615,28 @@ class OpportunityScanner:
         now = utcnow()
         return any(q.is_stale(max_age, now) for q in quotes.values())
 
+    async def _stale_held_quote(self, positions, quote_by_occ, chain_cache) -> bool:
+        """True when a held short's quote, fetched for the exit check, is too old.
+
+        Quotes already on this scan were checked with the rest. A name read only
+        because it is held uses that same rule.
+        """
+        now = utcnow()
+        max_age = self.settings.max_quote_age_seconds
+        for position in positions or []:
+            if not _is_short_open(position):
+                continue
+            occ = getattr(position, "occ_symbol", None)
+            if not occ or occ in quote_by_occ:
+                continue
+            try:
+                quote, fresh = await self._quote_for_held(position, quote_by_occ, chain_cache)
+            except Exception:  # noqa: BLE001 — the exit pass notes a bad read
+                continue
+            if quote is not None and fresh and quote.is_stale(max_age, now):
+                return True
+        return False
+
     def _skip_scan(self, reason: str) -> int:
         """Send nothing and record a skipped scan_runs row."""
         self.last_scan_at = utcnow()
@@ -550,6 +645,200 @@ class OpportunityScanner:
         )
         log.info("Scan skipped: %s", reason)
         return 0
+
+    def _reconcile_entries(self, positions, now) -> None:
+        """Match prior CSP/CC alerts to the positions this scan already read.
+
+        Does not read the broker again. A new alert with no match goes stale.
+        A stale alert that matches before expiry is taken and flagged late.
+        After the expiration date, anything not already taken is expired.
+        Exit alerts are left alone: a held short is not proof the exit was taken.
+        """
+        today = now.date()
+        for alert in self.alerts.open_entries():
+            try:
+                exp = date.fromisoformat(str(alert["expiration"])[:10])
+            except (TypeError, ValueError):
+                log.info("alert %s left alone: bad expiry", alert.get("dedup_key"))
+                continue
+            if today > exp:
+                self.alerts.mark_expired(alert["id"])
+                log.info("alert %s expired", alert.get("dedup_key"))
+                continue
+            match = _entry_match(alert, positions)
+            if match is not None:
+                late = alert["status"] == "stale"
+                partial = int(match.quantity) < int(alert["contracts"])
+                self.alerts.mark_taken(
+                    alert["id"], fill_price=_broker_average(match),
+                    taken_at=now.isoformat(), late=late, partial=partial,
+                )
+                log.info("alert %s taken", alert.get("dedup_key"))
+            elif alert["status"] == "new":
+                self.alerts.mark_stale(alert["id"], now.isoformat())
+                log.info("alert %s stale", alert.get("dedup_key"))
+
+    async def _grade_scorecard(self, now, notes: list[str]) -> None:
+        """Grade each expired entry once. Taken uses the fill; the rest use the mid."""
+        today = now.date()
+        spots: dict[str, float | None] = {}
+        for alert in self.alerts.ungraded_entries():
+            try:
+                exp = date.fromisoformat(str(alert["expiration"])[:10])
+            except (TypeError, ValueError):
+                continue
+            if today <= exp:
+                continue
+            sym = alert["underlying"]
+            if sym not in spots:
+                spots[sym] = await self._spot(sym, notes)
+            spot = spots[sym]
+            if spot is None:
+                continue
+            taken = alert["status"] == "taken"
+            if taken:
+                credit = alert.get("fill_price")
+                result = "realized"
+                if credit is None:
+                    notes.append(f"scorecard skipped: {alert['occ_symbol']} missing fill")
+                    log.info("scorecard skipped: %s missing fill", alert["occ_symbol"])
+                    continue
+            else:
+                credit = alert.get("premium")
+                result = "hypothetical"
+                if credit is None:
+                    notes.append(f"scorecard skipped: {alert['occ_symbol']} missing mid")
+                    log.info("scorecard skipped: %s missing mid", alert["occ_symbol"])
+                    continue
+            pnl = play_pnl(
+                kind=alert["kind"], strike=float(alert["strike"]), spot=float(spot),
+                credit=float(credit), contracts=int(alert["contracts"]),
+            )
+            self.alerts.grade(
+                alert["id"], taken=taken, result=result, pnl=pnl, graded_at=now.isoformat(),
+            )
+
+    async def _spot(self, symbol: str, notes: list[str]) -> float | None:
+        try:
+            price = await self.market_data.get_underlying_price(symbol)
+        except Exception as exc:  # noqa: BLE001 — a price miss must not break the scan
+            log.info("scorecard skipped: %s missing price (%s)", symbol, type(exc).__name__)
+            notes.append(f"scorecard skipped: {symbol} missing price")
+            return None
+        if price is None:
+            log.info("scorecard skipped: %s missing price", symbol)
+            notes.append(f"scorecard skipped: {symbol} missing price")
+            return None
+        return float(price)
+
+    async def _exit_alerts(
+        self, positions, quote_by_occ, chain_cache, notes: list[str], now,
+    ) -> tuple[int, int]:
+        """One exit alert per held short, through the same insert and webhook path."""
+        inserted = 0
+        confirmed = 0
+        touched: set[str] = set()
+        for position in positions or []:
+            if not _is_short_open(position):
+                continue
+            occ = getattr(position, "occ_symbol", None)
+            if not occ:
+                continue
+            dedup_key = f"exit:{position.underlying}:{occ}"
+            if dedup_key in touched:
+                continue
+            try:
+                decision = await self._exit_decision(
+                    position, quote_by_occ, chain_cache, notes, now,
+                )
+            except Exception as exc:  # noqa: BLE001 — one bad position must not break the scan
+                log.info("exit skipped: %s (%s)", occ, type(exc).__name__)
+                notes.append(f"exit skipped: {occ} missing quote")
+                continue
+            if decision is None:
+                continue
+            n_ins, n_ok = await self._emit_play(**decision)
+            touched.add(dedup_key)
+            inserted += n_ins
+            confirmed += n_ok
+        for row in self.alerts.unsent("exit"):
+            if row["dedup_key"] in touched:
+                continue
+            n_ins, n_ok = await self._emit_play(
+                dedup_key=row["dedup_key"], kind="exit", underlying=row["underlying"],
+                occ=row["occ_symbol"], strike=row["strike"], expiration=row["expiration"],
+                contracts=row["contracts"], premium=row.get("premium"),
+                bid=row.get("bid"), ask=row.get("ask"), mid=row.get("premium"),
+            )
+            inserted += n_ins
+            confirmed += n_ok
+        return inserted, confirmed
+
+    async def _exit_decision(self, position, quote_by_occ, chain_cache, notes, now):
+        """The exit play to emit, or None.
+
+        80% of the credit does not need an open time. The 50% clause does, and
+        a missing open time is noted. A missing quote is noted and skipped.
+        """
+        occ = position.occ_symbol
+        quote, _fresh = await self._quote_for_held(position, quote_by_occ, chain_cache)
+        if quote is None or quote.midpoint is None:
+            notes.append(f"exit skipped: {occ} missing quote")
+            log.info("exit skipped: %s missing quote", occ)
+            return None
+        credit = self._exit_credit(position)
+        profit = profit_fraction(credit, quote.midpoint)
+        if profit is None:
+            notes.append(f"exit skipped: {occ} missing credit")
+            log.info("exit skipped: %s missing credit", occ)
+            return None
+        opened = self._opened_at(position)
+        if opened is None:
+            notes.append(f"exit skipped: {occ} missing open time")
+            log.info("exit skipped: %s missing open time", occ)
+            if not clears_anytime(profit):
+                return None
+        else:
+            expiry = expiry_at(position.expiration, opened)
+            if not exit_due(profit, as_utc(now), as_utc(opened), expiry):
+                return None
+        return dict(
+            dedup_key=f"exit:{position.underlying}:{occ}", kind="exit",
+            underlying=position.underlying, occ=occ, strike=position.strike,
+            expiration=position.expiration, contracts=int(position.quantity),
+            premium=quote.midpoint, bid=quote.bid, ask=quote.ask, mid=quote.midpoint,
+        )
+
+    async def _quote_for_held(self, position, quote_by_occ, chain_cache):
+        """Quote from this scan's chain. Fetches the underlying only if it was not scanned."""
+        occ = position.occ_symbol
+        cached = quote_by_occ.get(occ)
+        if cached is not None:
+            return cached, False
+        symbol = position.underlying
+        if symbol not in chain_cache:
+            chain = await self.market_data.get_chain(symbol)
+            chain_cache[symbol] = list(chain or [])
+            for contract in chain_cache[symbol]:
+                if contract.occ_symbol:
+                    quote_by_occ[contract.occ_symbol] = contract
+        return quote_by_occ.get(occ), True
+
+    def _opened_at(self, position):
+        opened = getattr(position, "opened_at", None)
+        if isinstance(opened, datetime):
+            return opened
+        row = self.alerts.taken_entry_for_occ(position.occ_symbol)
+        if row is None:
+            return None
+        return parse_time(row.get("taken_at"))
+
+    def _exit_credit(self, position) -> float | None:
+        """Fill from the taken alert, or the broker average when opened outside the app."""
+        row = self.alerts.taken_entry_for_occ(position.occ_symbol)
+        if row is not None and row.get("fill_price") is not None:
+            return float(row["fill_price"])
+        return _broker_average(position)
 
     async def _emit_alerts(self, approved, quote_by_occ, kind: str) -> tuple[int, int]:
         """Insert a new play once, and deliver it.
@@ -565,38 +854,60 @@ class OpportunityScanner:
             quote = quote_by_occ.get(c.occ_symbol)
             if quote is None:
                 continue
-            dedup_key = f"{kind}:{c.underlying}:{c.occ_symbol}"
-            existing = self.alerts.get_by_dedup(dedup_key)
-            if existing is not None and existing.get("delivery_status") == "sent":
-                continue
-            if existing is None:
-                alert_id = self.alerts.insert_if_new({
-                    "dedup_key": dedup_key,
-                    "kind": kind,
-                    "underlying": c.underlying,
-                    "occ_symbol": c.occ_symbol,
-                    "strike": c.strike,
-                    "expiration": c.expiration.isoformat(),
-                    "contracts": entry.contracts,
-                    "premium": c.premium,
-                    "bid": quote.bid,
-                    "ask": quote.ask,
-                    "created_at": utcnow().isoformat(),
-                })
-                if alert_id is None:
-                    continue
-                inserted += 1
-            else:
-                alert_id = existing["id"]
-            ok = await self._send_alert(alert_id, kind, c, quote, entry.contracts)
-            if ok is True:
-                self.alerts.set_delivery_status(alert_id, "sent")
-                confirmed += 1
-            elif ok is False:
-                self.alerts.set_delivery_status(alert_id, "failed")
+            n_ins, n_ok = await self._emit_play(
+                dedup_key=f"{kind}:{c.underlying}:{c.occ_symbol}",
+                kind=kind, underlying=c.underlying, occ=c.occ_symbol,
+                strike=c.strike, expiration=c.expiration, contracts=entry.contracts,
+                premium=c.premium, bid=quote.bid, ask=quote.ask, mid=c.premium,
+            )
+            inserted += n_ins
+            confirmed += n_ok
         return inserted, confirmed
 
-    async def _send_alert(self, alert_id: str, kind: str, candidate, quote, contracts: int):
+    async def _emit_play(
+        self, *, dedup_key, kind, underlying, occ, strike, expiration, contracts,
+        premium, bid, ask, mid,
+    ) -> tuple[int, int]:
+        """Insert the play if it is new, and post it unless it was already sent."""
+        existing = self.alerts.get_by_dedup(dedup_key)
+        if existing is not None and existing.get("delivery_status") == "sent":
+            return 0, 0
+        inserted = 0
+        if existing is None:
+            exp = expiration.isoformat() if hasattr(expiration, "isoformat") else str(expiration)[:10]
+            alert_id = self.alerts.insert_if_new({
+                "dedup_key": dedup_key,
+                "kind": kind,
+                "underlying": underlying,
+                "occ_symbol": occ,
+                "strike": strike,
+                "expiration": exp,
+                "contracts": contracts,
+                "premium": premium,
+                "bid": bid,
+                "ask": ask,
+                "created_at": utcnow().isoformat(),
+            })
+            if alert_id is None:
+                return 0, 0
+            inserted = 1
+        else:
+            alert_id = existing["id"]
+        ok = await self._send_alert(
+            alert_id, kind, underlying=underlying, occ=occ, strike=strike,
+            expiration=expiration, contracts=contracts, bid=bid, ask=ask, mid=mid,
+        )
+        if ok is True:
+            self.alerts.set_delivery_status(alert_id, "sent")
+            return inserted, 1
+        if ok is False:
+            self.alerts.set_delivery_status(alert_id, "failed")
+        return inserted, 0
+
+    async def _send_alert(
+        self, alert_id: str, kind: str, *, underlying, occ, strike, expiration,
+        contracts: int, bid, ask, mid,
+    ):
         """Hand the play to the webhook transport. Never raises into the scan.
 
         True means the POST was accepted, False means it failed, None means
@@ -605,12 +916,14 @@ class OpportunityScanner:
         if self.trade_alerts is None:
             return None
         try:
+            if isinstance(expiration, str):
+                expiration = date.fromisoformat(expiration[:10])
             from ..notify.trade_alerts import build_scan_alert_payload
             return await self.trade_alerts.deliver_scan_alert(build_scan_alert_payload(
-                alert_id=alert_id, kind=kind, underlying=candidate.underlying,
-                occ=candidate.occ_symbol, strike=candidate.strike,
-                expiration=candidate.expiration, contracts=contracts,
-                bid=quote.bid, ask=quote.ask, mid=candidate.premium,
+                alert_id=alert_id, kind=kind, underlying=underlying,
+                occ=occ, strike=float(strike),
+                expiration=expiration, contracts=int(contracts),
+                bid=bid, ask=ask, mid=mid,
             ))
         except Exception:  # noqa: BLE001 — a webhook failure must not break the scan
             log.warning("scan alert dispatch failed")

@@ -265,7 +265,7 @@ CREATE TABLE IF NOT EXISTS iv_history (
 CREATE TABLE IF NOT EXISTS alerts (
     id           TEXT PRIMARY KEY,
     dedup_key    TEXT NOT NULL,
-    kind         TEXT NOT NULL,             -- CSP | CC
+    kind         TEXT NOT NULL,             -- CSP | CC | exit
     underlying   TEXT NOT NULL,
     occ_symbol   TEXT NOT NULL,
     strike       REAL NOT NULL,
@@ -275,9 +275,28 @@ CREATE TABLE IF NOT EXISTS alerts (
     bid          REAL,
     ask          REAL,
     created_at   TEXT NOT NULL,
-    delivery_status TEXT NOT NULL DEFAULT 'pending'  -- pending | sent | failed
+    delivery_status TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | failed
+    status       TEXT NOT NULL DEFAULT 'new',         -- new | taken | stale | expired
+    fill_price   REAL,                      -- broker average when a later scan matches
+    taken_at     TEXT,
+    stale_at     TEXT,
+    late         INTEGER NOT NULL DEFAULT 0, -- 1 when a stale alert is taken before expiry
+    partial      INTEGER NOT NULL DEFAULT 0  -- 1 when the matched quantity is short of the alert
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_dedup ON alerts(dedup_key);
+
+-- One row per alert: what was recommended, whether it was taken, and the expiry result.
+CREATE TABLE IF NOT EXISTS scorecard (
+    alert_id    TEXT PRIMARY KEY,
+    strike      REAL NOT NULL,
+    expiration  TEXT NOT NULL,
+    contracts   INTEGER NOT NULL,
+    mid         REAL,
+    taken       INTEGER NOT NULL DEFAULT 0,
+    result      TEXT,                       -- realized | hypothetical, once graded
+    pnl         REAL,
+    graded_at   TEXT
+);
 
 -- One row per scan that reached the health gate. status is ok or skipped.
 CREATE TABLE IF NOT EXISTS scan_runs (
@@ -543,6 +562,12 @@ class Database:
             ("control", "alerts_last_status", "TEXT"),
             ("control", "alerts_last_error", "TEXT"),
             ("alerts", "delivery_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("alerts", "status", "TEXT NOT NULL DEFAULT 'new'"),
+            ("alerts", "fill_price", "REAL"),
+            ("alerts", "taken_at", "TEXT"),
+            ("alerts", "stale_at", "TEXT"),
+            ("alerts", "late", "INTEGER NOT NULL DEFAULT 0"),
+            ("alerts", "partial", "INTEGER NOT NULL DEFAULT 0"),
         ):
             try:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -567,6 +592,12 @@ class Database:
         # Duplicate live rows (index cannot be created) are quarantined, then the index
         # is created.
         self._ensure_one_live_close_index()
+        # Alerts created before the scorecard table existed get one row each.
+        self.conn.execute(
+            """INSERT OR IGNORE INTO scorecard
+                 (alert_id, strike, expiration, contracts, mid, taken)
+               SELECT id, strike, expiration, contracts, premium, 0 FROM alerts"""
+        )
         self.conn.commit()
 
     def _ensure_one_live_close_index(self) -> None:
