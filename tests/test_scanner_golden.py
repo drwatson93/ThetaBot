@@ -5,12 +5,14 @@ OpportunityScanner.run_once — the same screen, rank, and size path the bot use
 and the executor double records the pick and returns without placing an order.
 No broker write method is callable from this test.
 
-Captured against the scanner as it stands: buying power 25_000, account value
-80_000, tax-reserve holding absent (reserve value 0), default criteria and sizing.
+Captured against the scanner as it stands: buying power 20_000, account value
+110_000, tax-reserve holding absent (reserve value 0), default criteria and sizing.
+The 10% buying-power reserve is what holds BBB at 1 contract; the per-name cap
+would allow 2.
 """
 from __future__ import annotations
 
-import re
+import ast
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -70,12 +72,12 @@ def _chains() -> dict[str, list[OptionContractQuote]]:
         "AAA": [
             # Best theta on the book, but AAA already has a short put, so it is not a pick.
             _contract("AAA", "put", 45, 32, -0.25, 1.20, 1.30, -0.12),
-            # Yield too thin to pass the screen.
-            _contract("AAA", "put", 48, 35, -0.26, 0.10, 0.12, -0.20),
         ],
         "BBB": [
             _contract("BBB", "put", 55, 40, -0.24, 1.50, 1.60, -0.09),
             _contract("BBB", "put", 50, 40, -0.22, 1.30, 1.40, -0.05),  # passes, loses rank
+            # Higher annualized yield, lower theta-efficiency. Wins only if rank leaves theta.
+            _contract("BBB", "put", 45, 30, -0.23, 1.40, 1.56, -0.05),
             _contract("BBB", "put", 60, 35, -0.55, 2.40, 2.50, -0.40),  # delta too high
             _contract("BBB", "put", 52, 5, -0.22, 1.40, 1.50, -0.30),   # DTE too short
             _contract("BBB", "call", 75, 35, 0.25, 1.70, 1.80, -0.06),
@@ -103,6 +105,12 @@ def _chains() -> dict[str, list[OptionContractQuote]]:
         "GGG": [
             # 50 shares: under one contract, never screened.
             _contract("GGG", "call", 12, 35, 0.25, 0.80, 0.86, -0.10),
+        ],
+        "HHH": [
+            # Single fault: annualized yield under the 20% floor. Delta, DTE, spread,
+            # and liquidity all pass, and theta would outrank CCC. Dropping the floor
+            # makes HHH a pick.
+            _contract("HHH", "put", 40, 35, -0.25, 0.36, 0.40, -0.20),
         ],
     }
 
@@ -142,10 +150,13 @@ class _ReadOnlyBook:
         ]
 
     async def get_buying_power(self) -> float:
-        return 25_000.0
+        # 10% reserve leaves $18,000 usable. After CCC (2 x $4,000), $10,000 remains,
+        # which sizes BBB's $5,500 contract to 1. With no reserve, BBB sizes to 2.
+        return 20_000.0
 
     async def get_account_value(self) -> float:
-        return 80_000.0
+        # 10% per-name cap is $11,000, enough for 2 of BBB's contracts.
+        return 110_000.0
 
     async def get_open_positions(self):
         return list(self.positions)
@@ -215,6 +226,7 @@ def _frozen_clock(monkeypatch):
     monkeypatch.setattr("agentic.services.scanner.utcnow", _frozen_now)
     monkeypatch.setattr("agentic.entry.screener.utcnow", _frozen_now)
     monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    monkeypatch.setattr("agentic.services.scanner.is_order_window", lambda *a, **k: True)
 
 
 @pytest.mark.asyncio
@@ -227,7 +239,7 @@ async def test_golden_csp_and_cc_picks(tmp_path, _frozen_clock):
         mode="paper",
         broker="paper",
         market_data="paper",
-        entry={"enabled": True, "watchlist": ["AAA", "BBB", "CCC"]},
+        entry={"enabled": True, "watchlist": ["AAA", "BBB", "CCC", "HHH"]},
     )
     scanner = OpportunityScanner(
         settings, book, _ChainBook(_chains()), EntryDecisionStore(db), picks,
@@ -242,27 +254,108 @@ async def test_golden_csp_and_cc_picks(tmp_path, _frozen_clock):
     assert cc == [dict(row) for row in GOLDEN_CC]
     assert book.writes == []
 
-    logged = [
-        (r["kind"], r["underlying"], r["strike"], r["expiration"], r["contracts"])
-        for r in EntryCandidateStore(db).recent(50)
-        if r["approved"]
+    logged = list(db.conn.execute(
+        """SELECT kind, underlying, strike, expiration, contracts
+           FROM entry_candidates WHERE approved = 1 ORDER BY rowid"""
+    ))
+    expected_logged = [
+        (kind, row["underlying"], row["strike"], row["expiration"].isoformat(), row["contracts"])
+        for kind, rows in (("CSP", GOLDEN_CSP), ("CC", GOLDEN_CC))
+        for row in rows
     ]
-    expected_logged = (
-        [("CSP", row["underlying"], row["strike"], row["expiration"].isoformat(), row["contracts"])
-         for row in GOLDEN_CSP]
-        + [("CC", row["underlying"], row["strike"], row["expiration"].isoformat(), row["contracts"])
-           for row in GOLDEN_CC]
-    )
-    assert sorted(logged) == sorted(expected_logged)
+    assert [tuple(r) for r in logged] == expected_logged
+
+    by_strike = {
+        (r["underlying"], r["strike"]): r
+        for r in db.conn.execute("SELECT * FROM entry_candidates ORDER BY rowid")
+    }
+    # Higher yield than the BBB put we actually pick, so a yield-based rank key would choose it.
+    decoy, winner = by_strike[("BBB", 45.0)], by_strike[("BBB", 55.0)]
+    assert decoy["approved"] == 0 and "already approved" in decoy["reason"]
+    assert winner["approved"] == 1
+    assert decoy["annualized_ror"] > winner["annualized_ror"]
+    assert ("HHH", 40.0) not in by_strike
+
+
+_LOCK_SOURCE = Path(__file__).resolve().parents[1] / "src" / "agentic" / "brokers" / "robinhood_mcp.py"
+_BLOCKED_TOOLS = (
+    "place_option_order",
+    "place_equity_order",
+    "cancel_option_order",
+    "not_a_real_tool",
+)
+
+
+def _target_names(node: ast.AST):
+    if isinstance(node, ast.Name):
+        yield node.id
+    elif isinstance(node, (ast.Tuple, ast.List)):
+        for elt in node.elts:
+            yield from _target_names(elt)
+    elif isinstance(node, ast.Starred):
+        yield from _target_names(node.value)
+
+
+def _orders_lock_stores(tree: ast.AST) -> list[ast.AST]:
+    """Every assignment that stores ORDERS_HARD_DISABLED, including nested ones."""
+    stores: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            targets = [node.target]
+        else:
+            continue
+        if any(name == "ORDERS_HARD_DISABLED" for t in targets for name in _target_names(t)):
+            stores.append(node)
+    return stores
+
+
+def _is_guard_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "assert_mcp_tool_allowed"
+    return isinstance(func, ast.Attribute) and func.attr == "assert_mcp_tool_allowed"
 
 
 def test_orders_hard_disabled_stays_true():
-    """The source assignment stays True, and a write tool is still refused with no network call."""
-    path = Path(__file__).resolve().parents[1] / "src" / "agentic" / "brokers" / "robinhood_mcp.py"
-    text = path.read_text(encoding="utf-8")
-    assignments = re.findall(r"^ORDERS_HARD_DISABLED\s*=\s*(.+?)\s*$", text, re.M)
-    assert assignments == ["True"]
+    """The module stores the lock once, as True, and _call_tool still asks the guard.
+
+    A later `if` or function that assigns False, a guard that only names one write
+    tool, or a _call_tool that no longer calls the guard all fail this test.
+    """
+    tree = ast.parse(_LOCK_SOURCE.read_text(encoding="utf-8"))
+    stores = _orders_lock_stores(tree)
+    assert len(stores) == 1
+    store = stores[0]
+    assert store in tree.body  # module level, not inside a function or conditional
+    value = store.value
+    assert isinstance(value, ast.Constant) and value.value is True
+
+    methods = [
+        item
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "RobinhoodMCPBroker"
+        for item in node.body
+        if isinstance(item, ast.AsyncFunctionDef) and item.name == "_call_tool"
+    ]
+    assert len(methods) == 1
+    method = methods[0]
+    tool_param = next(arg.arg for arg in method.args.args if arg.arg != "self")
+    direct_calls = [
+        stmt.value for stmt in method.body
+        if isinstance(stmt, ast.Expr) and _is_guard_call(stmt.value)
+    ]
+    assert direct_calls
+    assert any(
+        call.args and isinstance(call.args[0], ast.Name) and call.args[0].id == tool_param
+        for call in direct_calls
+    )
+
     assert ORDERS_HARD_DISABLED is True
-    with pytest.raises(RobinhoodWriteBlocked):
-        assert_mcp_tool_allowed("place_option_order")
+    for name in _BLOCKED_TOOLS:
+        with pytest.raises(RobinhoodWriteBlocked):
+            assert_mcp_tool_allowed(name)
     assert_mcp_tool_allowed("get_option_chains")
