@@ -578,33 +578,6 @@ def get_secret(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
 
 
-def _action_token(kind: str, decision_id: str) -> str | None:
-    """Per-decision one-tap approval credential = HMAC(CONTROL_TOKEN, "kind:decision_id").
-
-    Lets an approval notification link authorize ONLY that specific, already-vetted action —
-    without embedding the master CONTROL_TOKEN or requiring a dashboard login (so the phone one-tap
-    flow is preserved). ``kind`` (entry/close) domain-separates the two so a token for one can't
-    authorize the other. Returns None when no CONTROL_TOKEN is set -> the endpoints must refuse.
-    """
-    import hashlib
-    import hmac as _hmac
-
-    secret = get_secret("CONTROL_TOKEN")
-    if not is_usable_secret(secret):
-        return None
-    return _hmac.new(secret.encode(), f"{kind}:{decision_id}".encode(), hashlib.sha256).hexdigest()
-
-
-def entry_action_token(decision_id: str) -> str | None:
-    """One-tap token for approving a throttled ENTRY (places a real order)."""
-    return _action_token("entry", decision_id)
-
-
-def close_action_token(decision_id: str) -> str | None:
-    """One-tap token for approving a gated CLOSE (buys to close a real position)."""
-    return _action_token("close", decision_id)
-
-
 _dotenv_loaded = False
 
 

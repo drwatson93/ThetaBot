@@ -47,8 +47,8 @@ def describe_active_rules(
         "Robinhood quotes are treated as real-time. Alpaca needs feed=opra for live entry.")
 
     add("Hours", "Trading start", f"{_hhmm(s.trading_start)} America/New_York",
-        "No new entries, profit-target exits, stop-loss exits, DTE closes, signal closes, "
-        "rolls, or tax-reserve equity buys before this time.")
+        "Scans and exit alerts (profit-target, stop-loss, DTE, and signal closes) "
+        "wait until this time.")
     add("Hours", "Regular session", "09:30–16:00 ET on NYSE trading days",
         "Closed weekends, NYSE full-day holidays, and after 1:00 PM ET on early-close days. "
         "Quotes still refresh from 09:30; orders wait for the trading-start clock so the "

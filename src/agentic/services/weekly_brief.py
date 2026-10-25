@@ -240,21 +240,9 @@ def _management(open_positions, contexts, total_buying_power) -> list[str]:
     return lines
 
 
-def _reserve_and_unlocks(tax_reserve: dict | None, tier_proposals: list[dict] | None) -> list[str]:
-    """Tax reserve state + quality names that now fit the per-name cap (proposals, never auto-added)."""
+def _reserve_and_unlocks(tier_proposals: list[dict] | None) -> list[str]:
+    """Quality names that now fit the per-name cap (proposals, never auto-added)."""
     out: list[str] = []
-    tr = tax_reserve or {}
-    cfg = tr.get("config") or {}
-    if cfg.get("enabled"):
-        h, t, st = tr.get("holding") or {}, tr.get("totals") or {}, tr.get("status") or {}
-        out += ["## Tax reserve", "",
-                f"- Held: **${(h.get('value') or 0):,.2f}** in {cfg.get('symbol', 'SGOV')}"
-                + (f" ({h.get('shares'):,.4f} sh)" if h.get("shares") else "")
-                + " -- walled off from trading capital",
-                f"- Swept to date: ${(t.get('swept_dollars') or 0):,.2f} over {t.get('sweeps', 0)} sweep(s); "
-                f"net realized since the last sweep {(st.get('pending_net_since_last') or 0):+,.2f} "
-                f"-> next sweep would buy ${(st.get('would_sweep') or 0):,.2f}"
-                + (" (DRY RUN)" if cfg.get("dry_run") else ""), ""]
     if tier_proposals:
         out += ["## Capital unlocks", "",
                 "_Quality names whose one-contract collateral now fits under the per-name cap. "
@@ -301,7 +289,7 @@ def build_weekly_brief(
     tv_by_symbol: dict[str, dict], regime: dict | None, news_by_symbol: dict[str, str],
     accounts: list[dict], econ_events: list, now: datetime, ai_analysis: str | None = None,
     open_positions: list | None = None, total_buying_power: float | None = None,
-    tax_reserve: dict | None = None, tier_proposals: list[dict] | None = None,
+    tier_proposals: list[dict] | None = None,
 ) -> tuple[str, str]:
     """Return (title, markdown). Descriptive/informational only. ``ai_analysis`` is an optional
     Claude-written tactical synthesis rendered up top (fail-open — omitted when unavailable).
@@ -321,6 +309,6 @@ def build_weekly_brief(
     body += _setups_firing(watchlist, contexts)
     body += _watchlist(watchlist, contexts, _by_underlying(candidates), tv_by_symbol, news_by_symbol)
     body += _management(open_positions, contexts, total_buying_power)
-    body += _reserve_and_unlocks(tax_reserve, tier_proposals)
+    body += _reserve_and_unlocks(tier_proposals)
     body += _portfolio(accounts)
     return title, "\n".join(body)
