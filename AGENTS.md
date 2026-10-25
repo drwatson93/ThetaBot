@@ -140,8 +140,8 @@ through Hostinger); (c) they've run the desktop login (Step 1) and have a `data/
 |---|---|
 | `/health` fails / container restarts | check `docker compose logs`; usually a `.env` or `config.yaml` typo. |
 | Banner "degraded" / broker not connected | `data/rh_oauth.json` missing or expired → user re-runs desktop `rh_login`, re-uploads. |
-| No trades ever fire | normal if nothing clears the screen; check the dashboard's decision log for the rejecting gate, or lower `entry.criteria.min_annualized_yield`. |
-| "paused" won't trade | kill switch or loss breaker engaged → check `/api/ops` for the reason. |
+| No alerts | normal if nothing clears the screen; check the dashboard's decision log for the rejecting gate, or lower `entry.criteria.min_annualized_yield`. |
+| Paused | kill switch engaged → check `/api/ops` for the reason. New alerts stay pending until resume. |
 
 ## What NOT to do
 

@@ -486,7 +486,6 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 "consecutive_errors": ks.consecutive_errors(),
                 "auto_trip_after": deps.settings.auto_trip_after_errors,
             },
-            "loss_breaker": None,
             "loops": {
                 "monitor_poll": lag(AuditEventType.POLL, "monitor"),
                 "reconcile": lag(AuditEventType.RECONCILE, "reconcile"),
@@ -735,7 +734,6 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             except Exception:  # noqa: BLE001
                 setup_accuracy = None
             risk_profiles = dict(getattr(sc, "last_risk_profile", {}) or {}) if sc else None
-            tax_reserve = None
 
             # Open short options (for the management + assignment-capacity reads) and total buying
             # power across accounts. Drop paper positions in live mode.
@@ -770,7 +768,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 tv_by_symbol=tv_by_symbol, regime=regime, news_by_symbol=news_by_symbol,
                 accounts=accounts, econ_events=econ_events, now=now, ai_analysis=ai_analysis,
                 open_positions=open_positions, total_buying_power=total_bp,
-                tax_reserve=tax_reserve, tier_proposals=(list(getattr(sc, "last_tier_proposals", []) or []) if sc else []))
+                tier_proposals=(list(getattr(sc, "last_tier_proposals", []) or []) if sc else []))
             out = {"title": title, "body": body, "created_at": now.isoformat(),
                    "has_ai": ai_analysis is not None, "id": None}
             # Persist every generation so the brief can be re-read from a phone later without
@@ -840,7 +838,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         return {"holdings": [{
             "symbol": h.symbol, "shares": h.quantity, "average_cost": h.average_cost,
             "coverable": int(h.quantity // 100), "covered": covered.get(h.symbol, 0),
-            "reserve": False, "clock": clock.get(h.symbol),
+            "clock": clock.get(h.symbol),
         } for h in holds]}
 
     @router.get("/api/tiers")
@@ -1321,7 +1319,7 @@ _PAGE = """<!doctype html>
 
   <div class="ribbon">
     <div class="ribbon-top" id="conn-top"><span class="conn"><span class="dot"></span> Checking connection…</span></div>
-    <div class="ribbon-note" id="conn-note">This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.</div>
+    <div class="ribbon-note" id="conn-note">This banner turns <b>red</b> the moment the bot loses its Robinhood connection.</div>
   </div>
 
   <nav class="tabs" id="tabs">
@@ -1722,7 +1720,6 @@ async function loadConn(){
   const al = st.alerts || {};
   const alLabel = al.mode==="instant" ? "Alerts instant" : (al.mode==="regular" ? "Alerts regular" : (al.mode==="off" ? "Alerts off" : ""));
   const alChip = alLabel ? `<span class="chip ${al.mode==="instant"&&al.webhook_configured?"good":""}">${esc(alLabel)}</span>` : "";
-  const paper = bs.is_paper === true;
   let scanChip = "";
   if(sc){
     const lastAgo = sc.last_scan_at ? agoStr((Date.now()-new Date(sc.last_scan_at).getTime())/1000) : null;
@@ -1733,7 +1730,6 @@ async function loadConn(){
   }
   let klass="", label="", sub="";
   if(bs.read_error){ klass="bad"; label="Broker connection problem"; sub="· "+bs.read_error; }
-  else if(paper){ klass="warn"; label="Paper (simulation) mode"; sub="· no real orders"; }
   else if(bs.broker==="robinhood_mcp"){ klass=""; label="Connected to Robinhood"; sub="· read only"; }
   else { klass="warn"; label="Broker: "+esc(bs.broker||"unknown"); sub=""; }
   top.innerHTML = `<span class="conn ${klass}"><span class="dot"></span> ${esc(label)} <small>${esc(sub)}</small></span>
@@ -1746,7 +1742,7 @@ async function loadConn(){
     </div>`;
   note.innerHTML = (klass==="bad")
     ? `<b style="color:var(--neg)">Heads up:</b> the bot is not managing your real Robinhood positions right now.`
-    : `This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.`;
+    : `This banner turns <b>red</b> the moment the bot loses its Robinhood connection.`;
   const nd=$("nav-status"); if(nd) nd.className="nav-dot "+(klass||"good");
   renderAlerts(al);
 }

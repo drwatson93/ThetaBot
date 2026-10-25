@@ -26,9 +26,9 @@ It screens cash-secured puts on stocks you'd be happy to own and covered calls o
 4. [Setup overview](#setup-overview)
 5. [Step 1 — Robinhood account + one-time login](#step-1--robinhood-account--one-time-login)
 6. [Step 2 — Spin up a Hostinger VPS](#step-2--spin-up-a-hostinger-vps)
-7. [Host on Render (paper practice week)](#host-on-render-paper-practice-week)
+7. [Host on Render (read-only scanner)](#host-on-render-read-only-scanner)
 8. [Step 3 — Install & deploy](#step-3--install--deploy)
-9. [Step 4 — First run, paper → live](#step-4--first-run-paper--live)
+9. [Step 4 — First run](#step-4--first-run)
 10. [Configuration reference](#configuration-reference)
 11. [Accessing your dashboard securely](#accessing-your-dashboard-securely)
 12. [Optional integrations (Alpaca / TradingView)](#optional-integrations-for-different-setups)
@@ -220,15 +220,16 @@ On the VPS:
    nano config.yaml
    ```
 
-   The most important line to check first:
+   The lines to check first:
 
    ```yaml
-   mode: paper          # START HERE. Change to "live" only when you're ready.
    entry:
      enabled: true
      watchlist: [F, SOFI, ...]     # names you are happy to own
    market_data: robinhood          # default: all data from your Robinhood login (no Alpaca)
    ```
+
+   `mode` and `i_understand_live_trading` are ignored if an old file still has them. This build sends alerts and does not place orders.
 
    (Full options in the [Configuration reference](#configuration-reference).)
 

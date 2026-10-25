@@ -2,7 +2,7 @@
 
 The 5-minute version. Full detail: **[README.md](./README.md)**. Setting up with an AI assistant? Point it at **[AGENTS.md](./AGENTS.md)**.
 
-> ⚠️ This trades **real money** and can result in being assigned shares. Start in **paper mode**, use money you can afford to lose, and read the README's warnings. Not financial advice.
+> ⚠️ This build **scans and sends alerts**. It does not place orders. A human who trades an alert can still be assigned shares — only watch names you are willing to own. Read the README's warnings. Not financial advice.
 
 ## Before you start
 - A **Robinhood** account with **options enabled** + **agentic access** (set up in the Robinhood app).
@@ -25,14 +25,15 @@ curl -fsSL https://raw.githubusercontent.com/drwatson93/ThetaBot/main/scripts/bo
 ## 3. Configure
 ```bash
 nano ~/ThetaBot/.env           # set DASHBOARD_PASSWORD and CONTROL_TOKEN (optional PAUSE_TOKEN)
-nano ~/ThetaBot/config.yaml     # your watchlist; leave mode: paper for now
+nano ~/ThetaBot/config.yaml     # your watchlist; market_data: robinhood
 ```
 Upload your token from your computer:
 ```bash
 scp data/rh_oauth.json root@YOUR_VPS_IP:~/ThetaBot/data/
 ```
+`mode` and `i_understand_live_trading` are ignored if an old file still has them. The bot alerts; it does not place orders.
 
-## 4. Start (paper mode)
+## 4. Start
 ```bash
 cd ~/ThetaBot && docker compose up -d --build
 ```
@@ -43,5 +44,5 @@ ssh -L 8000:localhost:8000 root@YOUR_VPS_IP     # then open http://localhost:800
 ```
 Want a secure always-on URL instead? See **README → Accessing your dashboard securely** (Cloudflare Tunnel).
 
-## 6. Go live — only when you're ready
-Set **both** `mode: live` and `i_understand_live_trading: true` in `config.yaml`, then `docker compose up -d`. Start with a **small** account and a **short** watchlist. The dashboard is read-only; edit the yaml (not the UI) to change limits.
+## 6. Confirm it is scanning
+Open `http://localhost:8000/health`. You want `"orders_hard_disabled":true` and `"practice":true`. There is no live switch. Buying power for sizing is the broker's buying-power figure. Edit `config.yaml` (not the dashboard) to change the watchlist, then `docker compose up -d`.
