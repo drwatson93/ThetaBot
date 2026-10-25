@@ -45,7 +45,7 @@ def ctx(tmp_path, monkeypatch):
         )],
     )
 
-    # One open AAPL position, present in both the store and the (paper) broker.
+    # One open AAA position, present in both the store and the broker.
     pos = pb._default_seed()[0]
     positions.upsert(pos)
 
@@ -94,14 +94,14 @@ def test_health(ctx):
 
 
 def test_webhook_rejects_bad_token(ctx):
-    r = ctx["client"].post("/webhook/tradingview", json={"token": "wrong", "symbol": "AAPL"})
+    r = ctx["client"].post("/webhook/tradingview", json={"token": "wrong", "symbol": "AAA"})
     assert r.status_code == 401
     from agentic.domain.enums import SignalStatus
     assert ctx["signals"].list_by_status(SignalStatus.NEW) == []
 
 
 def test_webhook_queues_then_dedupes(ctx):
-    body = {"token": TOKEN, "action": "close", "symbol": "AAPL", "alert_id": "abc-1"}
+    body = {"token": TOKEN, "action": "close", "symbol": "AAA", "alert_id": "abc-1"}
     r1 = ctx["client"].post("/webhook/tradingview", json=body)
     assert r1.status_code == 202
     assert r1.json()["status"] == "queued"
@@ -116,9 +116,9 @@ def test_webhook_queues_then_dedupes(ctx):
 @pytest.mark.asyncio
 async def test_signal_to_approval_to_execution(ctx):
     client = ctx["client"]
-    # 1. Webhook enqueues a close signal for AAPL.
+    # 1. Webhook enqueues a close signal for AAA.
     r = client.post("/webhook/tradingview",
-                    json={"token": TOKEN, "action": "close", "symbol": "AAPL", "alert_id": "x1"})
+                    json={"token": TOKEN, "action": "close", "symbol": "AAA", "alert_id": "x1"})
     assert r.status_code == 202
 
     # 2. Monitor would call this each cycle; do it directly.
@@ -140,7 +140,7 @@ async def test_signal_to_approval_to_execution(ctx):
 async def test_reject_blocks_execution(ctx):
     client = ctx["client"]
     client.post("/webhook/tradingview",
-                json={"token": TOKEN, "action": "close", "symbol": "AAPL", "alert_id": "x2"})
+                json={"token": TOKEN, "action": "close", "symbol": "AAA", "alert_id": "x2"})
     await ctx["processor"].process_pending()
     decision_id = ctx["decisions"].list_by_status(DecisionStatus.PROPOSED)[0].id
 

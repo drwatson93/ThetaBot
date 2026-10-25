@@ -17,8 +17,8 @@ def _default_seed() -> list[Position]:
     today = utcnow().date()
     return [
         Position(
-            occ_symbol="AAPL" + (today + timedelta(days=30)).strftime("%y%m%d") + "C00250000",
-            underlying="AAPL",
+            occ_symbol="AAA" + (today + timedelta(days=30)).strftime("%y%m%d") + "C00250000",
+            underlying="AAA",
             option_type=OptionType.CALL,
             strategy=Strategy.COVERED_CALL,
             direction=Direction.SHORT,
@@ -33,12 +33,12 @@ def _default_seed() -> list[Position]:
             delta=0.30,
             iv=0.28,
             status=PositionStatus.OPEN,
-            broker_position_id="paper-aapl-cc",
+            broker_position_id="paper-aaa-cc",
             opened_at=utcnow(),
         ),
         Position(
-            occ_symbol="MSFT" + (today + timedelta(days=15)).strftime("%y%m%d") + "P00400000",
-            underlying="MSFT",
+            occ_symbol="BBB" + (today + timedelta(days=15)).strftime("%y%m%d") + "P00400000",
+            underlying="BBB",
             option_type=OptionType.PUT,
             strategy=Strategy.CASH_SECURED_PUT,
             direction=Direction.SHORT,
@@ -53,7 +53,7 @@ def _default_seed() -> list[Position]:
             delta=-0.18,
             iv=0.31,
             status=PositionStatus.OPEN,
-            broker_position_id="paper-msft-csp",
+            broker_position_id="paper-bbb-csp",
             opened_at=utcnow(),
         ),
     ]
