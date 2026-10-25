@@ -6,8 +6,8 @@ from contextlib import asynccontextmanager
 import pytest
 from fastapi.testclient import TestClient
 
-from agentic.brokers.live_guard import LiveOrderBlocked
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import LiveOrderBlocked
+from tests.fakes import PaperBroker
 from agentic.brokers.robinhood_mcp import (
     ORDERS_HARD_DISABLED,
     READ_ONLY_MCP_TOOLS,
@@ -21,13 +21,13 @@ from agentic.domain.enums import OrderStatus
 from agentic.domain.models import EntryDecision, Order
 from agentic.main import build_market_data
 from agentic.marketdata.quote import OptionContractQuote
-from agentic.services.executor import OrderExecutor
+from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
 from agentic.store.entry_decisions import EntryDecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -258,5 +258,5 @@ def test_paper_runtime_still_uses_paper_execution():
     md = build_market_data(settings, PaperBroker(seed_positions=[]))
     assert md is not None
     with pytest.raises(LiveOrderBlocked):
-        from agentic.brokers.live_guard import assert_live_order_allowed
+        from tests.fakes import assert_live_order_allowed
         assert_live_order_allowed(settings, kind="option")

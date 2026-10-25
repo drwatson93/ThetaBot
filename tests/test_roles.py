@@ -14,7 +14,7 @@ from agentic.services.killswitch import KillSwitch
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -75,29 +75,29 @@ def test_viewer_reads_and_owner_page_roles(tmp_path, viewer_env, monkeypatch):
     assert body["role"] == "viewer"
     assert "from_overlay" in body
     assert "overlay" in body
-    assert "tax_reserve" in body["editable"]
+    assert "tax_reserve" not in body["editable"]
     assert "trading_start" in body["editable"]
     assert "mode" not in body["editable"]
-    assert body["readonly"]["mode"] == "paper"
+    assert "mode" not in body["readonly"]
 
 
 def test_owner_edits_without_control_token(tmp_path, viewer_env, monkeypatch):
     client, audit = _app(tmp_path, monkeypatch)
     r = client.post(
         "/api/config",
-        json={"entry": {"watchlist": ["F"]}, "tax_reserve": {"pct": 0.25}, "trading_start": "10:30"},
+        json={"entry": {"watchlist": ["F"]}, "trading_start": "10:30"},
         auth=(OWNER_USER, OWNER_PASS),
     )
     assert r.status_code == 200
     assert r.json()["ok"] is True
     assert r.json()["role"] == "owner"
     assert r.json()["editable"]["entry"]["watchlist"] == ["F"]
-    assert r.json()["editable"]["tax_reserve"]["pct"] == 0.25
+    assert "tax_reserve" not in r.json()["editable"]
     assert r.json()["editable"]["trading_start"] == "10:30"
     row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
     assert row["payload"]["who"] == "owner"
     assert row["payload"]["values"]["entry.watchlist"] == {"old": [], "new": ["F"]}
-    assert row["payload"]["values"]["tax_reserve.pct"] == {"old": 0.2, "new": 0.25}
+    assert "tax_reserve.pct" not in row["payload"]["values"]
     assert row["payload"]["values"]["trading_start"] == {"old": "10:00", "new": "10:30"}
     blob = json.dumps(row)
     assert CONTROL not in blob
@@ -203,4 +203,5 @@ def test_mode_still_immutable_for_owner(tmp_path, monkeypatch):
     r = client.post("/api/config", json={"mode": "live", "i_understand_live_trading": True})
     assert r.status_code == 400
     assert "mode" in r.json()["error"]
-    assert client.get("/api/config").json()["readonly"]["mode"] == "paper"
+    body = client.get("/api/config").json()
+    assert "mode" not in body["editable"] and "mode" not in body["readonly"]

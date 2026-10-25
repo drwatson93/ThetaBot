@@ -1,8 +1,9 @@
-"""SignalProcessor: consume queued TradingView signals and route to close (Phase 3).
+"""SignalProcessor: consume queued TradingView signals and record the match.
 
-Runs each monitor cycle. For every NEW signal it: honors the TTL, matches the signal to
-open positions (see SignalMatcher), creates a deduped CloseDecision per match, and routes
-it — auto rules straight to the executor, approval-gated ones to the ApprovalGate.
+Runs each monitor cycle. For every NEW signal it honors the TTL, matches the signal to
+open positions (see SignalMatcher), and records a deduped CloseDecision. It does not
+place an order and it does not ask for approval. The webhook that enqueues the signal
+is unchanged.
 """
 from __future__ import annotations
 
@@ -16,8 +17,6 @@ from ..store.audit import AuditStore
 from ..store.decisions import DecisionStore
 from ..store.positions import PositionStore
 from ..store.signals import SignalStore
-from .approval import ApprovalGate
-from .executor import OrderExecutor
 
 log = logging.getLogger("agentic.signals")
 
@@ -55,8 +54,8 @@ class SignalProcessor:
         signals: SignalStore,
         positions: PositionStore,
         decisions: DecisionStore,
-        executor: OrderExecutor,
-        approval_gate: ApprovalGate,
+        executor,  # unused; kept so existing positional callers still line up
+        approval_gate,  # unused
         audit: AuditStore,
         matcher: SignalMatcher | None = None,
     ):
@@ -146,9 +145,9 @@ class SignalProcessor:
                  "requires_approval": m.requires_approval, "reason": m.reason},
                 source="signals", position_id=m.position.id, decision_id=decision.id,
             )
-            if m.requires_approval:
-                await self.approval_gate.request(m.position, decision)
-            else:
-                await self.executor.execute_close(m.position, decision)
+            log.info(
+                "Signal %s recorded for %s; no order placed",
+                sig.dedup_key, m.position.occ_symbol,
+            )
 
         self.signals.set_status(sig.id, SignalStatus.MATCHED)

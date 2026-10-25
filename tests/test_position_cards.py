@@ -20,7 +20,7 @@ from agentic.services.killswitch import KillSwitch
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -424,8 +424,6 @@ def test_hot_rules_edit_changes_the_plan_without_restart(tmp_path, monkeypatch):
     assert "50%" not in after["plan"]
     assert after["profit_pct"] == 0.8
     assert live.rules[0].params["profit_pct"] == 0.8
-    assert live.mode == "paper"
-    assert live.i_understand_live_trading is False
     # Money on the cards did not move when the rule changed.
     by = {row["underlying"]: row for row in after["positions"]}
     assert by["ZZZ"]["pnl_pct"] == 69

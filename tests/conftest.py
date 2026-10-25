@@ -35,9 +35,6 @@ def _order_window_open(monkeypatch):
     monkeypatch.setattr(
         "agentic.services.monitor.is_order_window", lambda *a, **k: True, raising=False
     )
-    monkeypatch.setattr(
-        "agentic.services.executor.is_order_window", lambda *a, **k: True, raising=False
-    )
 
 
 def _is_httpx_default_auth(auth) -> bool:

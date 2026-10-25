@@ -11,7 +11,7 @@ from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
 from agentic.store.news import NewsStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app

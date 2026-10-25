@@ -1,7 +1,7 @@
 """Phase 1: monitor evaluates rules, creates+notifies decisions, and dedups across cycles."""
 import pytest
 
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import DecisionStatus
 from agentic.marketdata.base import PaperMarketData
@@ -132,4 +132,7 @@ async def test_dte_close_action_executes(tmp_path):
 
     await monitor.run_once()
 
-    assert spy.closed and all(rule == "dte-close" for _occ, rule in spy.closed)
+    # Close actions are recorded and notified. The executor is not called.
+    assert spy.closed == []
+    proposed = decisions.list_by_status(DecisionStatus.PROPOSED)
+    assert proposed and all(d.rule_name == "dte-close" for d in proposed)

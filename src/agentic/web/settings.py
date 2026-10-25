@@ -62,7 +62,6 @@ EDITABLE_TOP_LEVEL = frozenset({
     "news",
     "roll",
     "reporting",
-    "tax_reserve",
     "notify",
     "rules",
 })
@@ -365,8 +364,6 @@ def _config_payload(settings: Settings, *, role: str | None = None) -> dict[str,
         "editable": _editable_view(settings),
         # Read-only context so the UI can SHOW (never edit) the safety-critical state.
         "readonly": {
-            "mode": settings.mode,
-            "live_armed": settings.is_live,
             "broker": settings.broker,
             "broker_fallback": settings.broker_fallback,
             "market_data": settings.market_data,

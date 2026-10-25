@@ -4,8 +4,7 @@ Each cycle (market-hours only, when entry.enabled): scan the watchlist for optio
 screen for CSP candidates, run the risk/sizing layer against live buying power + open
 positions, then record one alert per new play and send it on the webhook.
 
-The order path (``_submit``, the executor, the weekly throttle, approval parking) is still
-here. The scan does not call it.
+The scan records alerts. It does not place orders.
 """
 from __future__ import annotations
 
@@ -18,9 +17,8 @@ from ..config import Settings
 from ..brokers.base import ExecutionBroker
 from ..brokers.factory import broker_degraded
 from ..errors import describe_exception
-from ..domain.enums import AuditEventType, DecisionStatus, OrderStatus
-from ..domain.models import EntryDecision, TradeJournalEntry, utcnow
-from ..domain.order_pricing import pricing_kwargs
+from ..domain.enums import AuditEventType, DecisionStatus
+from ..domain.models import utcnow
 from ..marketdata.base import MarketDataProvider
 from ..marketdata.quote import OptionContractQuote
 from ..store.alerts import AlertStore
@@ -30,8 +28,7 @@ from ..store.trade_journal import TradeJournalStore
 from .alert_score import (
     as_utc, clears_anytime, exit_due, expiry_at, parse_time, play_pnl, profit_fraction,
 )
-from .risk_breaker import apply_sector_cap, evaluate_risk_breaker
-from .executor import OrderExecutor
+from .risk_breaker import apply_sector_cap
 from .killswitch import KillSwitch
 from .market_hours import is_market_hours, is_order_window
 from ..entry.context import UnderlyingContext, build_context, passes_underlying_gates
@@ -133,7 +130,7 @@ class OpportunityScanner:
         broker: ExecutionBroker,
         market_data: MarketDataProvider,
         entry_decisions: EntryDecisionStore,
-        executor: OrderExecutor,
+        executor,  # unused; kept so existing positional callers still line up
         audit: AuditStore,
         killswitch: KillSwitch,
         trade_journal: TradeJournalStore | None = None,
@@ -184,44 +181,18 @@ class OpportunityScanner:
         self.last_error: str | None = None
         self.last_scan_at = None
         self.last_regime: MarketRegime | None = None          # market-wide regime snapshot
-        self.last_breaker: dict | None = None                 # loss circuit breaker state (freezes new entries)
+        self.last_breaker: dict | None = None                 # gone with the loss circuit breaker
         self.last_setups: dict[str, dict] = {}                # per-symbol technical setup read (for /api/setups)
         self.last_risk_profile: dict[str, dict] = {}          # per-symbol strike-survival profile (daily)
-        self.last_reserve: dict | None = None                 # tax-reserve holding (caps only)
+        self.last_reserve: dict | None = None                 # tax reserve is gone
         self.last_csp_approved: list = []                     # sized CSPs from the latest scan
         self.last_cc_approved: list = []                      # sized CCs from the latest scan
         self.last_quotes: dict = {}                           # occ -> quote from the latest scan
         self.last_tier_proposals: list[dict] = []             # quality names the account can now afford
         self.last_cc_clock: dict[str, dict] = {}              # per held name: days since assignment, below-basis allowed
-        self.tax_reserve_store = None                         # set by main.py (ledger; for the dashboard)
         self._tiers_computed_on: str | None = None
         self._tier_prices: dict[str, float] = {}
         self.last_account_value: float | None = None
-
-    async def _reserve_value(self, holdings, reserve: set[str]) -> float:
-        """Market value of the tax-reserve holding (0 when none).
-
-        The price read is best-effort and falls back to cost basis. The caller
-        subtracts this from account value, which is the base for the per-name
-        and portfolio caps. Buying power passed to the sizer is the broker
-        figure, and this value is not taken out of it.
-        """
-        held = [h for h in holdings if h.symbol.upper() in reserve]
-        if not held:
-            self.last_reserve = None
-            return 0.0
-        h = held[0]
-        price = None
-        try:
-            price = await self.market_data.get_underlying_price(h.symbol)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("reserve price read failed for %s: %s", h.symbol, exc)
-        px = float(price) if price else float(h.average_cost or 0.0)
-        value = round(px * float(h.quantity), 2)
-        self.last_reserve = {"symbol": h.symbol, "shares": float(h.quantity), "price": px,
-                             "avg_cost": float(h.average_cost or 0.0), "value": value,
-                             "as_of": utcnow().isoformat()}
-        return value
 
     async def _refresh_tiers(self, account_value: float) -> None:
         """Once a day: which vetted quality names now fit under the per-name cap (proposal only)."""
@@ -319,28 +290,13 @@ class OpportunityScanner:
         book = self._account_broker()
         buying_power = await book.get_buying_power()
         account_value = await book.get_account_value()
-
-        # Loss circuit breaker: freeze NEW entries when realized losses pile up. Does NOT close
-        # anything — the monitor keeps managing/closing existing positions. Evaluated fresh each
-        # cycle (self-clearing as losing trades roll out of the window).
-        breaker = evaluate_risk_breaker(self.trade_journal, self.settings.risk, account_value, utcnow())
-        self.last_breaker = breaker
-        if breaker.get("tripped"):
-            log.warning("Loss circuit breaker ENGAGED — freezing new entries: %s", breaker["reason"])
-            return 0
+        self.last_breaker = None
 
         open_positions = await book.get_open_positions()
         holdings = await book.get_equity_positions()
         self.last_holdings = holdings
-
-        # The tax-reserve ETF is not written against. Its market value comes out of
-        # account value (the cap base) and stays inside buying power. CSP size uses
-        # the broker buying-power figure.
-        from .holdings import reserve_symbols, tradable_holdings
-        reserve = reserve_symbols(self.settings)
-        holdings_tradable = tradable_holdings(holdings, reserve)
-        reserve_val = await self._reserve_value(holdings, reserve)
-        account_value = max(0.0, account_value - reserve_val)
+        # Buying power is the broker figure. Nothing is subtracted for a tax reserve.
+        holdings_tradable = list(holdings)
         self.last_account_value = account_value
         await self._refresh_tiers(account_value)
 
@@ -501,7 +457,7 @@ class OpportunityScanner:
         self.last_context = context_by_underlying
         self.last_skips = skips
         cc_result = self.sizer.evaluate_covered_calls(
-            cc_cands, holdings=holdings_tradable, open_positions=open_positions, exclude=reserve,
+            cc_cands, holdings=holdings_tradable, open_positions=open_positions,
         )
         cc_approved = cc_result.approved
         self.last_scan_at = utcnow()
@@ -542,8 +498,6 @@ class OpportunityScanner:
         )
         log.info("Scan: CSP %d cand/%d approved; CC %d cand/%d approved.",
                  len(csp_cands), len(csp_approved), len(cc_cands), len(cc_approved))
-
-        self.expire_stale_entry_approvals()  # sweep any approval requests that timed out
 
         # The health gate already returned. Reconcile the positions this scan
         # already read, then grade and consider exits, then emit new plays.
@@ -949,173 +903,6 @@ class OpportunityScanner:
             log.warning("scan alert dispatch failed")
             return False
 
-    async def _submit(self, approved, quote_by_occ, rule_name: str, tag: str,
-                      review: bool = False, account_value: float = 0.0) -> int:
-        """Persist (dedup'd) + auto-execute a list of approved entries. Returns count submitted.
-
-        When ``review`` and AI is enabled, each entry is analyzed just before submission: the
-        verdict is stored (advisory) and, in veto mode, a 'skip' suppresses the entry. The AI never
-        widens risk — it only annotates or vetoes what the screen + sizer already approved.
-
-        Weekly premium throttle (CSP only, opt-in): once this week's collected premium reaches
-        weekly_premium_target_pct of account value, further entries are PARKED for one-tap approval
-        instead of auto-firing. Soft, not a hard cap.
-        """
-        today = utcnow().date().isoformat()
-        target_pct = self.settings.entry.weekly_premium_target_pct if review else 0.0
-        target_dollars = account_value * target_pct if target_pct > 0 else 0.0
-        collected = (self.entry_decisions.premium_collected_since(self._week_start_iso())
-                     if target_dollars > 0 else 0.0)
-        reviewed = 0
-        n = 0
-        for entry in approved:
-            c = entry.candidate
-            # Resolve the broker option id for live execution (paper returns None and is fine).
-            option_id = c.option_id or await self.broker.resolve_option_id(c.occ_symbol)
-            key_parts = [c.underlying, c.expiration.isoformat(), str(c.strike)]
-            if tag:
-                key_parts.append(tag)
-            key_parts.append(today)
-            decision = EntryDecision(
-                underlying=c.underlying,
-                occ_symbol=c.occ_symbol,
-                option_id=option_id,
-                strike=c.strike,
-                expiration=c.expiration,
-                contracts=entry.contracts,
-                premium=c.premium,
-                rule_name=rule_name,
-                reason=(f"{tag or 'CSP'} Δ={c.delta:.2f} dte={c.dte} "
-                        f"ann={c.annualized_ror:.0f}% {entry.contracts}x @ ~{c.premium:.2f}"),
-                dedup_key=":".join(key_parts),
-            )
-            if not self.entry_decisions.insert_if_new(decision):
-                continue  # already decided this contract today
-            self.audit.record(
-                AuditEventType.DECISION,
-                {"open": True, "kind": rule_name, "occ": decision.occ_symbol,
-                 "contracts": decision.contracts, "reason": decision.reason},
-                source="scanner", decision_id=decision.id,
-            )
-            quote = quote_by_occ.get(c.occ_symbol)
-            if quote is None:
-                self.entry_decisions.set_status(decision.id, DecisionStatus.FAILED)
-                continue
-
-            # AI trade review (advisory, entries only) — annotate, and in veto mode suppress a skip.
-            if (review and self.ai_reviewer is not None and self.settings.ai.enabled
-                    and reviewed < self.settings.ai.max_candidates_per_scan):
-                reviewed += 1
-                if await self._ai_veto(decision, c):
-                    continue  # veto mode + 'skip' -> do not execute
-
-            # Weekly premium throttle: over target -> hold for approval instead of auto-firing.
-            if target_dollars > 0 and collected >= target_dollars:
-                await self._park_for_approval(decision, c, collected, target_dollars)
-                continue
-
-            order = await self.executor.execute_open(decision, quote)
-            n += 1
-            # Journal real fills only (the labeled-dataset row; observe-only).
-            if order is not None and order.status == OrderStatus.FILLED:
-                collected += c.premium * decision.contracts * 100  # count premium just collected
-                if self.trade_journal is not None:
-                    await self._journal_fill(decision, c, quote, tag, order)
-        return n
-
-    def _week_start_iso(self) -> str:
-        """ISO timestamp for the start of the current week (Monday 00:00 UTC) — the throttle window."""
-        now = utcnow()
-        monday = (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-        return monday.isoformat()
-
-    async def _park_for_approval(self, decision, candidate, collected: float,
-                                 target: float) -> None:
-        """Hold an over-budget entry as AWAITING_APPROVAL and push a one-tap approve/reject alert."""
-        self.entry_decisions.set_status(decision.id, DecisionStatus.AWAITING_APPROVAL)
-        base = self.settings.public_base_url
-        # Per-decision token so the link authorizes only THIS trade and can't be replayed from a
-        # leaked decision id (executing a real order must not be unauthenticated).
-        from ..config import entry_action_token
-        tok = entry_action_token(decision.id) or ""
-        q = f"?t={tok}"
-        actions = [
-            {"action": "http", "label": "Approve",
-             "url": f"{base}/control/approve-entry/{decision.id}{q}", "method": "POST"},
-            {"action": "http", "label": "Reject",
-             "url": f"{base}/control/reject-entry/{decision.id}{q}", "method": "POST"},
-        ]
-        est = candidate.premium * decision.contracts * 100
-        mins = self.settings.approval_timeout_seconds // 60
-        title = f"Approve entry? {candidate.underlying} {candidate.strike:g}P"
-        msg = (f"Weekly premium target reached (${collected:.0f} / ${target:.0f}) — this one's held "
-               f"for your OK.\nSell {decision.contracts}x {decision.occ_symbol} for ~${est:.0f} "
-               f"(Δ={candidate.delta:.2f}, {candidate.dte}d, {candidate.annualized_ror:.0f}% ann).\n"
-               f"Approve within {mins} min (mode={self.settings.mode}).")
-        notifier = getattr(self.executor, "notifier", None)
-        if notifier is not None:
-            await notifier.send(title, msg, priority="high", actions=actions)
-        self.audit.record(
-            AuditEventType.DECISION,
-            {"open": True, "executed": False, "awaiting_approval": True,
-             "reason": "weekly premium target reached", "occ": decision.occ_symbol},
-            source="scanner", decision_id=decision.id,
-        )
-
-    async def _fresh_quote(self, underlying: str, occ: str):
-        try:
-            chain = await self.market_data.get_chain(underlying)
-            return next((c for c in chain if c.occ_symbol == occ), None)
-        except Exception:  # noqa: BLE001 — caller treats None as "no quote"
-            return None
-
-    async def approve_parked_entry(self, decision_id: str) -> dict:
-        """One-tap approve for a throttled entry: refetch a fresh quote and execute it."""
-        d = self.entry_decisions.get(decision_id)
-        if d is None:
-            return {"ok": False, "status": "not_found"}
-        if d.status == DecisionStatus.DONE:
-            return {"ok": True, "status": "already_done"}
-        if d.status != DecisionStatus.AWAITING_APPROVAL:
-            return {"ok": False, "status": "not_pending", "detail": d.status.value}
-        if utcnow() > d.created_at + timedelta(seconds=self.settings.approval_timeout_seconds):
-            self.entry_decisions.set_status(decision_id, DecisionStatus.EXPIRED)
-            return {"ok": False, "status": "expired"}
-        self.entry_decisions.set_status(decision_id, DecisionStatus.APPROVED)
-        quote = await self._fresh_quote(d.underlying, d.occ_symbol)
-        if quote is None:
-            self.entry_decisions.set_status(decision_id, DecisionStatus.FAILED)
-            return {"ok": False, "status": "no_quote"}
-        order = await self.executor.execute_open(d, quote)
-        ok = order is not None and order.status == OrderStatus.FILLED
-        return {"ok": ok, "status": "executed" if ok else "not_filled"}
-
-    async def reject_parked_entry(self, decision_id: str) -> dict:
-        d = self.entry_decisions.get(decision_id)
-        if d is None:
-            return {"ok": False, "status": "not_found"}
-        if d.status != DecisionStatus.AWAITING_APPROVAL:
-            return {"ok": False, "status": "not_pending", "detail": d.status.value}
-        self.entry_decisions.set_status(decision_id, DecisionStatus.REJECTED)
-        self.audit.record(
-            AuditEventType.DECISION,
-            {"open": True, "executed": False, "rejected": True, "occ": d.occ_symbol},
-            source="scanner", decision_id=decision_id,
-        )
-        return {"ok": True, "status": "rejected"}
-
-    def expire_stale_entry_approvals(self) -> int:
-        """Mark any AWAITING_APPROVAL entry past its window EXPIRED. Returns how many."""
-        now = utcnow()
-        window = timedelta(seconds=self.settings.approval_timeout_seconds)
-        n = 0
-        for d in self.entry_decisions.list_by_status(DecisionStatus.AWAITING_APPROVAL):
-            if now > d.created_at + window:
-                self.entry_decisions.set_status(d.id, DecisionStatus.EXPIRED)
-                n += 1
-        return n
-
     async def _refresh_news(self, watchlist: list[str]) -> None:
         """Pull recent headlines for the whole watchlist once per scan and store them (idempotent).
         Fail-open: no provider/store or any error is swallowed so news never breaks a scan."""
@@ -1357,66 +1144,7 @@ class OpportunityScanner:
         except Exception as exc:  # noqa: BLE001 — candidate logging must never break the scan
             log.warning("entry-candidate logging failed: %s", exc)
 
-    async def _journal_fill(self, decision: EntryDecision, candidate, quote, tag: str, order) -> None:
-        ctx = self.last_context.get(candidate.underlying)
-        context = {k: v for k, v in ctx.as_dict().items() if k != "symbol"} if ctx else {}
-        # Per-option greeks at entry (extensible context; feeds the refinement dataset).
-        context["theta"] = candidate.theta
-        context["gamma"] = candidate.gamma
-        context["theta_efficiency"] = candidate.theta_efficiency
-        # IV / realized-vol ratio at entry — the variance-risk-premium signal. >1 means implied vol
-        # exceeds the stock's actual movement, i.e. you're being paid MORE than the realized risk
-        # (the edge premium sellers harvest). Both inputs are already captured; persist the ratio so
-        # the analytics can test whether trades sold into a rich IV/RV actually pay off.
-        rv = ctx.realized_vol if ctx else None
-        context["iv_rv_ratio"] = (round(candidate.iv / rv, 3)
-                                  if (candidate.iv and rv and rv > 0) else None)
-        # Persist the MARKET REGIME at entry (previously computed then discarded). Premium-selling is
-        # highly regime-dependent, so this is the metadata most likely to reveal what conditions the
-        # strategy actually works in — the substrate for finding an edge.
-        reg = self.last_regime
-        if reg is not None:
-            context["mkt_regime"] = reg.label
-            context["mkt_risk_off"] = reg.risk_off
-            context["mkt_spy_vol"] = reg.spy_realized_vol
-            context["mkt_spy_drawdown_20d"] = reg.spy_drawdown_20d
-            context["mkt_spy_above_sma200"] = reg.spy_above_sma200
-            context["mkt_vix"] = reg.vix
-            context["mkt_vix_state"] = reg.vix_state
-        underlying_price = ctx.price if (ctx and ctx.price is not None) else None
-        if underlying_price is None:
-            try:
-                underlying_price = await self.market_data.get_underlying_price(candidate.underlying)
-            except Exception:  # noqa: BLE001 — price is best-effort context
-                underlying_price = None
-        snap = pricing_kwargs(order)
-        self.trade_journal.insert(TradeJournalEntry(
-            occ_symbol=candidate.occ_symbol,
-            underlying=candidate.underlying,
-            kind="CC" if tag == "CC" else "CSP",
-            contracts=decision.contracts,
-            strike=candidate.strike,
-            dte=candidate.dte,
-            delta=candidate.delta,
-            iv=candidate.iv,
-            premium=candidate.premium,
-            spread_pct=quote.spread_pct,
-            open_interest=candidate.open_interest,
-            volume=candidate.volume,
-            annualized_ror=candidate.annualized_ror,
-            underlying_price=underlying_price,
-            context=context,
-            entry_decision_id=decision.id,
-            order_type=snap["order_type"],
-            limit_price=snap["limit_price"],
-            bid=snap["bid"],
-            ask=snap["ask"],
-            mid=snap["mid"],
-            time_in_force=snap["time_in_force"],
-        ))
-
-    @staticmethod
-    def _atm_iv(chain: list[OptionContractQuote]) -> float | None:
+    def _atm_iv(self, chain: list[OptionContractQuote]) -> float | None:
         """IV of the contract nearest 0.50 |delta| (≈ at-the-money) — the IV-Rank seed."""
         best_iv: float | None = None
         best_dist: float | None = None

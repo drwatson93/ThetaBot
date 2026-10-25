@@ -2,20 +2,20 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from agentic.brokers import paper_broker as pb
-from agentic.brokers.paper_broker import PaperBroker
+import tests.fakes as pb
+from tests.fakes import PaperBroker
 from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import DecisionStatus, PositionStatus
 from agentic.marketdata.base import PaperMarketData
-from agentic.services.approval import ApprovalGate
-from agentic.services.executor import OrderExecutor
+from tests.fakes import ApprovalGate
+from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.services.signal_processor import SignalProcessor
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
 from agentic.store.entry_decisions import EntryDecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -124,8 +124,8 @@ async def test_signal_to_approval_to_execution(ctx):
     # 2. Monitor would call this each cycle; do it directly.
     await ctx["processor"].process_pending()
 
-    # 3. A decision is now AWAITING_APPROVAL (signals default to approval-gated).
-    pending = ctx["decisions"].list_by_status(DecisionStatus.AWAITING_APPROVAL)
+    # 3. A decision is recorded. The processor does not ask for approval or place an order.
+    pending = ctx["decisions"].list_by_status(DecisionStatus.PROPOSED)
     assert len(pending) == 1
     decision_id = pending[0].id
 
@@ -133,7 +133,7 @@ async def test_signal_to_approval_to_execution(ctx):
     assert client.post(f"/control/approve/{decision_id}", auth=None).status_code == 404
     assert client.post(f"/control/approve/{decision_id}").status_code == 404
     assert ctx["positions"].get_by_occ(ctx["occ"]).status == PositionStatus.OPEN
-    assert ctx["decisions"].get(decision_id).status == DecisionStatus.AWAITING_APPROVAL
+    assert ctx["decisions"].get(decision_id).status == DecisionStatus.PROPOSED
 
 
 @pytest.mark.asyncio
@@ -142,11 +142,11 @@ async def test_reject_blocks_execution(ctx):
     client.post("/webhook/tradingview",
                 json={"token": TOKEN, "action": "close", "symbol": "AAPL", "alert_id": "x2"})
     await ctx["processor"].process_pending()
-    decision_id = ctx["decisions"].list_by_status(DecisionStatus.AWAITING_APPROVAL)[0].id
+    decision_id = ctx["decisions"].list_by_status(DecisionStatus.PROPOSED)[0].id
 
     rr = client.post(f"/control/reject/{decision_id}")
     assert rr.status_code == 404
-    assert ctx["decisions"].get(decision_id).status == DecisionStatus.AWAITING_APPROVAL
+    assert ctx["decisions"].get(decision_id).status == DecisionStatus.PROPOSED
     assert ctx["positions"].get_by_occ(ctx["occ"]).status == PositionStatus.OPEN
 
 

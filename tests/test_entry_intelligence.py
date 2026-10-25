@@ -4,21 +4,21 @@ from datetime import timedelta
 import pytest
 from fastapi.testclient import TestClient
 
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.config import EntryConfig, EntryCriteria, Settings
 from agentic.domain.models import utcnow
 from agentic.entry.context import UnderlyingContext, build_context, passes_underlying_gates
 from agentic.store.tv_indicators import TVIndicatorStore
 from agentic.marketdata.base import MarketDataProvider
 from agentic.marketdata.quote import OptionContractQuote
-from agentic.services.executor import OrderExecutor
+from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.services.scanner import OpportunityScanner
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
 from agentic.store.entry_decisions import EntryDecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.store.trade_journal import TradeJournalStore
@@ -129,10 +129,10 @@ async def test_scanner_attaches_context_to_journal(tmp_path, monkeypatch):
     closes = [10 + i * 0.1 for i in range(260)]          # uptrend -> passes any gate
     sc, journal, *_ = _scanner(tmp_path, closes, CRIT)
     await sc.run_once()
-    # The scan only alerts. Drive the order path so the fill still journals this context.
-    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")
-    row = journal.recent()[0]
-    assert row.context.get("above_sma200") is True and row.context.get("rsi") == 100.0
+    # The scan records context on the name. It does not journal a fill.
+    ctx = sc.last_context["X"].as_dict()
+    assert journal.recent() == []
+    assert ctx.get("above_sma200") is True and ctx.get("rsi") == 100.0
 
 
 @pytest.mark.asyncio
@@ -153,9 +153,9 @@ async def test_scanner_overlays_tv_features_into_context(tmp_path, monkeypatch):
     closes = [10 + i * 0.1 for i in range(260)]          # uptrend -> enters, journals context
     sc, journal, *_ = _scanner(tmp_path, closes, CRIT, tv_seed={"adx": 31.5, "bb_percent_b": 62.0})
     await sc.run_once()
-    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")  # order path journals
-    row = journal.recent()[0]
-    assert row.context.get("adx") == 31.5 and row.context.get("bb_percent_b") == 62.0
+    ctx = sc.last_context["X"].as_dict()
+    assert journal.recent() == []
+    assert ctx.get("adx") == 31.5 and ctx.get("bb_percent_b") == 62.0
 
 
 @pytest.mark.asyncio
@@ -223,15 +223,15 @@ async def test_scanner_overlays_setups_into_context_and_cache(tmp_path, monkeypa
     closes = [10 + i * 0.1 for i in range(260)]          # uptrend -> enters, journals context
     sc, journal, *_ = _scanner(tmp_path, closes, CRIT)
     await sc.run_once()
-    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")  # order path journals
     read = sc.last_setups["X"]                           # cached for /api/setups
     assert set(read) >= {"flags", "features", "setups", "fired_now", "live", "bias", "score",
                          "primary", "partial_bar"}
     assert read["partial_bar"] is True                   # market open -> last bar treated as partial
-    row = journal.recent()[0]
-    assert isinstance(row.context.get("setups"), list)   # journaled automatically via as_dict()
-    assert row.context.get("setup_bias") in ("favorable", "avoid", "mixed", "none")
-    assert row.context.get("bb_percent_b") is not None   # bot-computed %B lands without TV
+    ctx = sc.last_context["X"].as_dict()
+    assert journal.recent() == []
+    assert isinstance(ctx.get("setups"), list)
+    assert ctx.get("setup_bias") in ("favorable", "avoid", "mixed", "none")
+    assert ctx.get("bb_percent_b") is not None   # bot-computed %B lands without TV
 
 
 @pytest.mark.asyncio
@@ -293,12 +293,11 @@ async def test_scanner_merges_fresh_tv_setup_flags(tmp_path, monkeypatch):
     (sc, journal, settings, killswitch, positions, orders, decisions,
      entry_decisions, audit, signals) = _scanner(tmp_path, closes, CRIT, tv_seed=seed)
     await sc.run_once()
-    await sc._submit(sc.last_csp_approved, sc.last_quotes, "csp-screener", "")  # order path journals
     ctx = sc.last_context["X"]
     assert "breakout_confirmed" in ctx.setups and ctx.live_breakout_attempt is True
     assert ctx.tv_setups["breakout"] is True and "tv_daily:breakout_confirmed" in ctx.setup_sources
-    row = journal.recent()[0]
-    assert "breakout_confirmed" in row.context["setups"]           # the merged read is what gets journaled
+    assert journal.recent() == []
+    assert "breakout_confirmed" in ctx.as_dict()["setups"]
     deps = WebDeps(settings=settings, signals=signals, killswitch=killswitch, approval_gate=None,
                    audit=audit, positions=positions, orders=orders, decisions=decisions,
                    entry_decisions=entry_decisions, scanner=sc, trade_journal=journal)

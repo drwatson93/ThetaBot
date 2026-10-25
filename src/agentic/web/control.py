@@ -242,8 +242,6 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         return {
             "paused": deps.killswitch.is_paused(),
             "reason": deps.killswitch.reason(),
-            "mode": deps.settings.mode,
-            "live_armed": deps.settings.is_live,
             "alerts": alerts_from_deps(deps).status(),
         }
 

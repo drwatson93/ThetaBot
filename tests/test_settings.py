@@ -9,15 +9,15 @@ from fastapi.testclient import TestClient
 from agentic.config import Settings, load_config, load_overlay, save_overlay
 from agentic.domain.enums import AuditEventType
 from agentic.entry.risk import RiskSizer
-from agentic.services.approval import ApprovalGate
-from agentic.services.executor import OrderExecutor
+from tests.fakes import ApprovalGate
+from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.marketdata.base import PaperMarketData
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -95,28 +95,24 @@ def test_protected_keys_rejected(tmp_path, patch):
     with pytest.raises(SettingsEditError):
         apply_patch(settings, patch, overlay_path=tmp_path / "o.yaml")
     # Nothing changed and nothing persisted.
-    assert settings.mode == "paper"
     assert settings.broker == "paper"
     assert not (tmp_path / "o.yaml").exists()
 
 
-def test_owner_can_edit_tax_reserve_and_trading_start(tmp_path):
+def test_owner_can_edit_trading_start(tmp_path):
     settings = Settings(broker="paper", market_data="paper")
     ov = tmp_path / "o.yaml"
     apply_patch(settings, {
-        "tax_reserve": {"dry_run": False, "pct": 0.3},
         "trading_start": "10:30",
         "entry": {"enabled": True},
         "roll": {"enabled": True},
     }, overlay_path=ov)
-    assert settings.tax_reserve.dry_run is False
-    assert settings.tax_reserve.pct == 0.3
     assert settings.trading_start == "10:30"
     assert settings.entry.enabled is True
     assert settings.roll.enabled is True
     saved = load_overlay(ov)
-    assert saved["tax_reserve"]["dry_run"] is False
     assert saved["trading_start"] == "10:30"
+    assert "tax_reserve" not in saved
 
 
 def test_invalid_value_rejected_and_not_applied(tmp_path):
@@ -149,8 +145,8 @@ def test_load_config_merges_overlay(tmp_path, monkeypatch):
     s = load_config(base)
     assert s.paper_buying_power == 25000
     assert s.entry.watchlist == ["F", "SOFI"]
-    # Base value not touched by the overlay stays put.
-    assert s.mode == "paper"
+    # An old file that still names mode loads. The key is not a setting.
+    assert not hasattr(s, "mode")
 
 
 def test_overlay_applies_strategy_keys_but_not_mode(tmp_path, monkeypatch, caplog):
@@ -180,11 +176,9 @@ def test_overlay_applies_strategy_keys_but_not_mode(tmp_path, monkeypatch, caplo
     }, ov)
     with caplog.at_level(logging.WARNING, logger="agentic.config"):
         s = load_config(base)
-    assert s.mode == "paper"
+    assert not hasattr(s, "mode")
     assert s.broker == "paper"
-    assert s.is_live is False
-    assert s.tax_reserve.dry_run is False
-    assert s.tax_reserve.pct == 0.99
+    assert not hasattr(s, "tax_reserve")
     assert s.trading_start == "09:30"
     assert s.entry.enabled is True
     assert s.entry.watchlist == ["F"]
@@ -230,13 +224,14 @@ def test_get_config_returns_editable_and_readonly(client):
     assert r.status_code == 200
     body = r.json()
     assert "entry" in body["editable"]
-    assert body["readonly"]["mode"] == "paper"
-    assert body["readonly"]["live_armed"] is False
+    assert "mode" not in body["readonly"]
+    assert "live_armed" not in body["readonly"]
+    assert body["readonly"]["broker"] == "paper"
     assert body["role"] == "owner"
     # The dangerous knobs are reported read-only, never in the editable set.
     assert "mode" not in body["editable"]
     assert "broker" not in body["editable"]
-    assert "tax_reserve" in body["editable"]
+    assert "tax_reserve" not in body["editable"]
     assert "trading_start" in body["editable"]
     assert body["from_overlay"] == []
     assert body["overlay"] == {}
@@ -312,7 +307,6 @@ def test_post_protected_edit_rejected_even_with_control_token(client, patch):
     r = c.post(f"/api/config?token={CONTROL}", json=patch)
     assert r.status_code == 400
     assert r.json()["ok"] is False
-    assert settings.mode == "paper"
     assert settings.broker == "paper"
 
 
@@ -338,10 +332,10 @@ def test_dashboard_settings_use_owner_login(client):
     assert 'id="wl-token"' not in html
     assert 'id="tn-token"' not in html
     assert 'id="al-token"' not in html
-    assert 'id="tn-tr-save"' in html
+    assert 'id="tn-tr-save"' not in html
     assert "Wrong CONTROL_TOKEN (unauthorized)." not in html
     assert "/api/config?token=" not in html
     assert "Dashboard is read-only. Edit config.yaml and restart." not in html
     assert "from_overlay" in html
     assert "view-only login" in html
-    assert "postConfig({tax_reserve" in html
+    assert "postConfig({tax_reserve" not in html

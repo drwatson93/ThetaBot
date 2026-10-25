@@ -167,9 +167,9 @@ async def render_weekly(settings, positions, orders, decisions, *, days: int = 7
     """Build the weekly report (trailing window + cumulative context + AI narrative). Shared by the
     scheduled loop and the /control/preview-weekly endpoint so both render identically."""
     pos = positions.list_all()
-    ords = orders.list_all()
+    ords = orders.list_all() if orders is not None else []
     decs = decisions.recent(1000)
-    real = settings.is_live  # live: report only real trades, not paper-soak history
+    real = False
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     week_stats = compute_stats(pos, ords, decs, since=cutoff, real_only=real)
     cumulative = compute_stats(pos, ords, decs, real_only=real)
@@ -200,9 +200,9 @@ class ReportingLoop:
 
     def _gather(self):
         pos = self.positions.list_all()
-        orders = self.orders.list_all()
+        orders = self.orders.list_all() if self.orders is not None else []
         decisions = self.decisions.recent(1000)
-        real = self.settings.is_live  # live: only real trades in the daily digest
+        real = False
         return (compute_stats(pos, orders, decisions, real_only=real),
                 position_rows(pos, orders, decisions, real_only=real))
 
@@ -231,7 +231,7 @@ class ReportingLoop:
                         from ..brokers.factory import broker_degraded
                         degraded = broker_degraded(self.settings, brk)
                     title, msg = build_daily_digest(
-                        stats=stats, rows=rows, scanner=self.scanner, mode=self.settings.mode,
+                        stats=stats, rows=rows, scanner=self.scanner, mode="read-only",
                         tv_health=tv_health, degraded=degraded)
                     await self.notifier.send(title, msg)
                     self._last_daily = cur.date()

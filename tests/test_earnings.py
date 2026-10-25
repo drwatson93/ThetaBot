@@ -14,7 +14,7 @@ from agentic.marketdata.earnings import (
     earnings_blackout,
     parse_next_earnings,
 )
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.marketdata.base import PaperMarketData
 from agentic.services.killswitch import KillSwitch
 from agentic.services.scanner import OpportunityScanner

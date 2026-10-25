@@ -1,13 +1,11 @@
 """Phase 0 end-to-end (paper): monitor sync + reconcile discovery/closed-detection."""
 import pytest
 
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.config import Settings
-from agentic.domain.enums import PositionStatus
 from agentic.marketdata.base import PaperMarketData
 from agentic.services.killswitch import KillSwitch
 from agentic.services.monitor import MonitorLoop
-from agentic.services.reconcile import ReconcileLoop
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.positions import PositionStore
@@ -36,26 +34,6 @@ async def test_monitor_syncs_positions_into_store(wiring):
     assert all(p.current_mark is not None for p in stored)
     # A POLL audit event was recorded.
     assert any(e["event_type"] == "POLL" for e in audit.recent())
-
-
-@pytest.mark.asyncio
-async def test_reconcile_discovers_then_detects_external_close(wiring):
-    db, audit, positions, killswitch, broker, settings = wiring
-    reconcile = ReconcileLoop(settings, broker, positions, audit)
-
-    diff = await reconcile.run_once()
-    assert len(diff["discovered"]) == 2
-    assert len(positions.list_open()) == 2
-
-    # Simulate the user closing one position outside the system.
-    broker._positions.popitem()
-    diff2 = await reconcile.run_once()
-    assert len(diff2["gone"]) == 1
-    # The gone position (still pre-expiration) is classified CLOSED; one remains open.
-    assert diff2["gone"][0]["status"] == PositionStatus.CLOSED.value
-    statuses = [p.status for p in positions.list_open()]
-    assert PositionStatus.CLOSED not in statuses
-    assert len(statuses) == 1
 
 
 def test_killswitch_persists(wiring):

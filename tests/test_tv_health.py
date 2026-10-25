@@ -8,7 +8,7 @@ from agentic.services.tv_health import build_tv_health, tv_health_digest_line
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.store.tv_indicators import TVIndicatorStore

@@ -13,12 +13,10 @@ from typing import Any
 from fastapi import FastAPI
 
 from ..config import Settings
-from ..services.approval import ApprovalGate
 from ..services.killswitch import KillSwitch
 from ..store.audit import AuditStore
 from ..store.decisions import DecisionStore
 from ..store.entry_decisions import EntryDecisionStore
-from ..store.orders import OrderStore
 from ..store.positions import PositionStore
 from ..store.signals import SignalStore
 from ..store.trade_journal import TradeJournalStore
@@ -35,10 +33,10 @@ class WebDeps:
     settings: Settings
     signals: SignalStore
     killswitch: KillSwitch
-    approval_gate: ApprovalGate
+    approval_gate: Any | None
     audit: AuditStore
     positions: PositionStore
-    orders: OrderStore
+    orders: Any | None
     decisions: DecisionStore
     entry_decisions: EntryDecisionStore | None = None
     scanner: Any | None = None   # OpportunityScanner (loose type to avoid an import cycle)
@@ -49,9 +47,7 @@ class WebDeps:
     entry_candidates: Any | None = None  # store.entry_candidates.EntryCandidateStore
     news: Any | None = None         # store.news.NewsStore (advisory news/catalyst channel)
     briefs: Any | None = None       # store.briefs.BriefStore (saved weekly briefs)
-    tax_reserve: Any | None = None   # services.tax_reserve.TaxReserveLoop (status for the dashboard)
-    tax_reserve_store: Any | None = None  # store.tax_reserve.TaxReserveStore
-    practice: dict | None = None     # paper-runtime snapshot (data source + RH connect)
+    practice: dict | None = None     # read-only snapshot (data source + RH connect)
     trade_alerts: Any | None = None  # notify.trade_alerts.TradeAlerts
 
 

@@ -1,7 +1,6 @@
-"""Entrypoint: build the app graph and run the monitor + reconcile loops.
+"""Entrypoint: build the app graph and run the monitor and scanner loops.
 
-Phase 0: read-only monitoring in paper mode. The FastAPI webhook/control server is
-added in Phase 3; for now this runs the two async background loops until interrupted.
+The process reads Robinhood and sends alerts. It does not place orders.
 """
 from __future__ import annotations
 
@@ -20,15 +19,9 @@ from .marketdata.news import build_news_provider
 from .notify.factory import build_notifier
 from .notify.trade_alerts import TradeAlerts
 from .rules.engine import RulesEngine
-from .services.approval import ApprovalGate
-from .services.executor import OrderExecutor
 from .services.killswitch import KillSwitch
 from .services.monitor import MonitorLoop
-from .services.reconcile import ReconcileLoop
 from .services.reporting import ReportingLoop
-from .services.tax_reserve import TaxReserveLoop
-from .store.tax_reserve import TaxReserveStore
-from .services.roll import RollManager
 from .services.scanner import OpportunityScanner
 from .services.signal_processor import SignalProcessor
 from .ai.client import build_reviewer_client
@@ -41,7 +34,6 @@ from .store.entry_candidates import EntryCandidateStore
 from .store.briefs import BriefStore
 from .store.setup_events import SetupEventStore
 from .store.entry_decisions import EntryDecisionStore
-from .store.orders import OrderStore
 from .store.positions import PositionStore
 from .store.signals import SignalStore
 from .store.trade_journal import TradeJournalStore
@@ -58,12 +50,6 @@ async def connect_brokers(settings: Settings):
     session for chains and quotes, or None. ``read_session`` is that Robinhood
     session even when the probe failed, so the scanner can fail closed on it.
     """
-    if settings.is_live:
-        broker = await build_broker(settings)
-        read_session = broker if hasattr(broker, "_call_tool") else None
-        connected = read_session is not None and getattr(read_session, "_connected", False)
-        data_broker = read_session if connected else None
-        return broker, data_broker, read_session
     return await build_paper_runtime(settings)
 
 
@@ -108,8 +94,7 @@ def build_market_data(settings: Settings, broker=None) -> MarketDataProvider:
 def build_web_server(settings, signals, killswitch, approval_gate, audit,
                      positions, orders, decisions, entry_decisions, scanner, trade_journal,
                      tv_indicators=None, ai_reviews=None, notifier=None, entry_candidates=None,
-                     news=None, briefs=None, tax_reserve=None, tax_reserve_store=None,
-                     practice=None, trade_alerts=None):
+                     news=None, briefs=None, practice=None, trade_alerts=None):
     """Build a uvicorn Server for the control/webhook/dashboard API, or None if disabled."""
     if not settings.web.enabled:
         log.info("Web API disabled (web.enabled=false).")
@@ -137,7 +122,6 @@ def build_web_server(settings, signals, killswitch, approval_gate, audit,
         entry_decisions=entry_decisions, scanner=scanner, trade_journal=trade_journal,
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
         entry_candidates=entry_candidates, news=news, briefs=briefs,
-        tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
         practice=practice, trade_alerts=trade_alerts,
     )
     app = create_app(deps)
@@ -152,12 +136,6 @@ async def main_async(config_path: str | None = None) -> None:
     require_runtime_secrets()
     settings = load_config(config_path)
 
-    if settings.mode == "live" and not settings.i_understand_live_trading:
-        log.warning(
-            "mode=live but i_understand_live_trading is false — running read-only. "
-            "Set i_understand_live_trading: true to arm live trading."
-        )
-
     db = Database(settings.db_path)
     audit = AuditStore(db)
     positions = PositionStore(db)
@@ -169,10 +147,8 @@ async def main_async(config_path: str | None = None) -> None:
     tv_indicators = TVIndicatorStore(db)
     news = NewsStore(db)
     briefs = BriefStore(db)
-    tax_reserve_store = TaxReserveStore(db)
     ai_reviews = AIReviewStore(db)
     ai_reviewer = AIReviewer(settings.ai, build_reviewer_client(settings.ai))
-    orders = OrderStore(db)
     signals = SignalStore(db)
     killswitch = KillSwitch(db, audit, auto_trip_threshold=settings.auto_trip_after_errors)
 
@@ -186,13 +162,8 @@ async def main_async(config_path: str | None = None) -> None:
     notifier = build_notifier(settings)
     trade_alerts = TradeAlerts(db, audit, settings)
     rules_engine = RulesEngine.from_configs(settings.rules)
-    executor = OrderExecutor(
-        settings, broker, market_data, positions, orders, decisions, audit, killswitch,
-        notifier=notifier, entry_decisions=entry_decisions, trade_journal=trade_journal,
-        trade_alerts=trade_alerts,
-    )
     scanner = make_scanner(
-        settings, broker, market_data, read_session, entry_decisions, executor, audit,
+        settings, broker, market_data, read_session, entry_decisions, None, audit,
         killswitch,
         trade_journal=trade_journal, ai_reviewer=ai_reviewer, tv_indicators=tv_indicators,
         ai_reviews=ai_reviews, earnings=build_earnings_provider(settings, data_broker or broker),
@@ -201,11 +172,8 @@ async def main_async(config_path: str | None = None) -> None:
         news_provider=build_news_provider(settings), news=news,
         setup_events=setup_events, trade_alerts=trade_alerts,
     )
-    approval_gate = ApprovalGate(
-        settings, decisions, positions, executor, audit, notifier=notifier
-    )
     signal_processor = SignalProcessor(
-        settings, signals, positions, decisions, executor, approval_gate, audit
+        settings, signals, positions, decisions, None, None, audit
     )
 
     caps = broker.capabilities()
@@ -216,13 +184,11 @@ async def main_async(config_path: str | None = None) -> None:
         "execution_broker": caps.name,
         "market_data": md_effective,
         "robinhood_connected": rh_connected,
-        "practice": (not settings.is_live),
+        "practice": True,
     }
     log.info(
-        "Starting AgenticRobinhood: mode=%s live_armed=%s broker=%s options=%s "
-        "data=%s robinhood_connected=%s",
-        settings.mode, settings.is_live, caps.name, caps.supports_options_orders,
-        md_effective, rh_connected,
+        "Starting AgenticRobinhood: broker=%s options=%s data=%s robinhood_connected=%s",
+        caps.name, caps.supports_options_orders, md_effective, rh_connected,
     )
     # Loud alarm for the "looks live but isn't" state: live-armed, but the broker fell back to
     # paper (RH connect failed). The bot is not managing the real account — page the operator.
@@ -236,39 +202,22 @@ async def main_async(config_path: str | None = None) -> None:
         except Exception as exc:  # noqa: BLE001 — alert must not block startup
             log.warning("degraded-broker alert failed to send: %s", exc)
 
-    roll_manager = RollManager(
-        settings, broker, market_data, executor, decisions, entry_decisions, audit,
-        notifier=notifier,
-    )
     monitor = MonitorLoop(
         settings, broker, market_data, positions, audit, killswitch,
         rules_engine=rules_engine, decisions=decisions, notifier=notifier,
-        executor=executor, signal_processor=signal_processor, approval_gate=approval_gate,
-        roll_manager=roll_manager,
+        signal_processor=signal_processor,
     )
-    reconcile = ReconcileLoop(
-        settings, broker, positions, audit, orders=orders, killswitch=killswitch,
-        notifier=notifier, trade_journal=trade_journal, entry_decisions=entry_decisions,
-        market_data=market_data, decisions=decisions,
-    )
-
-    tax_reserve = TaxReserveLoop(
-        settings, broker, market_data, trade_journal, tax_reserve_store, audit, killswitch,
-        notifier=notifier,
-    )
-    scanner.tax_reserve_store = tax_reserve_store
 
     web_server = build_web_server(
-        settings, signals, killswitch, approval_gate, audit,
-        positions, orders, decisions, entry_decisions, scanner, trade_journal,
+        settings, signals, killswitch, None, audit,
+        positions, None, decisions, entry_decisions, scanner, trade_journal,
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
         entry_candidates=entry_candidates, news=news, briefs=briefs,
-        tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
         practice=practice, trade_alerts=trade_alerts,
     )
 
     reporting = ReportingLoop(
-        settings, positions, orders, decisions, notifier,
+        settings, positions, None, decisions, notifier,
         scanner=scanner, trade_journal=trade_journal, tv_indicators=tv_indicators,
     )
 
@@ -279,10 +228,8 @@ async def main_async(config_path: str | None = None) -> None:
         log.info("Shutdown requested.")
         stop_event.set()
         monitor.stop()
-        reconcile.stop()
         scanner.stop()
         reporting.stop()
-        tax_reserve.stop()
         if web_server is not None:
             web_server.should_exit = True
 
@@ -293,9 +240,8 @@ async def main_async(config_path: str | None = None) -> None:
         except (NotImplementedError, AttributeError):
             pass
 
-    tasks = [asyncio.create_task(monitor.run()), asyncio.create_task(reconcile.run())]
+    tasks = [asyncio.create_task(monitor.run())]
     tasks.append(asyncio.create_task(reporting.run()))
-    tasks.append(asyncio.create_task(tax_reserve.run()))
     if settings.entry.enabled:
         log.info("Entry scanner ENABLED (watchlist=%d, feed=%s).",
                  len(settings.entry.watchlist), settings.entry.feed)
