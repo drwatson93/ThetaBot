@@ -142,10 +142,14 @@ async def test_scan_is_idempotent(ctx):
 
 
 @pytest.mark.asyncio
-async def test_killswitch_blocks_scan(ctx):
+async def test_killswitch_holds_the_scan_alert(ctx):
+    # Pause no longer skips the scan. It leaves the alert pending and places no order.
     ctx["killswitch"].pause("test")
-    assert await ctx["scanner"].run_once() == 0
+    assert await ctx["scanner"].run_once() == 1
+    alerts = ctx["scanner"].alerts.all()
+    assert len(alerts) == 1 and alerts[0]["delivery_status"] == "pending"
     assert ctx["entry_decisions"].recent() == []
+    assert ctx["orders"].list_all() == []
 
 
 @pytest.mark.asyncio

@@ -303,13 +303,14 @@ class OpportunityScanner:
         cfg = self.settings.entry
         if not cfg.enabled:
             return 0
-        if self.killswitch.is_paused():
-            log.debug("Scanner skipped: killswitch paused.")
-            return 0
+        # Pause does not skip the scan. It mutes the webhook in _emit_play.
+        # Unsent CSP, CC, and exit rows stay pending or failed, and the next
+        # unpaused scan posts each one once even if that scan does not approve it.
+        # A closed session still records a skipped row so /health can see the loop.
         if not is_market_hours():
-            return 0
+            return self._skip_scan("market_closed")
         if not is_order_window(start=self.settings.trading_start):
-            return 0
+            return self._skip_scan("outside_window")
         if self._broker_down():
             return self._skip_scan("broker degraded")
 
@@ -844,21 +845,36 @@ class OpportunityScanner:
         """Insert a new play once, and deliver it.
 
         Returns ``(inserted, confirmed)``. A row that is already ``sent`` is
-        left alone. A ``pending`` or ``failed`` row is posted again. ``confirmed``
-        counts only webhooks ``_deliver`` accepted.
+        left alone. A ``pending`` or ``failed`` row is posted again, including
+        one this scan did not approve. ``confirmed`` counts only webhooks
+        ``_deliver`` accepted. Pause is checked inside ``_emit_play``.
         """
         inserted = 0
         confirmed = 0
+        touched: set[str] = set()
         for entry in approved:
             c = entry.candidate
             quote = quote_by_occ.get(c.occ_symbol)
             if quote is None:
                 continue
+            dedup_key = f"{kind}:{c.underlying}:{c.occ_symbol}"
             n_ins, n_ok = await self._emit_play(
-                dedup_key=f"{kind}:{c.underlying}:{c.occ_symbol}",
+                dedup_key=dedup_key,
                 kind=kind, underlying=c.underlying, occ=c.occ_symbol,
                 strike=c.strike, expiration=c.expiration, contracts=entry.contracts,
                 premium=c.premium, bid=quote.bid, ask=quote.ask, mid=c.premium,
+            )
+            touched.add(dedup_key)
+            inserted += n_ins
+            confirmed += n_ok
+        for row in self.alerts.unsent(kind):
+            if row["dedup_key"] in touched:
+                continue
+            n_ins, n_ok = await self._emit_play(
+                dedup_key=row["dedup_key"], kind=kind, underlying=row["underlying"],
+                occ=row["occ_symbol"], strike=row["strike"], expiration=row["expiration"],
+                contracts=row["contracts"], premium=row.get("premium"),
+                bid=row.get("bid"), ask=row.get("ask"), mid=row.get("premium"),
             )
             inserted += n_ins
             confirmed += n_ok
@@ -893,6 +909,10 @@ class OpportunityScanner:
             inserted = 1
         else:
             alert_id = existing["id"]
+        if self.killswitch.is_paused():
+            # Hold the row. pending stays pending; failed stays failed.
+            # Neither is posted, so a paused scan cannot burn the one send.
+            return inserted, 0
         ok = await self._send_alert(
             alert_id, kind, underlying=underlying, occ=occ, strike=strike,
             expiration=expiration, contracts=contracts, bid=bid, ask=ask, mid=mid,

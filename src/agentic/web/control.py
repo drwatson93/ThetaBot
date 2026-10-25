@@ -1,7 +1,5 @@
-"""Control endpoints: one-tap approval and the kill switch.
+"""Control endpoints: the kill switch and owner settings.
 
-  POST /control/approve/{decision_id}   -> approve a parked close (executes it)
-  POST /control/reject/{decision_id}    -> reject it
   POST /control/pause                    -> engage the kill switch (Basic + CONTROL_TOKEN)
   POST /control/pause-only               -> engage the kill switch (PAUSE_TOKEN only)
   POST /control/resume                   -> release it (Basic + CONTROL_TOKEN)
@@ -11,9 +9,9 @@
 
 Owner mutations (pause/resume/alerts/…) accept owner Basic **or** CONTROL_TOKEN.
 ``/control/pause-only`` is the exception: it skips dashboard login so a monitoring bot
-can fail-closed pause with PAUSE_TOKEN, which cannot resume or approve anything.
-View-only login gets 403 on every mutation. One-tap approve/reject still use a
-per-decision HMAC (viewers are 403).
+can fail-closed pause with PAUSE_TOKEN, which cannot resume or change alerts.
+View-only login gets 403 on every mutation. Approve, close, and roll actions are
+not on this router.
 """
 from __future__ import annotations
 
@@ -27,7 +25,7 @@ from fastapi.responses import JSONResponse, Response
 
 from ..config import get_secret, is_usable_secret
 from ..domain.enums import AuditEventType
-from .auth import deny_viewer, require_auth, require_owner
+from .auth import require_auth, require_owner
 
 if TYPE_CHECKING:
     from .app import WebDeps
@@ -64,41 +62,6 @@ def _record_pause_auth_fail(key: str) -> None:
 
 def make_control_router(deps: "WebDeps") -> APIRouter:
     router = APIRouter(prefix="/control")
-
-    def _close_action_authorized(decision_id: str, token: str | None) -> bool:
-        # Buying to close a real position must not be unauthenticated: require the per-decision
-        # token (refuse if no CONTROL_TOKEN or on mismatch).
-        from ..config import close_action_token
-        expected = close_action_token(decision_id)
-        return bool(expected) and bool(token) and hmac.compare_digest(token, expected)
-
-    @router.post("/approve/{decision_id}")
-    async def approve(
-        decision_id: str,
-        t: str | None = None,
-        role: str | None = Depends(deny_viewer),
-    ) -> JSONResponse:
-        if role != "owner" and not _close_action_authorized(decision_id, t):
-            return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
-        result = await deps.approval_gate.approve(decision_id)
-        return JSONResponse(
-            {"status": result.status, "detail": result.detail, "ok": result.ok},
-            status_code=200 if result.ok else 409,
-        )
-
-    @router.post("/reject/{decision_id}")
-    async def reject(
-        decision_id: str,
-        t: str | None = None,
-        role: str | None = Depends(deny_viewer),
-    ) -> JSONResponse:
-        if role != "owner" and not _close_action_authorized(decision_id, t):
-            return JSONResponse({"status": "unauthorized", "ok": False}, status_code=401)
-        result = await deps.approval_gate.reject(decision_id)
-        return JSONResponse(
-            {"status": result.status, "detail": result.detail, "ok": result.ok},
-            status_code=200 if result.ok else 409,
-        )
 
     @router.post("/pause", dependencies=[Depends(require_owner)])
     async def pause(reason: str = "manual") -> JSONResponse:
@@ -194,42 +157,6 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
             )
         result = await AIReviewer(cfg, client).selftest()
         return JSONResponse(result, status_code=200)
-
-    def _entry_action_authorized(decision_id: str, token: str | None) -> bool:
-        # Trade-executing endpoint: require the per-decision HMAC token (refuse if unset/mismatch).
-        from ..config import entry_action_token
-        expected = entry_action_token(decision_id)
-        return bool(expected) and bool(token) and hmac.compare_digest(token, expected)
-
-    @router.post("/approve-entry/{decision_id}")
-    async def approve_entry(
-        decision_id: str,
-        t: str | None = None,
-        role: str | None = Depends(deny_viewer),
-    ) -> JSONResponse:
-        """One-tap approve for an entry the weekly-premium throttle held back.
-
-        Authorized by owner login or a per-decision token (?t=), not the guessable/leakable
-        decision id alone, because approving places a REAL order."""
-        if role != "owner" and not _entry_action_authorized(decision_id, t):
-            return JSONResponse({"ok": False, "status": "unauthorized"}, status_code=401)
-        if deps.scanner is None:
-            return JSONResponse({"ok": False, "status": "no_scanner"}, status_code=503)
-        result = await deps.scanner.approve_parked_entry(decision_id)
-        return JSONResponse(result, status_code=200 if result.get("ok") else 409)
-
-    @router.post("/reject-entry/{decision_id}")
-    async def reject_entry(
-        decision_id: str,
-        t: str | None = None,
-        role: str | None = Depends(deny_viewer),
-    ) -> JSONResponse:
-        if role != "owner" and not _entry_action_authorized(decision_id, t):
-            return JSONResponse({"ok": False, "status": "unauthorized"}, status_code=401)
-        if deps.scanner is None:
-            return JSONResponse({"ok": False, "status": "no_scanner"}, status_code=503)
-        result = await deps.scanner.reject_parked_entry(decision_id)
-        return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
     @router.post("/preview-weekly", dependencies=[Depends(require_owner)])
     async def preview_weekly() -> JSONResponse:
