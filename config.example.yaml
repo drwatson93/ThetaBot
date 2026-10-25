@@ -1,24 +1,17 @@
 # Copy to config.yaml and adjust. Behavior/config only — NO secrets (those live in .env).
 
-# paper | live   (live also requires i_understand_live_trading: true)
-mode: paper
-i_understand_live_trading: false
-
-# Which execution broker to use: paper | robinhood_mcp | robinstocks | alpaca
-broker: robinhood_mcp    # this edition trades via Robinhood
-# If the chosen broker can't trade options, fall back to this one (or null to stay read-only).
-broker_fallback: paper
+# This build does not place orders. An old file may still contain mode,
+# i_understand_live_trading, tax_reserve, or loss_breaker_* — those keys are ignored.
+# The only broker session is Robinhood, and it is read-only.
+broker: robinhood_mcp
+broker_fallback: null
 
 # Market data provider: robinhood | alpaca | paper  (see README > Optional integrations)
 market_data: robinhood     # default: pull all data from the SAME Robinhood login (no Alpaca needed)
 
-# Simulated buying power the paper broker reports — set to your REAL account size so the
-# paper soak sizes positions realistically (default 100000 is a large sandbox balance).
+# Unused by the read-only Robinhood session. Left so an old file still loads.
 paper_buying_power: 100000
-# Seed fake demo positions into the paper broker. Leave true for local dev; set FALSE on a real
-# paper soak — the demo fixtures otherwise inject phantom collateral that blocks entry sizing
-# and show up as fake positions/P&L on the dashboard.
-paper_seed_positions: true
+paper_seed_positions: false
 
 # Loop cadences (seconds)
 poll_interval_seconds: 60          # monitor loop during market hours
@@ -26,7 +19,7 @@ poll_interval_closed_seconds: 300  # monitor loop when market closed
 reconcile_interval_seconds: 300
 approval_timeout_seconds: 900      # how long an approval request stays valid
 max_quote_age_seconds: 90          # reject quotes older than this when executing (fresh quote is fetched first)
-trading_start: "10:00"             # no new entries, exits, stops, or tax-reserve buys before this ET time
+trading_start: "10:00"             # scan window opens at this ET time
                                    # (also closed on NYSE full-day holidays and after 1pm early closes)
 auto_trip_after_errors: 0          # auto-engage kill switch after N consecutive errors (0=off)
 
@@ -133,22 +126,6 @@ roll:
   min_net_credit: 0.0      # require net credit >= this (0 = never pay to roll)
   max_target_delta: 0.35   # don't roll into an even more-tested put
 
-# --- Gains sweep / tax reserve ---
-# Each week, a share of NET realized gains (losses carry forward) is moved into a symbol of your
-# choice by a small market order inside regular hours: SGOV (T-bills) to set aside taxes, or an
-# index fund to reinvest premium. The holding is walled off from trading capital, never written
-# against, never sold by the bot. One ledger row per week; run with dry_run: true for a cycle first.
-tax_reserve:
-  enabled: false
-  pct: 0.20                  # share of the week's net realized gains
-  symbol: SGOV               # any Robinhood-tradable stock or ETF
-  weekday: 4                 # 0=Mon .. 4=Fri
-  hour: 15                   # ET, inside regular hours (share market orders only fill then)
-  minute: 40
-  min_order_dollars: 5       # smaller amounts roll into the next week
-  dry_run: true              # log + ledger the intended order, place nothing
-  allow_sgov_test_buy: false # optional: allow one 1-share SGOV limit buy to test connectivity
-
 # --- Scheduled push reports (hands-off heartbeat) ---
 # For when you can't watch during the day: a daily digest (so 'no news' means 'all fine', not
 # 'it died') + a weekly performance rollup. Delivered via notify.provider (Pushover). Times ET.
@@ -172,16 +149,10 @@ web:
   port: 8000
   signal_ttl_seconds: 600   # how long a queued TradingView signal stays actionable
 
-# Rules evaluated per position each cycle. requires_approval is the hybrid-autonomy flag:
-#   false -> auto-execute (use only for safe, deterministic rules)
-#   true  -> push a notification and wait for one-tap approval
-# Loss circuit breaker: freezes NEW entries when realized losses pile up (never force-closes;
-# the monitor keeps managing open positions). Keys on realized P&L, not unrealized marks.
+# Rules are recorded and notified. This build does not place the close.
+# Sector cap is optional. Old loss_breaker_* keys in this block are ignored.
 risk:
-  loss_breaker_enabled: true
-  lookback_days: 7
-  max_realized_loss_pct: 0.10   # halt new entries if 7d realized P&L <= -10% of account (0 = off)
-  max_consecutive_losses: 4     # halt new entries after 4 straight realized losers (0 = off)
+  max_pct_per_sector: null
 
 rules:
   - name: profit-target

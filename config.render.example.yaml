@@ -1,18 +1,14 @@
-# Render paper-mode practice week. Paste this as a Secret File named "config.yaml"
+# Read-only scanner. Paste this as a Secret File named "config.yaml"
 # in the Render Dashboard (it appears at /etc/secrets/config.yaml).
 # Behavior only — NO secrets. Fill the watchlist with names YOU are willing to own.
+# Old mode / i_understand_live_trading / tax_reserve / loss_breaker keys are ignored.
 
-mode: paper
-i_understand_live_trading: false
-
-# Paper soak: live Robinhood quotes/chains, simulated fills on the paper broker.
 broker: robinhood_mcp
-broker_fallback: paper
+broker_fallback: null
 market_data: robinhood
 
-# Set this to your real agentic-account size so paper sizing matches reality.
+# Unused by the read-only session. Left so an old file still loads.
 paper_buying_power: 25000
-# No demo AAPL/MSFT fixtures — only what the scanner actually opens.
 paper_seed_positions: false
 
 # Loop cadences (seconds)
@@ -128,22 +124,6 @@ roll:
   min_net_credit: 0.0      # require net credit >= this (0 = never pay to roll)
   max_target_delta: 0.35   # don't roll into an even more-tested put
 
-# --- Gains sweep / tax reserve ---
-# Each week, a share of NET realized gains (losses carry forward) is moved into a symbol of your
-# choice by a small market order inside regular hours: SGOV (T-bills) to set aside taxes, or an
-# index fund to reinvest premium. The holding is walled off from trading capital, never written
-# against, never sold by the bot. One ledger row per week; run with dry_run: true for a cycle first.
-tax_reserve:
-  enabled: true
-  pct: 0.20                  # share of the week's net realized gains
-  symbol: SGOV
-  weekday: 4                 # 0=Mon .. 4=Fri
-  hour: 15                   # ET
-  minute: 40
-  min_order_dollars: 5
-  dry_run: true              # paper week: ledger the sweep, do not buy
-  allow_sgov_test_buy: false # keep off — no real 1-share test buy
-
 # --- Scheduled push reports (hands-off heartbeat) ---
 # For when you can't watch during the day: a daily digest (so 'no news' means 'all fine', not
 # 'it died') + a weekly performance rollup. Delivered via notify.provider (Pushover). Times ET.
@@ -167,16 +147,9 @@ web:
   port: 8000
   signal_ttl_seconds: 600   # how long a queued TradingView signal stays actionable
 
-# Rules evaluated per position each cycle. requires_approval is the hybrid-autonomy flag:
-#   false -> auto-execute (use only for safe, deterministic rules)
-#   true  -> push a notification and wait for one-tap approval
-# Loss circuit breaker: freezes NEW entries when realized losses pile up (never force-closes;
-# the monitor keeps managing open positions). Keys on realized P&L, not unrealized marks.
+# Rules are recorded and notified. This build does not place the close.
 risk:
-  loss_breaker_enabled: true
-  lookback_days: 7
-  max_realized_loss_pct: 0.10   # halt new entries if 7d realized P&L <= -10% of account (0 = off)
-  max_consecutive_losses: 4     # halt new entries after 4 straight realized losers (0 = off)
+  max_pct_per_sector: null
 
 rules:
   - name: profit-target

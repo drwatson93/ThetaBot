@@ -83,9 +83,9 @@ through Hostinger); (c) they've run the desktop login (Step 1) and have a `data/
    ```bash
    cp config.example.yaml config.yaml
    ```
-   Confirm these keys with the user (leave `mode: paper` for now):
+   Confirm these keys with the user. `mode` and `i_understand_live_trading` are not
+   settings anymore; an old file that still has them loads and the keys are ignored.
    ```yaml
-   mode: paper
    market_data: robinhood      # default: one-login, no extra data keys
    entry:
      enabled: true
@@ -110,9 +110,9 @@ through Hostinger); (c) they've run the desktop login (Step 1) and have a `data/
    pip install -e ".[all]" && python -m pytest -q
    ```
 
-7. **Going live is a separate, explicit step.** Only when the user confirms in words: set
-   `mode: live` and `i_understand_live_trading: true` in `config.yaml`, then
-   `docker compose up -d`. Recommend HTTPS in front of the dashboard first (see README Step 4).
+7. **This build does not place orders.** Do not set `mode: live` or
+   `i_understand_live_trading: true`. Those keys are ignored if an old file still has
+   them. Recommend HTTPS in front of the dashboard (see README Step 4).
 
 ## Choosing a data source (if the user asks)
 
@@ -128,7 +128,7 @@ through Hostinger); (c) they've run the desktop login (Step 1) and have a `data/
 | Goal | Command |
 |---|---|
 | Is it up/healthy? | `curl -sf http://localhost:8000/health` |
-| Live status (mode, paused, broker, breaker) | `curl -s -u USER:PASS http://localhost:8000/api/ops` |
+| Live status (paused, broker) | `curl -s -u USER:PASS http://localhost:8000/api/ops` |
 | Recent logs | `docker compose logs --tail=100 -f` |
 | Restart after a config change | `docker compose up -d` |
 | Update to latest | `git pull && docker compose up -d --build` |
