@@ -134,7 +134,7 @@ For a one-week **paper** soak with real Robinhood quotes and **simulated** fills
 1. On your **desktop**, run the one-time login (see Step 1) and copy the one-line `RH_OAUTH_JSON` it prints.
 2. Copy `config.render.example.yaml` into a Render **Secret File** named `config.yaml`. Fill `entry.watchlist` with names you are willing to own, and set `paper_buying_power` to your real account size. Keep `mode: paper`.
 3. In Render: **New → Blueprint**, point it at [drwatson93/ThetaBot](https://github.com/drwatson93/ThetaBot), apply `render.yaml`. Paste `RH_OAUTH_JSON` when prompted. Copy `DASHBOARD_PASSWORD` from the Environment tab after create. Optionally set `PAUSE_TOKEN` (Environment → add, a long random string *different* from `CONTROL_TOKEN`) so a monitoring bot can pause via `POST /control/pause-only` without getting the resume/approval secret.
-4. Open `https://<service>.onrender.com/health`. You want `"mode":"paper"`, `"live_armed":false`, `"robinhood_connected":true`, `"practice":true`. If `robinhood_connected` is false, the scanner has no real chains — re-check the token.
+4. Open `https://<service>.onrender.com/health`. You want `"orders_hard_disabled":true`, a `scanner` object, and `feed_age_seconds`, plus `"robinhood_connected":true` and `"practice":true`. A closed market or an old quote stays HTTP 200. If `robinhood_connected` is false, the scanner has no real chains — re-check the token.
 5. Leave `mode: live` and `i_understand_live_trading` **off** for the whole practice week.
 
 The Blueprint uses one Starter web service, Virginia, a 1 GB disk at `/app/data` (required: the OAuth refresh token is rewritten on every use), and auto-deploy **off**. Free Render instances will not work (no disk, they sleep after 15 minutes).

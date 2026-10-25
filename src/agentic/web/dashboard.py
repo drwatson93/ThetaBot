@@ -952,6 +952,7 @@ def _page_for(role: str, deps: "WebDeps") -> str:
         _PAGE.replace("__TB_ROLE__", shown)
         .replace("__HEALTH_INNER__", _health_inner(deps))
         .replace("__ALERT_ROWS__", _alert_rows_html(deps))
+        .replace("__PAUSE_BTN__", _pause_button(deps))
         .replace("__QUOTE_MAX_AGE__", str(int(getattr(deps.settings, "max_quote_age_seconds", 90) or 90)))
     )
 
@@ -1053,6 +1054,16 @@ def _health_inner(deps: "WebDeps") -> str:
         f'<span class="chip {lock_chip}" id="hb-lock" data-lock="{"on" if locked else "off"}">{_esc(lock_label)}</span>'
         f'<span class="chip {pause_chip}" id="hb-pause" data-paused="{"1" if paused else "0"}">{_esc(pause_label)}</span>'
         "</div>"
+    )
+
+
+def _pause_button(deps: "WebDeps") -> str:
+    paused = bool(deps.killswitch.is_paused())
+    label = "Resume" if paused else "Pause"
+    flag = "1" if paused else "0"
+    return (
+        f'<button class="go" type="button" id="pause-btn" data-paused="{flag}">'
+        f"{_esc(label)}</button>"
     )
 
 
@@ -1335,7 +1346,7 @@ _PAGE = """<!doctype html>
     <div class="ribbon-note" id="health-note">
       <span id="health-note-text">Scanner loop, quote feed, and the order lock. Pause holds new alerts as pending and sends them after resume.</span>
       <span class="owner-only" id="pause-ctl" style="margin-left:10px">
-        <button class="go" type="button" id="pause-btn" data-paused="0">Pause</button>
+        __PAUSE_BTN__
       </span>
       <span class="say" id="pause-say"></span>
     </div>

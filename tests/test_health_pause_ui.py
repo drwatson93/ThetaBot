@@ -7,6 +7,7 @@ from datetime import timedelta
 import pytest
 from fastapi.testclient import TestClient
 
+from agentic.brokers import robinhood_mcp
 from agentic.brokers.robinhood_mcp import ORDERS_HARD_DISABLED
 from agentic.config import Settings
 from agentic.domain.models import utcnow
@@ -157,7 +158,7 @@ class _NoOrders:
         raise AssertionError("scan tried to execute an order")
 
 
-def test_health_reports_lock_scanner_and_feed_without_mode_or_balances(tmp_path):
+def test_health_reports_lock_scanner_and_feed_without_mode_or_balances(tmp_path, monkeypatch):
     scanner = type("S", (), {})()
     scanner.alerts = None
     scanner.last_quotes = {"AAA": _quote("AAA", age_s=4)}
@@ -178,6 +179,11 @@ def test_health_reports_lock_scanner_and_feed_without_mode_or_balances(tmp_path)
     assert body["orders_hard_disabled"] is True
     assert body["orders_hard_disabled"] is ORDERS_HARD_DISABLED
     assert body["real_orders"] == "HARD DISABLED in code"
+    monkeypatch.setattr("agentic.web.health.ORDERS_HARD_DISABLED", False)
+    followed = TestClient(create_app(deps)).get("/health").json()
+    assert followed["orders_hard_disabled"] is False
+    assert "real_orders" not in followed and "real_orders_lock" not in followed
+    assert robinhood_mcp.ORDERS_HARD_DISABLED is True
     assert body["scanner"]["up"] is True
     assert body["scanner"]["last_status"] == "skipped"
     assert body["feed_age_seconds"] >= 4
@@ -244,7 +250,8 @@ def test_dashboard_renders_alert_chips_health_banner_and_drops_actions(tmp_path,
     assert 'data-scanner="up"' in html
     assert 'data-lock="on"' in html
     assert "Orders locked" in html
-    assert 'id="pause-btn"' in html and 'id="pause-ctl"' in html
+    assert 'id="pause-btn" data-paused="0">Pause</button>' in html
+    assert 'id="pause-ctl"' in html
     assert "owner-only" in html
     for gone in (
         "/control/approve", "/control/reject", "/control/approve-entry",
@@ -268,7 +275,7 @@ def test_dashboard_renders_alert_chips_health_banner_and_drops_actions(tmp_path,
     assert 'id="pause-btn"' in viewer_page
     owner_page = client.get("/", auth=OWNER).text
     assert 'const ROLE = "owner"' in owner_page
-    assert 'data-paused="1"' in owner_page
+    assert 'id="pause-btn" data-paused="1">Resume</button>' in owner_page
 
     for path in (
         "/control/approve/x",
@@ -330,3 +337,203 @@ async def test_pause_holds_webhook_then_sends_once(tmp_path, monkeypatch):
     assert await scanner.run_once() == 0
     assert len(sent) == 1
     assert len(scanner.alerts.all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_unpause_sends_held_play_that_is_not_approved_again(tmp_path, monkeypatch):
+    """A paused CSP stays pending. After resume it sends once even if a gate rejects it."""
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    sent: list[dict] = []
+
+    def _capture(url, payload, timeout=3.0):
+        sent.append(payload)
+
+    monkeypatch.setenv("TRADE_ALERT_URL", "https://alerts.example.test/hook/scan")
+    monkeypatch.setattr("agentic.notify.trade_alerts._http_post", _capture)
+    put = _quote("ZZZ", age_s=1)
+    put.strike = 40.0
+    put.bid, put.ask, put.mark = 1.40, 1.50, 1.45
+    put.delta = -0.25
+    db = Database(tmp_path / "hold.db")
+    audit = AuditStore(db)
+    killswitch = KillSwitch(db, audit)
+    transport = TradeAlerts(db, audit, Settings(mode="paper"), background=False)
+    book = _Book()
+    scanner = OpportunityScanner(
+        Settings(mode="paper", broker="paper", market_data="paper",
+                 entry={"enabled": True, "watchlist": ["ZZZ"]}),
+        book, _Chain(put), EntryDecisionStore(db), _NoOrders(),
+        audit, killswitch, alerts=AlertStore(db), trade_alerts=transport,
+    )
+
+    killswitch.pause("test")
+    assert await scanner.run_once() == 1
+    assert sent == []
+    held = scanner.alerts.all()
+    assert len(held) == 1 and held[0]["delivery_status"] == "pending"
+
+    put.delta = -0.05  # outside the delta band, so this scan does not approve it
+    killswitch.resume("test")
+    assert await scanner.run_once() == 0
+    assert scanner.last_csp_approved == []
+    assert len(sent) == 1
+    assert sent[0]["event"] == "scan_alert"
+    assert sent[0]["ticker"] == "ZZZ" and sent[0]["kind"] == "CSP"
+    assert scanner.alerts.all()[0]["delivery_status"] == "sent"
+    assert len(scanner.alerts.all()) == 1
+    assert book.writes == []
+
+    assert await scanner.run_once() == 0
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_pause_keeps_failed_row_and_holds_exit_until_resume(tmp_path, monkeypatch):
+    """Pause does not rewrite a failed row, and it does not post an unsent exit."""
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    sent: list[dict] = []
+
+    def _capture(url, payload, timeout=3.0):
+        sent.append(payload)
+
+    monkeypatch.setenv("TRADE_ALERT_URL", "https://alerts.example.test/hook/scan")
+    monkeypatch.setattr("agentic.notify.trade_alerts._http_post", _capture)
+    db = Database(tmp_path / "retry.db")
+    audit = AuditStore(db)
+    store = AlertStore(db)
+    failed_id = store.insert_if_new({
+        "dedup_key": "CSP:AAA:AAA261120P00010000",
+        "kind": "CSP", "underlying": "AAA", "occ_symbol": "AAA261120P00010000",
+        "strike": 10.0, "expiration": "2026-11-20", "contracts": 1,
+        "premium": 0.45, "bid": 0.40, "ask": 0.50,
+    })
+    assert failed_id
+    store.set_delivery_status(failed_id, "failed")
+    exit_id = store.insert_if_new({
+        "dedup_key": "exit:BBB:BBB261218C00015000",
+        "kind": "exit", "underlying": "BBB", "occ_symbol": "BBB261218C00015000",
+        "strike": 15.0, "expiration": "2026-12-18", "contracts": 1,
+        "premium": 0.20, "bid": 0.18, "ask": 0.22,
+    })
+    assert exit_id
+    killswitch = KillSwitch(db, audit)
+    transport = TradeAlerts(db, audit, Settings(mode="paper"), background=False)
+    book = _Book()
+    scanner = OpportunityScanner(
+        Settings(mode="paper", broker="paper", market_data="paper",
+                 entry={"enabled": True, "watchlist": []}),
+        book, _Chain(_quote("XYZ", age_s=1)), EntryDecisionStore(db), _NoOrders(),
+        audit, killswitch, alerts=store, trade_alerts=transport,
+    )
+
+    killswitch.pause("test")
+    assert await scanner.run_once() == 0
+    assert sent == []
+    rows = {row["kind"]: row for row in scanner.alerts.all()}
+    assert rows["CSP"]["delivery_status"] == "failed"
+    assert rows["exit"]["delivery_status"] == "pending"
+    assert len(rows) == 2
+    assert book.writes == []
+
+    killswitch.resume("test")
+    assert await scanner.run_once() == 0
+    assert len(sent) == 2
+    posted = {payload["kind"]: payload["ticker"] for payload in sent}
+    assert posted == {"CSP": "AAA", "exit": "BBB"}
+    rows = {row["kind"]: row for row in scanner.alerts.all()}
+    assert rows["CSP"]["delivery_status"] == "sent"
+    assert rows["exit"]["delivery_status"] == "sent"
+
+    assert await scanner.run_once() == 0
+    assert len(sent) == 2
+    assert len(scanner.alerts.all()) == 2
+
+
+class _ClosedBook:
+    async def get_buying_power(self):
+        raise AssertionError("closed session read buying power")
+
+    async def get_account_value(self):
+        raise AssertionError("closed session read account value")
+
+    async def get_open_positions(self):
+        raise AssertionError("closed session reconciled positions")
+
+    async def get_equity_positions(self):
+        raise AssertionError("closed session read holdings")
+
+
+class _ClosedChain:
+    async def get_quote(self, position):
+        raise AssertionError("closed session fetched a quote")
+
+    async def get_chain(self, underlying: str):
+        raise AssertionError("closed session fetched a chain")
+
+    async def get_underlying_price(self, underlying: str):
+        raise AssertionError("closed session fetched a price")
+
+
+@pytest.mark.asyncio
+async def test_closed_session_records_skipped_run_without_sending(tmp_path, monkeypatch):
+    """A closed market or a closed order window records a skipped run and sends nothing."""
+    sent: list[dict] = []
+
+    def _capture(url, payload, timeout=3.0):
+        sent.append(payload)
+
+    monkeypatch.setenv("TRADE_ALERT_URL", "https://alerts.example.test/hook/scan")
+    monkeypatch.setattr("agentic.notify.trade_alerts._http_post", _capture)
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: False)
+    db = Database(tmp_path / "closed.db")
+    audit = AuditStore(db)
+    store = AlertStore(db)
+    alert_id = store.insert_if_new({
+        "dedup_key": "CSP:AAA:AAA261120P00010000",
+        "kind": "CSP", "underlying": "AAA", "occ_symbol": "AAA261120P00010000",
+        "strike": 10.0, "expiration": "2026-11-20", "contracts": 1,
+        "premium": 0.45, "bid": 0.40, "ask": 0.50,
+    })
+    assert alert_id
+    killswitch = KillSwitch(db, audit)
+    transport = TradeAlerts(db, audit, Settings(mode="paper"), background=False)
+    scanner = OpportunityScanner(
+        Settings(mode="paper", broker="paper", market_data="paper",
+                 entry={"enabled": True, "watchlist": ["AAA"]}),
+        _ClosedBook(), _ClosedChain(), EntryDecisionStore(db), _NoOrders(),
+        audit, killswitch, alerts=store, trade_alerts=transport,
+    )
+
+    assert await scanner.run_once() == 0
+    run = scanner.alerts.latest_run()
+    assert run["status"] == "skipped" and run["reason"] == "market_closed"
+    assert run["alerts_sent"] == 0
+    assert sent == []
+    held = scanner.alerts.get_by_dedup("CSP:AAA:AAA261120P00010000")
+    assert held["delivery_status"] == "pending" and held["status"] == "new"
+
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    monkeypatch.setattr("agentic.services.scanner.is_order_window", lambda *a, **k: False)
+    assert await scanner.run_once() == 0
+    run = scanner.alerts.latest_run()
+    assert run["status"] == "skipped" and run["reason"] == "outside_window"
+    assert run["alerts_sent"] == 0
+    assert sent == []
+    held = scanner.alerts.get_by_dedup("CSP:AAA:AAA261120P00010000")
+    assert held["delivery_status"] == "pending" and held["status"] == "new"
+
+    deps = WebDeps(
+        settings=scanner.settings,
+        signals=SignalStore(db),
+        killswitch=killswitch,
+        approval_gate=None,
+        audit=audit,
+        positions=PositionStore(db),
+        orders=OrderStore(db),
+        decisions=DecisionStore(db),
+        scanner=scanner,
+    )
+    body = TestClient(create_app(deps)).get("/health").json()
+    assert body["status"] == "ok"
+    assert body["scanner"]["up"] is True
+    assert body["scanner"]["last_status"] == "skipped"

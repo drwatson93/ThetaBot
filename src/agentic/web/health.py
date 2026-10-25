@@ -2,8 +2,9 @@
 
 Reports the order lock, whether the scanner loop has written a scan_runs row
 inside two scan intervals, and the age of the newest quote that scan used.
-Market hours and a stale feed stay fields on a 200. The body has no balances,
-secrets, or paper/live mode.
+A skipped row (market closed, or outside the order window) still counts as
+the loop being up. A stale feed stays a field on a 200. The body has no
+balances, secrets, or paper/live mode.
 """
 from __future__ import annotations
 
@@ -68,6 +69,7 @@ def scanner_status(deps: Any, now: datetime | None = None) -> dict[str, Any]:
         scanned_at = scanned_at.replace(tzinfo=timezone.utc)
     now = now or utcnow()
     age = (now - scanned_at).total_seconds()
+    # Skipped rows count. The loop ran; the session was closed.
     return {
         "up": age <= window,
         "last_scan_at": raw,
