@@ -87,7 +87,10 @@ def test_dashboard_page_js_escapes_survive(ctx):
 def test_health(ctx):
     r = ctx["client"].get("/health")
     assert r.status_code == 200
-    assert r.json()["mode"] == "paper"
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["orders_hard_disabled"] is True
+    assert "mode" not in body and "live_armed" not in body
 
 
 def test_webhook_rejects_bad_token(ctx):
@@ -126,15 +129,11 @@ async def test_signal_to_approval_to_execution(ctx):
     assert len(pending) == 1
     decision_id = pending[0].id
 
-    # 4. Approve via the control endpoint -> executes the paper close.
-    assert client.post(f"/control/approve/{decision_id}", auth=None).status_code == 401
-    ra = client.post(f"/control/approve/{decision_id}")  # owner Basic, no per-decision token
-    assert ra.status_code == 200
-    assert ra.json()["status"] == "approved"
-
-    # 5. Position is closed and the decision is DONE.
-    assert ctx["positions"].get_by_occ(ctx["occ"]).status == PositionStatus.CLOSED
-    assert ctx["decisions"].get(decision_id).status == DecisionStatus.DONE
+    # 4. The dashboard no longer exposes approve/close. The position stays open.
+    assert client.post(f"/control/approve/{decision_id}", auth=None).status_code == 404
+    assert client.post(f"/control/approve/{decision_id}").status_code == 404
+    assert ctx["positions"].get_by_occ(ctx["occ"]).status == PositionStatus.OPEN
+    assert ctx["decisions"].get(decision_id).status == DecisionStatus.AWAITING_APPROVAL
 
 
 @pytest.mark.asyncio
@@ -145,10 +144,9 @@ async def test_reject_blocks_execution(ctx):
     await ctx["processor"].process_pending()
     decision_id = ctx["decisions"].list_by_status(DecisionStatus.AWAITING_APPROVAL)[0].id
 
-    from agentic.config import close_action_token
-    rr = client.post(f"/control/reject/{decision_id}?t={close_action_token(decision_id)}")
-    assert rr.status_code == 200
-    assert ctx["decisions"].get(decision_id).status == DecisionStatus.REJECTED
+    rr = client.post(f"/control/reject/{decision_id}")
+    assert rr.status_code == 404
+    assert ctx["decisions"].get(decision_id).status == DecisionStatus.AWAITING_APPROVAL
     assert ctx["positions"].get_by_occ(ctx["occ"]).status == PositionStatus.OPEN
 
 

@@ -155,10 +155,11 @@ def test_pause_token_rejected_by_resume_and_approval_routes(ctx):
     assert resume.status_code == 401
     assert ctx["killswitch"].is_paused() is True
 
-    assert client.post("/control/approve/dec-1?t=" + PAUSE, auth=None).status_code == 401
-    assert client.post("/control/reject/dec-1?t=" + PAUSE, auth=None).status_code == 401
-    assert client.post("/control/approve-entry/dec-1?t=" + PAUSE, auth=None).status_code == 401
-    assert client.post("/control/reject-entry/dec-1?t=" + PAUSE, auth=None).status_code == 401
+    # Approve / close / roll actions are not on the dashboard. Pause token cannot reach them.
+    assert client.post("/control/approve/dec-1?t=" + PAUSE, auth=None).status_code == 404
+    assert client.post("/control/reject/dec-1?t=" + PAUSE, auth=None).status_code == 404
+    assert client.post("/control/approve-entry/dec-1?t=" + PAUSE, auth=None).status_code == 404
+    assert client.post("/control/reject-entry/dec-1?t=" + PAUSE, auth=None).status_code == 404
 
     # PAUSE_TOKEN cannot use /control/pause or /control/resume. Owner Basic or CONTROL_TOKEN can.
     assert client.post(f"/control/pause?token={PAUSE}", auth=None).status_code == 401

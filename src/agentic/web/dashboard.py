@@ -356,6 +356,11 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             "symbols": q,
         }
 
+    @router.get("/api/alerts")
+    async def api_alerts() -> dict:
+        """Scan alerts for the list. Status and flags only — no balances or prices paid."""
+        return {"alerts": _alert_rows(deps)}
+
     @router.get("/api/scan-status")
     async def api_scan_status() -> dict:
         from ..services.market_hours import is_market_hours
@@ -914,11 +919,11 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
 
     @router.get("/", response_class=HTMLResponse)
     async def index(role: str = Depends(require_auth)) -> str:
-        return _page_for(role)
+        return _page_for(role, deps)
 
     @router.get("/dashboard", response_class=HTMLResponse)
     async def dashboard(role: str = Depends(require_auth)) -> str:
-        return _page_for(role)
+        return _page_for(role, deps)
 
     @router.get("/calculator", response_class=HTMLResponse)
     async def calculator() -> str:
@@ -941,9 +946,125 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
     return router
 
 
-def _page_for(role: str) -> str:
+def _page_for(role: str, deps: "WebDeps") -> str:
     shown = role if role in ("owner", "viewer") else "viewer"
-    return _PAGE.replace("__TB_ROLE__", shown)
+    return (
+        _PAGE.replace("__TB_ROLE__", shown)
+        .replace("__HEALTH_INNER__", _health_inner(deps))
+        .replace("__ALERT_ROWS__", _alert_rows_html(deps))
+        .replace("__PAUSE_BTN__", _pause_button(deps))
+        .replace("__QUOTE_MAX_AGE__", str(int(getattr(deps.settings, "max_quote_age_seconds", 90) or 90)))
+    )
+
+
+def _esc(value: object) -> str:
+    return (
+        str("" if value is None else value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _alert_store(deps: "WebDeps"):
+    return getattr(getattr(deps, "scanner", None), "alerts", None)
+
+
+def _alert_rows(deps: "WebDeps") -> list[dict]:
+    store = _alert_store(deps)
+    if store is None:
+        return []
+    out = []
+    for row in store.all():
+        out.append({
+            "kind": row.get("kind"),
+            "underlying": row.get("underlying"),
+            "occ_symbol": row.get("occ_symbol"),
+            "strike": row.get("strike"),
+            "expiration": row.get("expiration"),
+            "contracts": row.get("contracts"),
+            "status": row.get("status") or "new",
+            "late": bool(row.get("late")),
+            "partial": bool(row.get("partial")),
+            "created_at": row.get("created_at"),
+        })
+    return out
+
+
+def _status_chips(row: dict) -> str:
+    status = str(row.get("status") or "new")
+    klass = {"taken": "good", "stale": "warn", "expired": "warn"}.get(status, "")
+    parts = [
+        f'<span class="chip {klass}" data-status="{_esc(status)}">{_esc(status)}</span>'
+    ]
+    if row.get("late"):
+        parts.append('<span class="chip warn" data-flag="late">late</span>')
+    if row.get("partial"):
+        parts.append('<span class="chip warn" data-flag="partial">partial</span>')
+    return " ".join(parts)
+
+
+def _alert_rows_html(deps: "WebDeps") -> str:
+    rows = _alert_rows(deps)
+    if not rows:
+        return '<tr><td colspan="6" class="muted">No alerts yet.</td></tr>'
+    html = []
+    for row in rows:
+        html.append(
+            "<tr>"
+            f"<td>{_esc(row['underlying'])}</td>"
+            f"<td>{_esc(row['kind'])}</td>"
+            f"<td class=\"num\">{_esc(row['strike'])}</td>"
+            f"<td>{_esc(row['expiration'])}</td>"
+            f"<td class=\"num\">{_esc(row['contracts'])}</td>"
+            f"<td>{_status_chips(row)}</td>"
+            "</tr>"
+        )
+    return "".join(html)
+
+
+def _health_inner(deps: "WebDeps") -> str:
+    from .health import build_health
+    body = build_health(deps)
+    scanner = body.get("scanner") or {}
+    up = bool(scanner.get("up"))
+    age = body.get("feed_age_seconds")
+    locked = bool(body.get("orders_hard_disabled"))
+    paused = bool(body.get("paused"))
+    scan_klass = "" if up else "bad"
+    scan_chip = "good" if up else "warn"
+    scan_label = "Scanner up" if up else "Scanner down"
+    if age is None:
+        feed_label, feed_chip, feed_attr = "Feed unknown", "warn", ""
+    else:
+        feed_label = f"Feed {int(round(float(age)))}s"
+        limit = int(getattr(deps.settings, "max_quote_age_seconds", 90) or 90)
+        feed_chip = "warn" if float(age) > limit else "good"
+        feed_attr = _esc(age)
+    lock_label = "Orders locked" if locked else "Orders not locked"
+    lock_chip = "good" if locked else "warn"
+    pause_label = "Paused" if paused else "Running"
+    pause_chip = "warn" if paused else ""
+    return (
+        f'<span class="conn {scan_klass}"><span class="dot"></span> {_esc(scan_label)}</span>'
+        '<div class="chips">'
+        f'<span class="chip {scan_chip}" id="hb-scanner" data-scanner="{"up" if up else "down"}">{_esc(scan_label)}</span>'
+        f'<span class="chip {feed_chip}" id="hb-feed" data-feed-age="{feed_attr}">{_esc(feed_label)}</span>'
+        f'<span class="chip {lock_chip}" id="hb-lock" data-lock="{"on" if locked else "off"}">{_esc(lock_label)}</span>'
+        f'<span class="chip {pause_chip}" id="hb-pause" data-paused="{"1" if paused else "0"}">{_esc(pause_label)}</span>'
+        "</div>"
+    )
+
+
+def _pause_button(deps: "WebDeps") -> str:
+    paused = bool(deps.killswitch.is_paused())
+    label = "Resume" if paused else "Pause"
+    flag = "1" if paused else "0"
+    return (
+        f'<button class="go" type="button" id="pause-btn" data-paused="{flag}">'
+        f"{_esc(label)}</button>"
+    )
 
 
 # --- self-contained page (vanilla JS, no dependencies) -----------------------------------
@@ -1220,6 +1341,17 @@ _PAGE = """<!doctype html>
       <button class="rbtn" onclick="loadAll()">Refresh now</button></div>
   </div>
 
+  <div class="ribbon" id="health-banner" data-max-quote-age="__QUOTE_MAX_AGE__">
+    <div class="ribbon-top" id="health-top">__HEALTH_INNER__</div>
+    <div class="ribbon-note" id="health-note">
+      <span id="health-note-text">Scanner loop, quote feed, and the order lock. Pause holds new alerts as pending and sends them after resume.</span>
+      <span class="owner-only" id="pause-ctl" style="margin-left:10px">
+        __PAUSE_BTN__
+      </span>
+      <span class="say" id="pause-say"></span>
+    </div>
+  </div>
+
   <div class="ribbon">
     <div class="ribbon-top" id="conn-top"><span class="conn"><span class="dot"></span> Checking connection…</span></div>
     <div class="ribbon-note" id="conn-note">This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.</div>
@@ -1238,6 +1370,15 @@ _PAGE = """<!doctype html>
   <div class="tabpane" id="pane-overview">
   <div class="grid">
     <div class="col">
+      <section class="card2" id="scan-alerts">
+        <div class="card-h"><h2>Alerts</h2><span class="count" id="scan-alerts-count"></span></div>
+        <div class="more-body" style="padding:0">
+          <table id="scan-alerts-tbl"><thead><tr>
+            <th>Play</th><th>Kind</th><th class="num">Strike</th><th>Expiry</th>
+            <th class="num">Contracts</th><th>Status</th>
+          </tr></thead><tbody id="scan-alerts-body">__ALERT_ROWS__</tbody></table>
+        </div>
+      </section>
       <section class="card2">
         <div class="card-h"><h2>What you're holding</h2><span class="count" id="pos-count"></span></div>
         <div id="holds"></div>
@@ -1612,7 +1753,7 @@ function applyRoleUI(){
   document.body.classList.add("role-viewer");
   const badge = $("role-badge");
   if(badge){ badge.className = "view-badge"; badge.textContent = "view-only login"; }
-  document.querySelectorAll("#al-modes .rbtn, #al-test, #wl-add, #wl-in, #wk-save, #wk-in, #brief-run, #scr-run, #scr-scan, #pane-tuning button.go, #pane-tuning input, #pane-tuning select, #pane-rules input, #pane-rules button, #scr-syms, .scr-filters input").forEach(el => {
+  document.querySelectorAll("#al-modes .rbtn, #al-test, #pause-btn, #wl-add, #wl-in, #wk-save, #wk-in, #brief-run, #scr-run, #scr-scan, #pane-tuning button.go, #pane-tuning input, #pane-tuning select, #pane-rules input, #pane-rules button, #scr-syms, .scr-filters input").forEach(el => {
     if(el) el.disabled = true;
   });
 }
@@ -2631,8 +2772,96 @@ async function loadRules(){
   }
   try { await loadRulesEditor(false); } catch(e){ console.error("rules-editor", e); }
 }
+function statusChips(a){
+  const status = a.status || "new";
+  const klass = status==="taken" ? "good" : (status==="stale" || status==="expired" ? "warn" : "");
+  let html = `<span class="chip ${klass}" data-status="${esc(status)}">${esc(status)}</span>`;
+  if(a.late) html += ` <span class="chip warn" data-flag="late">late</span>`;
+  if(a.partial) html += ` <span class="chip warn" data-flag="partial">partial</span>`;
+  return html;
+}
+function renderHealth(h){
+  const top = $("health-top");
+  if(!top || !h) return;
+  const up = !!(h.scanner && h.scanner.up);
+  const age = h.feed_age_seconds;
+  const locked = !!h.orders_hard_disabled;
+  const paused = !!h.paused;
+  const scanLabel = up ? "Scanner up" : "Scanner down";
+  let feedLabel = "Feed unknown", feedChip = "warn", feedAttr = "";
+  if(age != null){
+    const limit = Number(($("health-banner") && $("health-banner").dataset.maxQuoteAge) || 90);
+    feedLabel = "Feed " + Math.round(age) + "s";
+    feedChip = age > limit ? "warn" : "good";
+    feedAttr = String(age);
+  }
+  const lockLabel = locked ? "Orders locked" : "Orders not locked";
+  const pauseLabel = paused ? "Paused" : "Running";
+  top.innerHTML =
+    `<span class="conn ${up?"":"bad"}"><span class="dot"></span> ${esc(scanLabel)}</span>`
+    + `<div class="chips">`
+    + `<span class="chip ${up?"good":"warn"}" id="hb-scanner" data-scanner="${up?"up":"down"}">${esc(scanLabel)}</span>`
+    + `<span class="chip ${feedChip}" id="hb-feed" data-feed-age="${esc(feedAttr)}">${esc(feedLabel)}</span>`
+    + `<span class="chip ${locked?"good":"warn"}" id="hb-lock" data-lock="${locked?"on":"off"}">${esc(lockLabel)}</span>`
+    + `<span class="chip ${paused?"warn":""}" id="hb-pause" data-paused="${paused?"1":"0"}">${esc(pauseLabel)}</span>`
+    + `</div>`;
+  const btn = $("pause-btn");
+  if(btn){
+    btn.dataset.paused = paused ? "1" : "0";
+    btn.textContent = paused ? "Resume" : "Pause";
+  }
+}
+async function loadHealth(){
+  try { renderHealth(await getJSON("/health")); }
+  catch(e){
+    const top = $("health-top");
+    if(top) top.innerHTML = `<span class="conn bad"><span class="dot"></span> Health unavailable</span>`;
+  }
+}
+function renderScanAlerts(rows){
+  const body = $("scan-alerts-body");
+  if(!body) return;
+  const list = rows || [];
+  const count = $("scan-alerts-count");
+  if(count) count.textContent = list.length ? (list.length + (list.length===1?" alert":" alerts")) : "";
+  body.innerHTML = list.map(a => `<tr>
+    <td>${esc(a.underlying)}</td><td>${esc(a.kind)}</td>
+    <td class="num">${esc(a.strike)}</td><td>${esc(a.expiration)}</td>
+    <td class="num">${esc(a.contracts)}</td><td>${statusChips(a)}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="muted">No alerts yet.</td></tr>`;
+}
+async function loadScanAlerts(){
+  try {
+    const data = await getJSON("/api/alerts");
+    renderScanAlerts(data.alerts || []);
+  } catch(e){ console.error("alerts", e); }
+}
+async function togglePause(){
+  const say = $("pause-say");
+  if(!isOwner()){
+    if(say){ say.className = "say err"; say.textContent = "View-only login cannot pause."; }
+    return;
+  }
+  const btn = $("pause-btn");
+  const paused = btn && btn.dataset.paused === "1";
+  try {
+    const r = await fetch(paused ? "/control/resume" : "/control/pause", {method:"POST", credentials:"same-origin"});
+    if(r.status === 403){
+      if(say){ say.className = "say err"; say.textContent = "View-only login cannot pause."; }
+      return;
+    }
+    if(!r.ok){
+      if(say){ say.className = "say err"; say.textContent = "Could not change pause."; }
+      return;
+    }
+    if(say){ say.className = "say ok"; say.textContent = paused ? "Resumed. Held alerts send on the next scan." : "Paused. Scans still run; alerts stay pending."; }
+    await loadHealth();
+  } catch(e){
+    if(say){ say.className = "say err"; say.textContent = "Could not change pause."; }
+  }
+}
 async function loadAll(){
-  for (const [fn,name] of [[loadConn,"conn"],[loadHolds,"holds"],[loadWeek,"week"],
+  for (const [fn,name] of [[loadHealth,"health"],[loadScanAlerts,"scan-alerts"],[loadConn,"conn"],[loadHolds,"holds"],[loadWeek,"week"],
                            [loadFeed,"feed"],[loadScanStatus,"scan"],[loadTvLevels,"tv"],
                            [loadQuality,"quality"],[loadSetups,"setups"],[loadSetupAccuracy,"setupacc"],
                            [loadRiskProfile,"riskprofile"],[loadRegimeStatus,"regime"],
@@ -2654,6 +2883,8 @@ document.querySelectorAll("#al-modes .rbtn").forEach(b => {
   b.onclick = () => setAlertMode(b.dataset.mode);
 });
 $("al-test").onclick = sendTestAlert;
+const pauseBtn = $("pause-btn");
+if(pauseBtn) pauseBtn.onclick = togglePause;
 $("scr-run").onclick = runScreen;
 $("scr-scan").onclick = runScan;
 $("wl-add").onclick = addTicker;

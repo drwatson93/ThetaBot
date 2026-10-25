@@ -166,3 +166,9 @@ class AlertStore:
     def runs(self) -> list[dict[str, Any]]:
         rows = self.db.conn.execute("SELECT * FROM scan_runs ORDER BY rowid").fetchall()
         return [dict(r) for r in rows]
+
+    def latest_run(self) -> dict[str, Any] | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM scan_runs ORDER BY scanned_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
