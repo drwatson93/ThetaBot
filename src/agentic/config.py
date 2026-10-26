@@ -277,7 +277,6 @@ class AIConfig(BaseModel):
     model: str = "claude-opus-4-8"
     mode: Literal["advisory", "veto"] = "advisory"    # advisory = annotate only; veto = skip on "skip"
     max_candidates_per_scan: int = 3                   # cap Claude calls per scan (cost control)
-    cache_ttl_seconds: int = 3600                      # reuse a verdict for the same (occ, day)
     # Daily S/R alerts fire once per session, so a snapshot is routinely 17-24h old during market
     # hours — a 1h window would hide it from the AI entirely. 30h keeps the latest daily read valid
     # all day, and a missed day goes stale (ignored) rather than lingering forever.
@@ -402,18 +401,6 @@ class Settings(BaseModel):
     rules: list[RuleConfig] = Field(default_factory=list)
 
     # --- derived helpers ---
-    @property
-    def public_base_url(self) -> str:
-        """Base URL for one-tap approval links. Uses the public tunnel hostname when set
-        (so the buttons work from a phone), else Render's public URL, else localhost."""
-        if self.tunnel.hostname:
-            host = self.tunnel.hostname
-            return host if host.startswith("http") else f"https://{host}"
-        render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-        if render_url:
-            return render_url.rstrip("/")
-        return f"http://localhost:{self.web.port}"
-
     def http_bind_port(self) -> int:
         """Listen port: honor ``$PORT`` (Render) when set, else ``web.port``."""
         raw = os.environ.get("PORT")

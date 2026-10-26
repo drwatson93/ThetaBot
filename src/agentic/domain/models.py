@@ -81,10 +81,6 @@ class EquityHolding:
     quantity: int                        # shares held
     average_cost: float
 
-    @property
-    def coverable_contracts(self) -> int:
-        return self.quantity // 100
-
 
 @dataclass
 class CloseDecision:

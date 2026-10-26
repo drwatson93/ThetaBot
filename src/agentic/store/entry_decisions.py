@@ -75,26 +75,6 @@ class EntryDecisionStore:
         )
         self.db.conn.commit()
 
-    def set_order_snapshot(
-        self,
-        decision_id: str,
-        *,
-        order_type: str | None,
-        limit_price: float | None,
-        bid: float | None,
-        ask: float | None,
-        mid: float | None,
-        time_in_force: str | None,
-    ) -> None:
-        """Stamp the priced order onto the entry decision (additive; does not change status)."""
-        self.db.conn.execute(
-            """UPDATE entry_decisions SET
-                 order_type = ?, limit_price = ?, bid = ?, ask = ?, mid = ?, time_in_force = ?
-               WHERE id = ?""",
-            (order_type, limit_price, bid, ask, mid, time_in_force, decision_id),
-        )
-        self.db.conn.commit()
-
     def get(self, decision_id: str) -> EntryDecision | None:
         r = self.db.conn.execute(
             "SELECT * FROM entry_decisions WHERE id = ?", (decision_id,)
@@ -113,24 +93,3 @@ class EntryDecisionStore:
             (status.value,),
         ).fetchall()
         return [_row_to_entry(r) for r in rows]
-
-    def most_recent_by_occ(self, occ_symbol: str) -> EntryDecision | None:
-        """The latest entry decision for a contract (any status), or None."""
-        r = self.db.conn.execute(
-            "SELECT * FROM entry_decisions WHERE occ_symbol = ? "
-            "ORDER BY created_at DESC LIMIT 1",
-            (occ_symbol,),
-        ).fetchone()
-        return _row_to_entry(r) if r else None
-
-    def premium_collected_since(self, since_iso: str) -> float:
-        """Total CSP premium (credit) actually collected since ``since_iso`` — DONE entries only.
-
-        premium is per-share credit, so dollars = premium * contracts * 100.
-        """
-        rows = self.db.conn.execute(
-            "SELECT premium, contracts FROM entry_decisions "
-            "WHERE status = ? AND created_at >= ?",
-            (DecisionStatus.DONE.value, since_iso),
-        ).fetchall()
-        return round(sum((r["premium"] or 0.0) * (r["contracts"] or 0) * 100 for r in rows), 2)

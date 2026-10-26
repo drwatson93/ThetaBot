@@ -73,35 +73,6 @@ class DecisionStore:
         )
         self.db.conn.commit()
 
-    def mark_awaiting(self, decision_id: str, expires_at: datetime) -> None:
-        """Move a decision to AWAITING_APPROVAL with an expiry (decided_at stays null until
-        the human responds)."""
-        self.db.conn.execute(
-            "UPDATE decisions SET status = ?, expires_at = ? WHERE id = ?",
-            (DecisionStatus.AWAITING_APPROVAL.value, expires_at.isoformat(), decision_id),
-        )
-        self.db.conn.commit()
-
-    def set_order_snapshot(
-        self,
-        decision_id: str,
-        *,
-        order_type: str | None,
-        limit_price: float | None,
-        bid: float | None,
-        ask: float | None,
-        mid: float | None,
-        time_in_force: str | None,
-    ) -> None:
-        """Stamp the priced close order onto the decision (additive; does not change status)."""
-        self.db.conn.execute(
-            """UPDATE decisions SET
-                 order_type = ?, limit_price = ?, bid = ?, ask = ?, mid = ?, time_in_force = ?
-               WHERE id = ?""",
-            (order_type, limit_price, bid, ask, mid, time_in_force, decision_id),
-        )
-        self.db.conn.commit()
-
     def get_by_dedup(self, dedup_key: str) -> CloseDecision | None:
         r = self.db.conn.execute(
             "SELECT * FROM decisions WHERE dedup_key = ?", (dedup_key,)

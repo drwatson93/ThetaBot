@@ -8,7 +8,7 @@ import asyncio
 import logging
 import signal
 
-from .brokers.factory import broker_degraded, build_broker, build_paper_runtime
+from .brokers.factory import build_broker, build_paper_runtime
 from .config import Settings, load_config, require_runtime_secrets
 from .logging_setup import setup_logging
 from .marketdata.alpaca_md import AlpacaMarketData
@@ -190,17 +190,6 @@ async def main_async(config_path: str | None = None) -> None:
         "Starting AgenticRobinhood: broker=%s options=%s data=%s robinhood_connected=%s",
         caps.name, caps.supports_options_orders, md_effective, rh_connected,
     )
-    # Loud alarm for the "looks live but isn't" state: live-armed, but the broker fell back to
-    # paper (RH connect failed). The bot is not managing the real account — page the operator.
-    if broker_degraded(settings, broker):
-        warn = (f"mode=live but the active broker is the PAPER simulator (configured "
-                f"'{settings.broker}' failed to connect). The bot is NOT trading or managing your "
-                f"real Robinhood account. Fix the RH token (rh_login) and redeploy.")
-        log.error("DEGRADED BROKER: %s", warn)
-        try:
-            await notifier.send("Bot on SIMULATOR - not live!", warn, priority="high")
-        except Exception as exc:  # noqa: BLE001 — alert must not block startup
-            log.warning("degraded-broker alert failed to send: %s", exc)
 
     monitor = MonitorLoop(
         settings, broker, market_data, positions, audit, killswitch,
