@@ -456,7 +456,7 @@ def test_format_pnl_pct_runs_in_javascript():
         node = "/exec-daemon/node"
     if node is None:
         pytest.skip("node is not installed")
-    src = Path("src/agentic/web/dashboard.py").read_text(encoding="utf-8")
+    src = Path("src/agentic/web/dashboard.html").read_text(encoding="utf-8")
     start = src.index("function formatPnlPct")
     end = src.index("async function loadHolds")
     script = src[start:end] + """
