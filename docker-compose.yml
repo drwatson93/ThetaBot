@@ -1,4 +1,4 @@
-# ThetaBot — one long-lived container (scanner + monitor + reconcile + dashboard).
+# ThetaBot — one container: scanner, alert webhook, dashboard. No orders.
 # Deploy on any Docker host (e.g. a Hostinger VPS):  docker compose up -d --build
 services:
   agentic:

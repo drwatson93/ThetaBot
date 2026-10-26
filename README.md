@@ -41,29 +41,20 @@ It screens cash-secured puts on stocks you'd be happy to own and covered calls o
 
 ## What it does
 
-The **options wheel**, automated end to end:
+Reads Robinhood (quotes, chains, positions, buying power) and scans for cash-secured puts and covered calls. Each new pick is posted to `TRADE_ALERT_URL` when alerts mode is `instant`. Each open alert is marked taken, stale, or expired; a held short gets one exit webhook at 50% of the credit by the halfway point, or at 80% at any time; expiry P&L lands on the scorecard. It never places an order. `ORDERS_HARD_DISABLED` stays on.
 
-1. **Sell a cash-secured put** on a watchlist name — collect a premium for agreeing to buy the stock at a lower ("strike") price.
-2. **If it expires worthless** (stock stayed above the strike) → keep the premium, repeat.
-3. **If you're assigned** (stock fell below the strike) → you now own 100 shares per contract at that strike.
-4. **Sell covered calls** against those shares — collect more premium — until the shares are called away at/above your cost basis. Then back to step 1.
-
-Every scan, the bot screens each watchlist name's live option chain, filters for the right delta / days-to-expiry / liquidity / yield, ranks by how *rich* the premium is (IV rank), sizes the position so no single bet dominates, and places the order. It then monitors open positions and buys them back at a profit target, rolls when it makes sense, or lets them ride to assignment.
-
-It is deliberately a **slow, patient** strategy: 7–14 day expirations, held for days, only on names you'd own.
+A person who acts on an alert can still be assigned. Use 7–14 day expirations and only names they will own.
 
 ## How it works
 
 | Component | Job |
 |---|---|
-| **Scanner** | Every few minutes during market hours: screen the watchlist, rank candidates, size, and open new CSPs / CCs. |
-| **Monitor** | Continuously price open positions; take profit, alert on short-DTE, track excursions. |
-| **Executor** | Places and confirms orders through Robinhood; never leaves an order in an unknown state. |
-| **Reconcile** | Keeps the bot's ledger in sync with what Robinhood actually reports (assignments, expiries, fills). |
-| **Risk** | Position/sizing caps, entry gates, a **loss circuit breaker**, and an instant kill switch. |
-| **Dashboard** | A password-protected, phone-first web page: health, positions, weekly **and** all-time P&L, the "why" behind every decision, a daily **Setups** read with measured edge and per-name risk profiles, a **Weekly tactical brief** archive, and a **Tuning** tab to change config live from your phone. |
+| **Scanner** | During the scan window: screen, size, and POST one alert per new CSP or covered call. |
+| **Score** | Mark each open alert taken, stale, or expired. One exit webhook per held short. One scorecard row at expiry. |
+| **Monitor** | Price positions already on the account and send a close signal. It does not submit an order. |
+| **Dashboard** | Password-protected page: health, positions, the decision log, setups, the weekly brief, and config edits. |
 
-All of it runs as **one small Docker container** that keeps its state (a local SQLite database + your login token) on a persistent volume. Market data — option chains, quotes, greeks, IV, open interest, and daily price bars — is pulled from **Robinhood's own connection** (`market_data.provider: robinhood`), so there are **no separate data subscriptions**.
+One Docker container. State is a SQLite file plus the login token on a persistent volume. Chains, quotes, greeks, IV, open interest, and daily bars come from the Robinhood login (`market_data: robinhood` in the example config). No separate data subscription. Pause mutes new alert webhooks.
 
 ## What you need
 
@@ -326,7 +317,7 @@ rules:                           # each rule needs rule_type (required by the co
     enabled: true
     requires_approval: false
     params:
-      profit_pct: 0.5            # close once 50% of the credit is captured
+      profit_pct: 0.5            # alert once 50% of the credit is captured
 ```
 
 ### Exit rules from the dashboard
@@ -338,7 +329,7 @@ The owner login can tune exit rules on the dashboard **Rules** tab. The view-onl
 | `profit_pct` | profit target | 0.05–0.95 |
 | `loss_mult` | stop loss | 1.0–10, or off |
 | `delta_stop` | stop loss | 0.1–1.0, or off |
-| `dte_threshold` | DTE close | whole number 0–30 |
+| `dte_threshold` | DTE | whole number 0–30 |
 
 **Stop-loss triggers.** `null` means that trigger is off. `0` is not off (it would trip immediately) and is rejected. Turning off `loss_mult` leaves `delta_stop` active, and the other way around. Turning **both** triggers off while the rule stays enabled is rejected — disable the rule itself (`enabled: false`) to turn stop-loss off. You can turn the rule back on later and set either trigger again.
 
@@ -346,7 +337,7 @@ Saving posts the full rules list plus the signature of the rules the form was lo
 
 A successful save that actually changes a value is applied in place, written to the data-disk overlay (it overrides `config.yaml`), and recorded as a `CONFIG_EDIT` audit row. Changed fields are stored as `rules.<name>.<field>: {old, new}` — for example `rules.stop-loss.params.loss_mult` from `2.0` to `null`. A save whose leaf diff is empty writes no `CONFIG_EDIT` row, so a no-op does not ping Watchman. Every real change still does.
 
-The monitor reloads exit rules on its next poll. A disabled profit-target, stop-loss, or DTE rule is not evaluated. Turning **tv-signal** off is read live. The webhook stores a close alert that arrives while it is off as already expired, and the monitor expires any still-new alerts on every cycle, including when the order window is closed. The processor also re-checks the rule before each alert in a batch. None of those paths match, open a close decision, or call the executor or the approval gate, so turning the rule back on does not replay them. Alerts that arrive after it is on still close. Mode, live-arming, broker, and the hard-coded real-order lock are not on this screen.
+The monitor reloads these rules on its next poll. A disabled profit-target, stop-loss, or DTE rule is not evaluated. Turning **tv-signal** off is read on the next cycle. An alert that arrives while it is off is stored expired, and any still-new alerts are expired every cycle, including outside the scan window. The processor checks the rule again before each alert in a batch, so turning it back on does not replay them. A later alert is recorded only. This screen does not place an order. `ORDERS_HARD_DISABLED` stays on.
 
 Tune the yield floor and delta band to your own risk tolerance. Higher `min_annualized_yield` = fewer, richer, higher-IV trades; lower = more, thinner ones. The defaults above are the ones that survived a real-option-print backtest under both fair and worst-case fills; **[docs/backtests.md](docs/backtests.md)** lists every lever tested, what held up, and what did not.
 

@@ -1,7 +1,7 @@
 [project]
 name = "thetabot"
 version = "0.1.0"
-description = "Local agentic platform that monitors and closes Robinhood options positions (covered calls + cash-secured puts) by rule or signal."
+description = "Alert-only options scanner: reads Robinhood, sends webhook alerts, never places orders."
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.6",
