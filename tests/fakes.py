@@ -125,6 +125,45 @@ class PaperBroker:
         self._refuse("submit_equity_order")
 
 
+class RecordingReadBroker:
+    """Records the account_number the monitor passes into the positions read.
+
+    Stands in for the Robinhood session. ``get_open_positions`` stores the argument
+    the live broker sends to ``get_option_positions``. Synthetic ids only.
+    """
+
+    def __init__(self, account_number: str = "", positions: list[Position] | None = None):
+        self.account_number = str(account_number or "").strip()
+        self._positions = list(positions or [])
+        self.position_calls: list[dict] = []
+        self._account_unresolved = not bool(self.account_number)
+
+    def capabilities(self) -> BrokerCapabilities:
+        return BrokerCapabilities(
+            name="recording", supports_options_orders=False, is_paper=False,
+            notes="recording fake",
+        )
+
+    async def ensure_account_number(self, account_number: str | None = None) -> str:
+        explicit = str(account_number or "").strip()
+        if explicit:
+            return explicit
+        return self.account_number
+
+    async def get_open_positions(self, account_number: str | None = None):
+        acct = str(account_number or "").strip()
+        self.position_calls.append({
+            "tool": "get_option_positions",
+            "account_number": acct,
+        })
+        if not acct:
+            return []
+        return list(self._positions)
+
+    async def get_order(self, order):
+        return order
+
+
 class OrderStore:
     """Empty stand-in. The orders table still exists in the schema; this is not that store."""
 
