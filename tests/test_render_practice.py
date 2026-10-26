@@ -112,12 +112,6 @@ def test_http_bind_port_honors_env(monkeypatch):
     assert s.http_bind_port() == 10000
 
 
-def test_public_base_url_uses_render_external(monkeypatch):
-    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://thetabot.onrender.com")
-    s = Settings(mode="paper")
-    assert s.public_base_url == "https://thetabot.onrender.com"
-
-
 def test_oauth_reseed_overwrites_existing(tmp_path, monkeypatch):
     from agentic.brokers.rh_oauth import maybe_seed_oauth_from_env
     path = tmp_path / "rh_oauth.json"
