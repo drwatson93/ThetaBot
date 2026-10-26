@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
@@ -163,6 +164,11 @@ _ROLE_HINTS: dict[str, tuple[tuple[str, ...], ...]] = {
 }
 
 class RobinhoodMCPBroker(ExecutionBroker):
+    # Unrecognized reply list keys already warned about. Once per process, so a
+    # stable unknown shape does not warn on every poll.
+    _unknown_record_keys_logged: set[str] = set()
+    _POSITION_POLL_LOG_SECONDS = 15 * 60
+
     def __init__(self, url: str = MCP_URL, account_number: str = "", settings=None):
         self.url = url
         self._account_number = str(account_number or "").strip()
@@ -186,6 +192,9 @@ class RobinhoodMCPBroker(ExecutionBroker):
         # persisted between calls, so refresh stays headless.
         self._provider: Any = None
         self._session_lock = asyncio.Lock()
+        # Position-poll INFO line: last counts, and when they were logged.
+        self._position_poll_sig: tuple | None = None
+        self._position_poll_at: float = 0.0
 
     # ------------------------------------------------------------------ lifecycle
     async def connect(self) -> None:
@@ -348,14 +357,27 @@ class RobinhoodMCPBroker(ExecutionBroker):
         option_ids = [str(r["option_id"]) for r in records if r.get("option_id")]
         instruments = await self._fetch_instruments(option_ids)
         positions: list[Position] = []
+        drops = {
+            "not_short": 0, "qty_0": 0, "missing_fields": 0,
+            "instrument_lookup": 0, "other": 0,
+        }
         for item in records:
             try:
-                pos = self._map_position(item, instruments)
+                pos, reason = self._map_position_result(item, instruments)
             except Exception as exc:  # noqa: BLE001 — skip a malformed row, not the cycle
-                log.warning("Skipping unmappable position record: %s (%s)", item, exc)
+                drops["other"] += 1
+                log.warning(
+                    "Skipping unmappable position record (%s)", type(exc).__name__,
+                )
                 continue
-            if pos is not None:
-                positions.append(pos)
+            if reason:
+                drops[reason] = drops.get(reason, 0) + 1
+                continue
+            if pos is None:
+                drops["other"] += 1
+                continue
+            positions.append(pos)
+        self._log_position_poll(acct, raw, len(records), len(positions), drops)
         return positions
 
     async def get_order(self, order: Order) -> Order:
@@ -364,7 +386,13 @@ class RobinhoodMCPBroker(ExecutionBroker):
             return order
         # get_option_orders is a LIST tool; fetch recent orders (a per-id filter isn't confirmed
         # supported) and match our order by id, so the fill poll reads the RIGHT order's state.
-        raw = await self._call_tool(role, {"account_number": self._account_number})
+        acct = await self.ensure_account_number()
+        if not acct:
+            log.warning(
+                "Skipping get_option_orders: account_number is required and unresolved."
+            )
+            return order
+        raw = await self._call_tool(role, {"account_number": acct})
         rec = self._match_order_record(raw, order.broker_order_id)
         return self._apply_order_status(order, rec) if rec else order
 
@@ -379,10 +407,14 @@ class RobinhoodMCPBroker(ExecutionBroker):
             if iid is None:
                 raw = await self._call_tool("get_indexes", {})
                 for rec in self._iter_records(raw):
-                    for idx in (rec.get("indexes") or []):
+                    nested = rec.get("indexes")
+                    rows = nested if isinstance(nested, list) else [rec]
+                    for idx in rows:
+                        if not isinstance(idx, dict):
+                            continue
                         sym, i = idx.get("symbol"), idx.get("id")
                         if sym and i:
-                            self._index_ids[sym.upper()] = i
+                            self._index_ids[str(sym).upper()] = i
                 iid = self._index_ids.get(symbol.upper())
             if not iid:
                 return None
@@ -568,7 +600,16 @@ class RobinhoodMCPBroker(ExecutionBroker):
         role = self._roles.get("get_equity_orders")
         if not role:
             raise RuntimeError("Robinhood MCP did not expose get_equity_orders.")
-        raw = await self._call_tool(role, {"account_number": self._account_number, "order_id": order_id})
+        acct = await self.ensure_account_number()
+        if not acct:
+            log.warning(
+                "Skipping get_equity_orders: account_number is required and unresolved."
+            )
+            raise RuntimeError(
+                "Robinhood account_number is required for get_equity_orders "
+                "and could not be resolved."
+            )
+        raw = await self._call_tool(role, {"account_number": acct, "order_id": order_id})
         rec = self._match_order_record(raw, order_id) or self._first_record(raw)
         return self._parse_equity_order(rec)
 
@@ -682,17 +723,31 @@ class RobinhoodMCPBroker(ExecutionBroker):
         """Normalize a tool result into a list of record dicts.
 
         RH MCP wraps payloads as ``{"data": {...}, "guide": ...}`` — unwrap ``data`` first,
-        then pull the inner collection (positions / orders / instruments / results / items).
+        then pull the inner collection (positions / option_positions / orders /
+        instruments / results / items). One unrecognized list-of-dicts value is
+        used too, with a warning that names the key.
         """
         if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
             raw = raw["data"]
         if isinstance(raw, list):
             return [r for r in raw if isinstance(r, dict)]
         if isinstance(raw, dict):
-            for key in ("results", "positions", "orders", "instruments", "items"):
+            for key in (
+                "results", "positions", "option_positions", "orders", "instruments", "items",
+            ):
                 val = raw.get(key)
                 if isinstance(val, list):
                     return [r for r in val if isinstance(r, dict)]
+            lists = [
+                (key, val) for key, val in raw.items()
+                if isinstance(val, list) and all(isinstance(item, dict) for item in val)
+            ]
+            if len(lists) == 1:
+                key, val = lists[0]
+                if key not in RobinhoodMCPBroker._unknown_record_keys_logged:
+                    RobinhoodMCPBroker._unknown_record_keys_logged.add(key)
+                    log.warning("Tool reply used unrecognized list key %s", key)
+                return list(val)
             return [raw]
         return []
 
@@ -735,33 +790,86 @@ class RobinhoodMCPBroker(ExecutionBroker):
         return f"{underlying}{expiration:%y%m%d}{cp}{int(round(strike * 1000)):08d}"
 
     @staticmethod
+    def _reply_key_names(raw: Any) -> list[str]:
+        """Top-level key names of a tool reply. A list has no keys."""
+        if isinstance(raw, dict):
+            return sorted(str(k) for k in raw.keys())
+        if isinstance(raw, list):
+            return ["list"]
+        return []
+
+    def _log_position_poll(
+        self, acct: str, raw: Any, raw_count: int, mapped: int, drops: dict[str, int],
+    ) -> None:
+        """One INFO line per poll, throttled unless the shape is hiding rows.
+
+        Counts and key names only. The account is the last 4 digits. No tickers,
+        amounts, or reply bodies. Always logged when raw rows exist and none map.
+        """
+        keys = self._reply_key_names(raw)
+        signature = (
+            raw_count, mapped,
+            tuple(drops[k] for k in (
+                "not_short", "qty_0", "missing_fields", "instrument_lookup", "other",
+            )),
+            tuple(keys),
+        )
+        now = time.monotonic()
+        changed = signature != self._position_poll_sig
+        elapsed = now - self._position_poll_at
+        due = self._position_poll_at == 0.0 or elapsed >= self._POSITION_POLL_LOG_SECONDS
+        forced = raw_count > 0 and mapped == 0
+        if self._position_poll_sig is not None and not (changed or due or forced):
+            return
+        self._position_poll_sig = signature
+        self._position_poll_at = now
+        last4 = acct[-4:] if len(acct) >= 4 else "????"
+        log.info(
+            "Option position poll acct=****%s raw=%d keys=%s mapped=%d "
+            "dropped=not_short:%d,qty_0:%d,missing_fields:%d,instrument_lookup:%d,other:%d",
+            last4, raw_count, ",".join(keys) if keys else "-", mapped,
+            drops["not_short"], drops["qty_0"], drops["missing_fields"],
+            drops["instrument_lookup"], drops["other"],
+        )
+
+    @staticmethod
     def _map_position(
         rec: dict[str, Any], instruments: dict[str, dict[str, Any]]
     ) -> Position | None:
-        """Map a get_option_positions record (+ enriched instrument) -> domain Position.
+        pos, _reason = RobinhoodMCPBroker._map_position_result(rec, instruments)
+        return pos
+
+    @staticmethod
+    def _map_position_result(
+        rec: dict[str, Any], instruments: dict[str, dict[str, Any]]
+    ) -> tuple[Position | None, str | None]:
+        """Map a record, or ``(None, reason)`` when the row is dropped.
 
         Only SHORT option positions are relevant (we close premium we sold). The positions
         query already filters type=short, but we re-check defensively. Strike, call/put, and
         the OCC symbol come from the instrument lookup (``instruments`` keyed by option_id);
         chain_symbol/quantity/average_price/expiration come from the position record.
 
-        TODO(verify-live): the position-record field names below (quantity, average_price,
+        Reasons: ``qty_0``, ``not_short``, ``missing_fields``, ``instrument_lookup``.
+
+        TODO(verify-live): the position-record field names (quantity, average_price,
         type, chain_symbol, expiration_date) and the per-share-vs-per-contract scaling of
         average_price are inferred from the tool guide — confirm against a real RH short.
         """
         oid = str(rec.get("option_id") or "")
         inst = instruments.get(oid, {})
+        lookup_failed = bool(oid) and oid not in instruments
 
         try:
             qty = int(float(rec.get("quantity") or rec.get("qty") or 0))
         except (TypeError, ValueError):
-            return None
+            return None, "other"
         if qty == 0:
-            return None
+            return None, "qty_0"
         # Short positions: type=short (RH), or negative qty, or an explicit sell side flag.
         side = str(rec.get("type") or rec.get("side") or rec.get("position_type") or "").lower()
         if not (qty < 0 or side in ("short", "sell", "sell_to_open")):
-            return None
+            return None, "not_short"
 
         opt_type = str(inst.get("type") or rec.get("option_type") or rec.get("type") or "").upper()
         option_type = OptionType.PUT if opt_type.startswith("P") else OptionType.CALL
@@ -778,7 +886,9 @@ class RobinhoodMCPBroker(ExecutionBroker):
                   or rec.get("credit_received") or rec.get("avg_price"))
 
         if expiration is None or credit is None or not underlying or strike <= 0:
-            return None
+            if lookup_failed:
+                return None, "instrument_lookup"
+            return None, "missing_fields"
         # VERIFIED LIVE 2026-07-22: RH's average_price is PER-CONTRACT dollars ($0.20/share x 100 =
         # 20.0), not per-share. Scale to per-share by the contract multiplier so credit_received
         # matches the rest of the system (per-share) — else P&L and the profit-target rule are 100x off.
@@ -800,7 +910,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
             broker_position_id=str(rec.get("id") or rec.get("position_id") or "") or None,
             option_id=oid or None,
             status=PositionStatus.OPEN,
-        )
+        ), None
 
     @staticmethod
     def _apply_order_status(order: Order, raw: Any) -> Order:
