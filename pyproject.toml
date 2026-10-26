@@ -36,6 +36,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentic"]
 
+# dashboard.html is the page template. Hatchling's wheel only packs Python
+# files unless they are force-included; the destination is the installed package.
+[tool.hatch.build.targets.wheel.force-include]
+"src/agentic/web/dashboard.html" = "agentic/web/dashboard.html"
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"

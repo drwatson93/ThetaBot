@@ -1,5 +1,7 @@
 """Dashboard: compute_stats P&L/win-rate logic + read-only API endpoints."""
 from datetime import date, datetime, timedelta, timezone
+from importlib.resources import files
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -144,6 +146,33 @@ def test_dashboard_ships_control_ui(tmp_path):
                    'data-tab="tuning"', 'id="tn-uc"', 'id="tn-em"', 'id="tn-vrp"',
                    'id="tn-pt-sym"', 'id="tn-pt-save"'):
         assert marker in page, f"missing dashboard marker: {marker!r}"
+
+
+def test_served_dashboard_matches_template_file(tmp_path):
+    """GET / and /dashboard serve dashboard.html with the five placeholders filled."""
+    from agentic.web.dashboard import _PAGE, _page_for
+
+    on_disk = Path("src/agentic/web/dashboard.html").read_bytes()
+    packaged = files("agentic.web").joinpath("dashboard.html").read_bytes()
+    assert _PAGE.encode("utf-8") == on_disk == packaged
+
+    db = Database(tmp_path / "page.db")
+    audit = AuditStore(db)
+    deps = WebDeps(
+        settings=Settings(mode="paper"), signals=SignalStore(db),
+        killswitch=KillSwitch(db, audit), approval_gate=None, audit=audit,
+        positions=PositionStore(db), orders=OrderStore(db), decisions=DecisionStore(db),
+    )
+    client = TestClient(create_app(deps))
+    expected = _page_for("owner", deps)
+    assert client.get("/dashboard").text == expected
+    assert client.get("/").text == expected
+    for token in (
+        "__TB_ROLE__", "__HEALTH_INNER__", "__ALERT_ROWS__",
+        "__PAUSE_BTN__", "__QUOTE_MAX_AGE__",
+    ):
+        assert token in _PAGE
+        assert token not in expected
 
 
 def test_option_oi_fail_open_without_rh_broker(tmp_path):
