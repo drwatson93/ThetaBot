@@ -11,9 +11,8 @@ non-finite, returns None. The card shows an em dash. This never returns
 Infinity or NaN.
 
 The plan sentence is built from ``settings.rules`` (the same list a hot edit
-replaces in memory). Rolls are not in that list: a credit roll is
-``settings.roll`` / ``RollManager``, off unless that separate flag is on, and
-this sentence does not claim one.
+replaces in memory). A credit roll is not one of those rules, and this
+sentence does not claim one.
 """
 from __future__ import annotations
 

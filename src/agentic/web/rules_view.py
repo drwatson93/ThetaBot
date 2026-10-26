@@ -164,13 +164,5 @@ def describe_active_rules(
         "Price starts at the bid/ask midpoint and steps toward a fill, capped by slippage.")
     add("Orders", "Quote freshness", f"{s.max_quote_age_seconds}s",
         "A fresh quote is fetched immediately before each order.")
-    add("Orders", "Fill timeout / reprice",
-        f"{s.execution.fill_timeout_seconds}s timeout, reprice after {s.execution.reprice_after_seconds}s",
-        "The working order must actually cancel before a replacement is sent. Unfilled closes are cancelled.")
-    add("Orders", "Slippage cap", _pct(s.execution.slippage_cap_pct),
-        "A buy-to-close never pays more than ask × (1 + cap). A sell-to-open never goes below bid × (1 − cap).")
-
-    add("Rolls", "Roll tested puts", _on(s.roll.enabled),
-        "Both legs must be ready before the old put is bought back. A half-roll is never started on purpose.")
 
     return rows

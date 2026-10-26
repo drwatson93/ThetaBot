@@ -1,6 +1,6 @@
-"""Outbound instant trade alerts (webhook POST on fill).
+"""Outbound instant scan alerts (webhook POST).
 
-Fires after ThetaBot records an open/close fill. Never on the trading path:
+Fires when the scanner records a new play. Never raises into the scan:
 background thread, ~3s timeout, one retry, all failures swallowed/logged.
 The webhook URL (TRADE_ALERT_URL) and optional sender-key header value
 (TRADE_ALERT_HEADER_VALUE) are never logged, printed, or returned.
@@ -17,8 +17,8 @@ from datetime import date, datetime
 from typing import Any
 
 from ..config import Settings, get_secret, is_usable_secret
-from ..domain.enums import AuditEventType, OptionType, PositionStatus
-from ..domain.models import EntryDecision, Order, Position, utcnow
+from ..domain.enums import AuditEventType, OptionType
+from ..domain.models import utcnow
 from ..store.audit import AuditStore
 from ..store.db import Database
 
@@ -36,13 +36,6 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
 _BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+\S+")
 _COLON_TOKEN_RE = re.compile(r":\s*\S+")
-_SIDES = {
-    "SELL_TO_OPEN": "STO",
-    "BUY_TO_CLOSE": "BTC",
-    "SELL_TO_CLOSE": "STC",
-    "BUY_TO_OPEN": "BTO",
-}
-
 # OCC: <root><YYMMDD><C|P><strike*1000, 8 digits> — trailing 15 chars are fixed.
 def _parse_occ(occ: str) -> tuple[str, date, str, float] | None:
     if not occ or len(occ) < 16:
@@ -135,11 +128,6 @@ def sanitize_error(exc: BaseException, url: str | None = None) -> str:
     return msg[:400]
 
 
-def _action(side: str | None) -> str:
-    key = (side or "").upper()
-    return _SIDES.get(key, key or "STO")
-
-
 def _fmt_strike(strike: float) -> str:
     if float(strike).is_integer():
         return str(int(strike))
@@ -152,11 +140,6 @@ def _fmt_limit(px: float) -> str:
 
 def _money_int(n: float) -> int:
     return int(round(n))
-
-
-def _fmt_signed_dollars(n: float) -> str:
-    mag = abs(_money_int(n))
-    return f"+${mag}" if n >= 0 else f"-${mag}"
 
 
 def _right(*, option_type: OptionType | str | None = None, occ: str = "") -> str:
@@ -189,11 +172,6 @@ def _ticker(underlying: str | None, occ: str = "") -> str:
     return parsed[0].upper() if parsed else ""
 
 
-def _contracts(order: Order) -> int:
-    qty = order.filled_qty or 0
-    return qty if qty > 0 else int(order.quantity or 0)
-
-
 def _iso(ts: datetime | None = None) -> str:
     t = ts or utcnow()
     if t.tzinfo is None:
@@ -216,23 +194,6 @@ def format_open_line(
     return (
         f"{action} {contracts} {ticker} {_fmt_strike(strike)}{right} {expiry} "
         f"@{_fmt_limit(limit_price)} (${_money_int(premium)})"
-    )
-
-
-def format_close_line(
-    *,
-    action: str,
-    contracts: int,
-    ticker: str,
-    strike: float,
-    right: str,
-    expiry: str,
-    limit_price: float,
-    realized_pnl: float,
-) -> str:
-    return (
-        f"{action} {contracts} {ticker} {_fmt_strike(strike)}{right} {expiry} "
-        f"@{_fmt_limit(limit_price)} ({_fmt_signed_dollars(realized_pnl)})"
     )
 
 
@@ -283,80 +244,6 @@ def build_scan_alert_payload(
         "premium": premium,
         "bid": bid,
         "ask": ask,
-    }
-
-
-def build_open_payload(decision: EntryDecision, order: Order, *, mode: str) -> dict[str, Any]:
-    contracts = _contracts(order)
-    limit = float(order.limit_price)
-    premium = round(limit * contracts * 100, 2)
-    ticker = _ticker(decision.underlying, decision.occ_symbol or order.occ_symbol)
-    right = _right(occ=decision.occ_symbol or order.occ_symbol)
-    expiry = _expiry_mmdd(decision.expiration, decision.occ_symbol or order.occ_symbol)
-    action = _action(order.side)
-    strike = float(decision.strike)
-    return {
-        "event": "trade_open",
-        "trade_id": order.id,
-        "summary": format_open_line(
-            action=action, contracts=contracts, ticker=ticker, strike=strike,
-            right=right, expiry=expiry, limit_price=limit, premium=premium,
-        ),
-        "ticker": ticker,
-        "action": action,
-        "contracts": contracts,
-        "strike": strike,
-        "right": right,
-        "expiry": expiry,
-        "limit_price": limit,
-        "premium": premium,
-        "realized_pnl": None,
-        "order_type": order.order_type,
-        "bid": order.bid,
-        "ask": order.ask,
-        "filled_at": _iso(order.last_status_at or utcnow()),
-        "mode": mode,
-    }
-
-
-def build_close_payload(position: Position, order: Order, *, mode: str) -> dict[str, Any]:
-    from dataclasses import replace
-
-    from ..services.stats import position_pnl
-
-    contracts = _contracts(order)
-    limit = float(order.limit_price)
-    ticker = _ticker(position.underlying, position.occ_symbol or order.occ_symbol)
-    right = _right(option_type=position.option_type, occ=position.occ_symbol or order.occ_symbol)
-    expiry = _expiry_mmdd(position.expiration, position.occ_symbol or order.occ_symbol)
-    action = _action(order.side)
-    strike = float(position.strike)
-    closed = replace(position, status=PositionStatus.CLOSED)
-    info = position_pnl(closed, order)
-    pnl = info.get("realized_pnl")
-    if pnl is None:
-        pnl = 0.0
-    return {
-        "event": "trade_close",
-        "trade_id": order.id,
-        "summary": format_close_line(
-            action=action, contracts=contracts, ticker=ticker, strike=strike,
-            right=right, expiry=expiry, limit_price=limit, realized_pnl=float(pnl),
-        ),
-        "ticker": ticker,
-        "action": action,
-        "contracts": contracts,
-        "strike": strike,
-        "right": right,
-        "expiry": expiry,
-        "limit_price": limit,
-        "premium": None,
-        "realized_pnl": pnl,
-        "order_type": order.order_type,
-        "bid": order.bid,
-        "ask": order.ask,
-        "filled_at": _iso(order.last_status_at or utcnow()),
-        "mode": mode,
     }
 
 
@@ -488,8 +375,8 @@ class TradeAlerts:
         None when delivery is not attempted (alerts off, or no webhook).
         False when the POST failed, including its one retry. True only after
         ``_deliver`` returns ok. Background mode — the production default —
-        runs that POST on the same daemon thread as a fill alert, then applies
-        the result on the event loop before this returns.
+        runs that POST on a daemon thread, then applies the result on the
+        event loop before this returns.
         """
         try:
             if not self.should_send():
@@ -531,26 +418,6 @@ class TradeAlerts:
             log.warning("scan alert dispatch failed")
             return False
 
-    def notify_fill(self, payload: dict[str, Any]) -> None:
-        """Fire-and-forget. Never raises into the caller (trading path)."""
-        try:
-            if not self.should_send():
-                return
-            url = _webhook_url()
-            if not url:
-                return
-            loop = self._running_loop()
-            if self._background:
-                threading.Thread(
-                    target=self._deliver_bg, args=(url, payload, loop),
-                    daemon=True, name="trade-alert",
-                ).start()
-            else:
-                ok, err = _deliver(url, payload)
-                self._finish_delivery(payload, ok, err)
-        except Exception:  # noqa: BLE001 — never break trading
-            log.warning("trade alert dispatch failed")
-
     async def send_test(self) -> dict[str, Any]:
         """Owner-initiated test POST. HTTP runs in a worker thread; DB stays on the loop."""
         try:
@@ -565,41 +432,6 @@ class TradeAlerts:
             err = sanitize_error(exc)
             log.warning("trade alert failed event=test err=%s", err)
             return {"ok": False, "error": err}
-
-    def _running_loop(self) -> asyncio.AbstractEventLoop | None:
-        try:
-            return asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-
-    def _deliver_bg(
-        self,
-        url: str,
-        payload: dict[str, Any],
-        loop: asyncio.AbstractEventLoop | None,
-    ) -> None:
-        """HTTP only. Never touches the shared sqlite connection."""
-        try:
-            ok, err = _deliver(url, payload)
-            self._log_result(payload, ok, err)
-            self._schedule_record(loop, ok, err)
-        except Exception as exc:  # noqa: BLE001
-            err = sanitize_error(exc, url)
-            log.warning("trade alert failed: %s", err)
-            self._schedule_record(loop, False, err)
-
-    def _schedule_record(
-        self,
-        loop: asyncio.AbstractEventLoop | None,
-        ok: bool,
-        error: str | None,
-    ) -> None:
-        if loop is None or not loop.is_running():
-            return
-        try:
-            loop.call_soon_threadsafe(self._record_delivery, ok, error)
-        except Exception:  # noqa: BLE001 — never persist from this thread as a fallback
-            log.warning("trade alert status persist schedule failed")
 
     def _finish_delivery(
         self, payload: dict[str, Any], ok: bool, error: str | None

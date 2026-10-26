@@ -1,7 +1,6 @@
-"""Instant trade alerts: payload format, send gates, persistence, and owner-only auth."""
+"""Scan-alert webhook: payload shape, send gates, persistence, and owner-only auth."""
 from __future__ import annotations
 
-import asyncio
 import json
 import threading
 from datetime import date
@@ -11,16 +10,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agentic.config import Settings
-from agentic.domain.enums import (
-    AuditEventType, Direction, OptionType, OrderStatus, Strategy,
-)
-from agentic.domain.models import EntryDecision, Order, Position
+from agentic.domain.enums import AuditEventType
 from agentic.notify import trade_alerts as ta_mod
 from agentic.notify.trade_alerts import (
-    INVALID_HEADER_NAME_ERROR, TradeAlerts, build_close_payload,
-    build_open_payload, format_close_line, format_open_line, sanitize_error,
+    INVALID_HEADER_NAME_ERROR, TradeAlerts, build_scan_alert_payload,
+    format_open_line, sanitize_error,
 )
-from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
@@ -47,142 +42,187 @@ def _alerts(tmp_path, monkeypatch, *, url=None, background=False):
     return TradeAlerts(db, audit, settings, background=background), db, audit, settings
 
 
-def _open_decision_order():
-    d = EntryDecision(
-        underlying="HIMS", occ_symbol="HIMS261009P00027000", option_id=None,
-        strike=27, expiration=date(2026, 10, 9), contracts=2, premium=0.23,
-        rule_name="csp", reason="t", dedup_key="k",
-    )
-    o = Order(
-        decision_id=d.id, position_id="", occ_symbol=d.occ_symbol, quantity=2,
-        limit_price=0.23, is_paper=True, side="SELL_TO_OPEN", filled_qty=2,
-        bid=0.22, ask=0.24, order_type="LIMIT",
-    )
-    return d, o
+_SCAN_KEYS = {
+    "event", "trade_id", "summary", "kind", "ticker", "occ", "action",
+    "contracts", "strike", "right", "expiry", "limit_price", "premium",
+    "bid", "ask",
+}
+_BALANCE_WORDS = (
+    "balance", "buying_power", "equity", "cash", "account", "realized_pnl",
+    "unrealized", "portfolio",
+)
 
 
-def _close_position_order():
-    pos = Position(
-        occ_symbol="HIMS261009P00026000", underlying="HIMS", option_type=OptionType.PUT,
-        strategy=Strategy.CASH_SECURED_PUT, direction=Direction.SHORT, quantity=3,
-        strike=26, expiration=date(2026, 10, 9), credit_received=0.32,
+def _scan(**overrides):
+    fields = dict(
+        alert_id="alert-aaa",
+        kind="CSP",
+        underlying="AAA",
+        occ="AAA261009P00027000",
+        strike=27.0,
+        expiration=date(2026, 10, 9),
+        contracts=2,
+        bid=0.22,
+        ask=0.24,
+        mid=0.23,
     )
-    o = Order(
-        decision_id="d", position_id=pos.id, occ_symbol=pos.occ_symbol, quantity=3,
-        limit_price=0.13, is_paper=True, side="BUY_TO_CLOSE", filled_qty=3,
-        avg_fill_price=0.13, bid=0.12, ask=0.14, order_type="LIMIT",
-        status=OrderStatus.FILLED,
+    fields.update(overrides)
+    return build_scan_alert_payload(**fields)
+
+
+def _exit_scan():
+    return _scan(
+        alert_id="alert-bbb",
+        kind="exit",
+        underlying="BBB",
+        occ="BBB261009P00026000",
+        strike=26.0,
+        contracts=3,
+        bid=0.12,
+        ask=0.14,
+        mid=0.13,
     )
-    return pos, o
+
+
+async def _send(alerts, payload=None):
+    return await alerts.deliver_scan_alert(_scan() if payload is None else payload)
+
+
+def _assert_no_balances_or_secrets(payload: dict) -> None:
+    blob = json.dumps(payload).lower()
+    for word in _BALANCE_WORDS:
+        assert word not in blob
+    assert HOOK not in blob
+    assert "secret" not in blob
+    assert "token" not in blob
+    assert "bearer" not in blob
 
 
 def test_open_line_format():
     line = format_open_line(
-        action="STO", contracts=2, ticker="HIMS", strike=27, right="P",
+        action="STO", contracts=2, ticker="AAA", strike=27, right="P",
         expiry="10/09", limit_price=0.23, premium=46,
     )
-    assert line == "STO 2 HIMS 27P 10/09 @0.23 ($46)"
+    assert line == "STO 2 AAA 27P 10/09 @0.23 ($46)"
 
 
-def test_close_line_format():
-    line = format_close_line(
-        action="BTC", contracts=3, ticker="HIMS", strike=26, right="P",
-        expiry="10/09", limit_price=0.13, realized_pnl=57,
-    )
-    assert line == "BTC 3 HIMS 26P 10/09 @0.13 (+$57)"
-    loss = format_close_line(
-        action="BTC", contracts=1, ticker="HIMS", strike=26, right="P",
-        expiry="10/09", limit_price=0.40, realized_pnl=-12,
-    )
-    assert loss.endswith("(-$12)")
-
-
-def test_open_payload_matches_recorded_prices():
-    d, o = _open_decision_order()
-    p = build_open_payload(d, o, mode="paper")
-    assert p["event"] == "trade_open"
-    assert p["trade_id"] == o.id
-    assert p["summary"] == "STO 2 HIMS 27P 10/09 @0.23 ($46)"
-    assert p["ticker"] == "HIMS"
+def test_scan_alert_payload_is_the_play():
+    p = _scan()
+    assert set(p) == _SCAN_KEYS
+    assert p["event"] == "scan_alert"
+    assert p["trade_id"] == "alert-aaa"
+    assert p["kind"] == "CSP"
+    assert p["summary"] == "STO 2 AAA 27P 10/09 @0.23 ($46)"
+    assert p["ticker"] == "AAA"
+    assert p["occ"] == "AAA261009P00027000"
     assert p["action"] == "STO"
     assert p["contracts"] == 2
-    assert p["strike"] == 27
+    assert p["strike"] == 27.0
     assert p["right"] == "P"
     assert p["expiry"] == "10/09"
     assert p["limit_price"] == 0.23
     assert p["premium"] == 46.0
-    assert p["realized_pnl"] is None
-    assert p["order_type"] == "LIMIT"
     assert p["bid"] == 0.22 and p["ask"] == 0.24
-    assert p["mode"] == "paper"
-    assert p["filled_at"]
+    _assert_no_balances_or_secrets(p)
 
 
-def test_close_payload_matches_recorded_pnl():
-    pos, o = _close_position_order()
-    p = build_close_payload(pos, o, mode="paper")
-    assert p["event"] == "trade_close"
-    assert p["trade_id"] == o.id
-    assert p["summary"] == "BTC 3 HIMS 26P 10/09 @0.13 (+$57)"
-    assert p["action"] == "BTC"
-    assert p["premium"] is None
-    assert p["realized_pnl"] == 57.0
-    assert p["limit_price"] == 0.13
-    assert p["right"] == "P"
+def test_scan_alert_payload_exit_and_covered_call():
+    exit_p = _exit_scan()
+    assert exit_p["event"] == "scan_alert"
+    assert exit_p["action"] == "BTC"
+    assert exit_p["right"] == "P"
+    assert exit_p["ticker"] == "BBB"
+    assert exit_p["contracts"] == 3
+    assert exit_p["limit_price"] == 0.13
+    assert exit_p["premium"] == 39.0
+    assert exit_p["summary"] == "BTC 3 BBB 26P 10/09 @0.13 ($39)"
+    _assert_no_balances_or_secrets(exit_p)
+
+    cc = _scan(
+        alert_id="alert-xyz",
+        kind="CC",
+        underlying="XYZ",
+        occ="XYZ261009C00050000",
+        strike=50.0,
+        contracts=1,
+        bid=0.95,
+        ask=1.05,
+        mid=1.0,
+    )
+    assert cc["action"] == "STO"
+    assert cc["right"] == "C"
+    assert cc["ticker"] == "XYZ"
+    assert cc["summary"] == "STO 1 XYZ 50C 10/09 @1.00 ($100)"
+    assert set(cc) == _SCAN_KEYS
+    _assert_no_balances_or_secrets(cc)
 
 
-def test_stc_bto_actions():
-    d, o = _open_decision_order()
-    o.side = "BUY_TO_OPEN"
-    assert build_open_payload(d, o, mode="paper")["action"] == "BTO"
-    pos, c = _close_position_order()
-    c.side = "SELL_TO_CLOSE"
-    assert build_close_payload(pos, c, mode="paper")["action"] == "STC"
-
-
-def test_noop_when_url_unset(tmp_path, monkeypatch):
+async def test_noop_when_url_unset(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: sent.append(a))
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=None)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is None
     assert sent == []
     assert alerts.status()["webhook_configured"] is False
     assert alerts.status()["last_status"] is None
 
 
 @pytest.mark.parametrize("mode", ["regular", "off"])
-def test_no_send_when_mode_not_instant(tmp_path, monkeypatch, mode):
+async def test_no_send_when_mode_not_instant(tmp_path, monkeypatch, mode):
     sent = []
     monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: sent.append(a))
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK)
     alerts.set_mode(mode)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is None
     assert sent == []
     assert alerts.status()["mode"] == mode
     assert alerts.status()["webhook_configured"] is True
 
 
-def test_send_when_instant_and_url_set(tmp_path, monkeypatch):
+async def test_send_when_instant_and_url_set(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(ta_mod, "_http_post", lambda url, payload, timeout=3.0: sent.append(payload))
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
-    payload = build_open_payload(*_open_decision_order(), mode="paper")
-    alerts.notify_fill(payload)
+    payload = _scan()
+    assert await _send(alerts, payload) is True
     assert len(sent) == 1
-    assert sent[0]["event"] == "trade_open"
+    assert sent[0]["event"] == "scan_alert"
     assert sent[0]["summary"].startswith("STO ")
+    assert sent[0]["ticker"] == "AAA"
+    _assert_no_balances_or_secrets(sent[0])
     st = alerts.status()
     assert st["last_status"] == "ok"
     assert st["last_error"] is None
     assert st["last_sent_at"]
 
 
-def test_failures_do_not_raise(tmp_path, monkeypatch):
-    monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: (_ for _ in ()).throw(
-        OSError(f"connection to {HOOK} failed")
-    ))
+async def test_delivery_retries_once_then_succeeds(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def post(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient")
+
+    monkeypatch.setattr(ta_mod, "_http_post", post)
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is True
+    assert calls["n"] == 2
+    assert alerts.status()["last_status"] == "ok"
+    assert alerts.status()["last_error"] is None
+
+
+async def test_failures_do_not_raise(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def post(*_a, **_k):
+        calls["n"] += 1
+        raise OSError(f"connection to {HOOK} failed")
+
+    monkeypatch.setattr(ta_mod, "_http_post", post)
+    alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
+    assert await _send(alerts) is False
+    assert calls["n"] == 2
     st = alerts.status()
     assert st["last_status"] == "error"
     assert st["last_error"]
@@ -307,7 +347,7 @@ def test_dashboard_has_alerts_control(tmp_path, monkeypatch):
 
 
 
-def test_ops_last_error_untouched_by_alert_failure(tmp_path, monkeypatch):
+async def test_ops_last_error_untouched_by_alert_failure(tmp_path, monkeypatch):
     """Watcher bots alarm on engine last_error; alert delivery must use alerts.last_error."""
     monkeypatch.setenv("TRADE_ALERT_URL", HOOK)
     db = Database(tmp_path / "ops-al.db")
@@ -315,7 +355,7 @@ def test_ops_last_error_untouched_by_alert_failure(tmp_path, monkeypatch):
     settings = Settings(mode="paper")
     alerts = TradeAlerts(db, audit, settings, background=False)
     monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is False
     deps = WebDeps(
         settings=settings, signals=SignalStore(db),
         killswitch=KillSwitch(db, audit), approval_gate=None, audit=audit,
@@ -343,11 +383,11 @@ def test_set_mode_does_not_touch_updated_at(tmp_path, monkeypatch):
     assert row["updated_at"] == stamp
 
 
-def test_record_delivery_does_not_touch_updated_at(tmp_path, monkeypatch):
+async def test_record_delivery_does_not_touch_updated_at(tmp_path, monkeypatch):
     monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: None)
     alerts, db, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
     stamp = _stamp_updated_at(db)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is True
     row = db.conn.execute(
         "SELECT updated_at, alerts_last_status FROM control WHERE id = 1"
     ).fetchone()
@@ -392,7 +432,7 @@ async def test_background_path_does_no_db_writes_off_loop_thread(tmp_path, monke
         lambda *a, **k: bg_threads.add(threading.get_ident()),
     )
 
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is True
     assert started
     for t in started:
         t.join(timeout=2)
@@ -400,7 +440,6 @@ async def test_background_path_does_no_db_writes_off_loop_thread(tmp_path, monke
     assert bg_threads
     assert set(db_threads).isdisjoint(bg_threads)
 
-    await asyncio.sleep(0)  # run call_soon_threadsafe persist on the loop thread
     assert alerts.status()["last_status"] == "ok"
     assert set(db_threads).isdisjoint(bg_threads)
     assert threading.get_ident() in db_threads
@@ -440,16 +479,19 @@ async def test_auth_header_sent_when_both_set(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
     captured = _capture_urlopen(monkeypatch)
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
-    alerts.notify_fill(build_close_payload(*_close_position_order(), mode="paper"))
+    assert await _send(alerts) is True
+    assert await _send(alerts, _exit_scan()) is True
     await alerts.send_test()
     assert len(captured) == 3
     events = []
     for req in captured:
         hdrs = _req_headers(req)
         assert hdrs.get(HEADER_NAME) == HEADER_VALUE
-        events.append(json.loads(req.data.decode("utf-8"))["event"])
-    assert events == ["trade_open", "trade_close", "test"]
+        body = json.loads(req.data.decode("utf-8"))
+        events.append(body["event"])
+        assert HEADER_VALUE not in req.data.decode("utf-8")
+        assert HOOK not in req.data.decode("utf-8")
+    assert events == ["scan_alert", "scan_alert", "test"]
 
 
 @pytest.mark.parametrize("name,value", [
@@ -459,7 +501,7 @@ async def test_auth_header_sent_when_both_set(tmp_path, monkeypatch):
     ("", HEADER_VALUE),
     (HEADER_NAME, ""),
 ])
-def test_auth_header_not_sent_when_either_missing(tmp_path, monkeypatch, name, value):
+async def test_auth_header_not_sent_when_either_missing(tmp_path, monkeypatch, name, value):
     if name is None:
         monkeypatch.delenv("TRADE_ALERT_HEADER_NAME", raising=False)
     else:
@@ -470,7 +512,7 @@ def test_auth_header_not_sent_when_either_missing(tmp_path, monkeypatch, name, v
         monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", value)
     captured = _capture_urlopen(monkeypatch)
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is True
     assert len(captured) == 1
     hdrs = _req_headers(captured[0])
     assert HEADER_NAME not in hdrs
@@ -488,14 +530,14 @@ def test_sanitize_error_redacts_header_value(monkeypatch):
     assert "[redacted]" in err
 
 
-def test_header_value_redacted_from_delivery_error(tmp_path, monkeypatch):
+async def test_header_value_redacted_from_delivery_error(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", HEADER_NAME)
     monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
     monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: (_ for _ in ()).throw(
         OSError(f"rejected key {HEADER_VALUE} at {HOOK}")
     ))
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is False
     st = alerts.status()
     assert st["last_status"] == "error"
     assert HEADER_VALUE not in (st["last_error"] or "")
@@ -530,13 +572,13 @@ FULL_HEADER_LINE_KEY = "rh_whsec_prod_abc123XYZ"
 FULL_HEADER_LINE = f"Authorization: Bearer {FULL_HEADER_LINE_KEY}"
 
 
-def test_invalid_header_name_full_line_does_not_send(tmp_path, monkeypatch):
+async def test_invalid_header_name_full_line_does_not_send(tmp_path, monkeypatch):
     """Owner pasted 'Authorization: Bearer <key>' into TRADE_ALERT_HEADER_NAME."""
     monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", FULL_HEADER_LINE)
     monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
     captured = _capture_urlopen(monkeypatch)
     alerts, *_ = _alerts(tmp_path, monkeypatch, url=HOOK, background=False)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is False
     assert captured == []
     st = alerts.status()
     assert st["auth_header_configured"] is False
@@ -547,12 +589,12 @@ def test_invalid_header_name_full_line_does_not_send(tmp_path, monkeypatch):
     assert "Bearer" not in (st["last_error"] or "")
 
 
-def test_invalid_header_name_error_never_on_ops(tmp_path, monkeypatch):
+async def test_invalid_header_name_error_never_on_ops(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADE_ALERT_URL", HOOK)
     monkeypatch.setenv("TRADE_ALERT_HEADER_NAME", FULL_HEADER_LINE)
     monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", HEADER_VALUE)
     client, alerts, _ = _client(tmp_path, monkeypatch)
-    alerts.notify_fill(build_open_payload(*_open_decision_order(), mode="paper"))
+    assert await _send(alerts) is False
     for path in ("/api/ops", "/control/status"):
         body = client.get(path).json()
         assert body["alerts"]["auth_header_configured"] is False
