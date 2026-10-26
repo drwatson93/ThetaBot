@@ -1,7 +1,7 @@
 [project]
 name = "thetabot"
 version = "0.1.0"
-description = "Local agentic platform that monitors and closes Robinhood options positions (covered calls + cash-secured puts) by rule or signal."
+description = "Alert-only options scanner: reads Robinhood, sends webhook alerts, never places orders."
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.6",
@@ -11,10 +11,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Heavy / external-service deps are optional so the skeleton runs in paper mode
-# with only the core dependencies installed.
-# Pinned: a newer mcp moved/renamed streamablehttp_client, silently breaking the RH connect at
-# startup (bot falls back to paper). Pin to the known-good version so rebuilds are reproducible.
+# Optional extras. Core dependencies are enough to import the package.
+# Pin mcp: a newer release renamed streamablehttp_client and broke the Robinhood connect.
+# Keep the known-good version so rebuilds stay reproducible.
 mcp = ["mcp==1.28.1"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "httpx>=0.27"]
 ai = ["anthropic>=0.69"]

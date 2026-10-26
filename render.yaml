@@ -1,8 +1,7 @@
-# ThetaBot — PAPER-mode practice week on Render.
-# One Docker web service + a 1 GB disk (SQLite, rotating RH OAuth file, paper book).
-#
+# ThetaBot — alert-only scanner on Render (read-only Robinhood, webhook alerts, no orders).
+# One Docker web service and a 1 GB disk for SQLite plus the rotating OAuth file.
 # After the Blueprint creates the service, add a Secret File named "config.yaml"
-# (copy config.render.example.yaml and fill the watchlist). Paste RH_OAUTH_JSON
+# (copy config.render.example.yaml, fill the watchlist). Paste RH_OAUTH_JSON
 # from `python -m agentic.tools.rh_login` (desktop only) when prompted.
 services:
   - type: web
