@@ -83,7 +83,7 @@ class MonitorLoop:
         # Pick up any live rule edits (settings API) without a restart.
         if self.rules_engine is not None:
             self.rules_engine.refresh(self.settings.rules)
-        broker_positions = await self.broker.get_open_positions()
+        broker_positions = await self._open_positions()
         _caps = getattr(self.broker, "capabilities", None)
         src_is_paper = _caps().is_paper if _caps is not None else None  # tag positions' source
         # Rule evaluation and rolls only run during the regular session: after hours nothing is
@@ -135,6 +135,22 @@ class MonitorLoop:
 
         log.info("Polled %d open position(s).", len(broker_positions))
         return len(broker_positions)
+
+    async def _open_positions(self):
+        """Open option positions for this cycle.
+
+        The Robinhood session resolves ``account_number`` (config, else get_accounts)
+        and the monitor passes that value through. A book with no resolver (the test
+        paper book) is read with no argument. A blank account is not sent to
+        ``get_option_positions``; the broker has already logged that once.
+        """
+        ensure = getattr(self.broker, "ensure_account_number", None)
+        if ensure is None:
+            return await self.broker.get_open_positions()
+        acct = await ensure()
+        if not str(acct or "").strip():
+            return []
+        return await self.broker.get_open_positions(acct)
 
     async def _evaluate(self, pos, quote) -> None:
         """Evaluate rules for one position.

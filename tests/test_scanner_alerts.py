@@ -471,6 +471,7 @@ async def test_main_wiring_reads_robinhood_holdings(tmp_path, _open, monkeypatch
     monkeypatch.setattr(RobinhoodMCPBroker, "_call_tool", fake_call)
     settings = Settings(
         mode="paper", broker="paper", market_data="robinhood",
+        robinhood={"account_number": "ACCT-AAA"},
         paper_seed_positions=False, paper_buying_power=100.0,
         entry={
             "enabled": True, "watchlist": [], "earnings_gate": False,

@@ -46,5 +46,10 @@ async def build_paper_runtime(
 
 
 def broker_degraded(settings: Settings, broker: ExecutionBroker) -> bool:
-    """No paper simulator remains to fall back to."""
-    return False
+    """True when the Robinhood account could not be resolved.
+
+    ``/api/ops`` already reports this as ``broker.degraded``. A blank
+    ``robinhood.account_number`` that ``get_accounts`` cannot fill is that state.
+    There is no paper book to fall back to.
+    """
+    return bool(getattr(broker, "_account_unresolved", False))

@@ -165,8 +165,13 @@ _ROLE_HINTS: dict[str, tuple[tuple[str, ...], ...]] = {
 class RobinhoodMCPBroker(ExecutionBroker):
     def __init__(self, url: str = MCP_URL, account_number: str = "", settings=None):
         self.url = url
-        self._account_number = account_number
+        self._account_number = str(account_number or "").strip()
         self._settings = settings
+        # Blank config is filled once from get_accounts. A failed lookup is remembered so
+        # the monitor does not call get_option_positions (and log) on every poll.
+        self._account_lookup_done = False
+        self._account_unresolved = False
+        self._account_missing_logged = False
         self._token = get_secret("ROBINHOOD_MCP_TOKEN")
         self._tools: list[str] = []
         self._tool_defs: dict[str, dict] = {}  # tool name -> {description, input_schema} (diagnostic)
@@ -216,6 +221,9 @@ class RobinhoodMCPBroker(ExecutionBroker):
                 "(%s).", REAL_ORDERS_LOCK_LABEL,
             )
         self._roles = self._resolve_roles(self._tools)
+        # get_option_positions and get_portfolio both require account_number. A blank
+        # config value is filled from get_accounts before the first read.
+        await self.ensure_account_number()
         # We can place option closes only if an account is configured AND both a place and a
         # positions tool resolved. Without account_number every RH options tool 400s, so this
         # also doubles as a live-arming safety gate.
@@ -235,7 +243,10 @@ class RobinhoodMCPBroker(ExecutionBroker):
         if not self._connected:
             note = "Not connected (token/SDK missing or probe failed)"
         elif not self._account_number:
-            note = "Connected, but robinhood.account_number is unset — read-only, use fallback."
+            note = (
+                "Connected, but no Robinhood account is resolved. "
+                "Set robinhood.account_number. Position reads are skipped."
+            )
         elif not self._supports_options:
             missing = [r for r in ("place_option_order", "list_positions") if r not in self._roles]
             note = f"Connected; option tools NOT fully resolved (missing {missing}) — use fallback."
@@ -250,6 +261,76 @@ class RobinhoodMCPBroker(ExecutionBroker):
         )
 
     # ------------------------------------------------------------------ reads
+    async def ensure_account_number(self, account_number: str | None = None) -> str:
+        """Account number for a read that requires one.
+
+        An explicit argument wins (multi-account calculator). Otherwise the configured
+        ``robinhood.account_number``. When that is blank, one ``get_accounts`` read fills
+        it: the single ``agentic_allowed`` account, or the only account on the login.
+        Several accounts and no single agentic account are not guessed. The value is
+        never logged. A failed lookup is remembered and warned once.
+        """
+        explicit = str(account_number or "").strip()
+        if explicit:
+            return explicit
+        current = str(self._account_number or "").strip()
+        if current:
+            return current
+        if self._account_lookup_done:
+            return ""
+        self._account_lookup_done = True
+        if not self._connected or "get_accounts" not in self._tools:
+            self._warn_account_missing()
+            return ""
+        try:
+            accounts = await self.list_accounts()
+        except Exception as exc:  # noqa: BLE001 — a lookup miss must not spam the monitor
+            log.warning("Account lookup failed: %s", exc)
+            self._warn_account_missing()
+            return ""
+        picked = self._pick_account_number(accounts)
+        if not picked:
+            self._warn_account_missing()
+            return ""
+        self._account_number = picked
+        self._account_unresolved = False
+        log.info(
+            "Resolved Robinhood account from get_accounts; robinhood.account_number was unset."
+        )
+        return picked
+
+    def _warn_account_missing(self) -> None:
+        self._account_unresolved = True
+        if self._account_missing_logged:
+            return
+        self._account_missing_logged = True
+        log.warning(
+            "robinhood.account_number is unset and get_accounts did not identify one account. "
+            "Open-position and buying-power reads are skipped."
+        )
+
+    @staticmethod
+    def _pick_account_number(accounts: list[dict[str, Any]]) -> str:
+        """The one account a blank config can use, or ``""`` when it is ambiguous."""
+        numbered: list[tuple[str, bool]] = []
+        for rec in accounts:
+            if not isinstance(rec, dict):
+                continue
+            num = str(rec.get("account_number") or "").strip()
+            if not num:
+                continue
+            flag = rec.get("agentic_allowed")
+            agentic = flag is True or (
+                isinstance(flag, str) and flag.strip().lower() == "true"
+            )
+            numbered.append((num, agentic))
+        agentic_nums = [num for num, is_agentic in numbered if is_agentic]
+        if len(agentic_nums) == 1:
+            return agentic_nums[0]
+        if len(numbered) == 1:
+            return numbered[0][0]
+        return ""
+
     async def get_open_positions(self, account_number: str | None = None) -> list[Position]:
         if not self._connected:
             return []
@@ -257,7 +338,10 @@ class RobinhoodMCPBroker(ExecutionBroker):
         if not role:
             log.debug("No list_positions tool resolved; returning [].")
             return []
-        raw = await self._call_tool(role, self._list_positions_args(account_number))
+        acct = await self.ensure_account_number(account_number)
+        if not acct:
+            return []
+        raw = await self._call_tool(role, self._list_positions_args(acct))
         records = self._iter_records(raw)
         # get_option_positions records carry option_id but NOT strike / call-put — enrich
         # those from get_option_instruments (one batched lookup by id).
@@ -330,9 +414,10 @@ class RobinhoodMCPBroker(ExecutionBroker):
         role = self._roles.get("get_portfolio")
         if not role:
             return 0.0
-        acct = account_number or self._account_number
-        args: dict[str, Any] = {"account_number": acct} if acct else {}
-        raw = await self._call_tool(role, args)
+        acct = await self.ensure_account_number(account_number)
+        if not acct:
+            return 0.0
+        raw = await self._call_tool(role, {"account_number": acct})
         rec = self._first_record(raw)
         bp = rec.get("buying_power")
         if isinstance(bp, dict):  # nested: {"buying_power": "1500.0000", ...}
@@ -363,9 +448,10 @@ class RobinhoodMCPBroker(ExecutionBroker):
         role = self._roles.get("equity_positions")
         if not role:
             return []
-        acct = account_number or self._account_number
-        args: dict[str, Any] = {"account_number": acct} if acct else {}
-        raw = await self._call_tool(role, args)
+        acct = await self.ensure_account_number(account_number)
+        if not acct:
+            return []
+        raw = await self._call_tool(role, {"account_number": acct})
         out: list[EquityHolding] = []
         for rec in self._iter_records(raw):
             sym = rec.get("symbol") or rec.get("ticker") or rec.get("chain_symbol")
@@ -398,9 +484,10 @@ class RobinhoodMCPBroker(ExecutionBroker):
         role = self._roles.get("get_portfolio")
         if not role:
             return 0.0
-        acct = account_number or self._account_number
-        args: dict[str, Any] = {"account_number": acct} if acct else {}
-        raw = await self._call_tool(role, args)
+        acct = await self.ensure_account_number(account_number)
+        if not acct:
+            return 0.0
+        raw = await self._call_tool(role, {"account_number": acct})
         rec = self._first_record(raw)
         for k in keys:
             v = rec.get(k)
