@@ -557,8 +557,7 @@ class TradeAlerts:
             url = _webhook_url()
             if not url:
                 return {"ok": False, "error": "webhook not configured"}
-            mode = self.settings.mode if self.settings is not None else "paper"
-            payload = build_test_payload(mode)
+            payload = build_test_payload(self.mode())
             ok, err = await asyncio.to_thread(_deliver, url, payload)
             self._finish_delivery(payload, ok, err)
             return {"ok": ok, "error": err}

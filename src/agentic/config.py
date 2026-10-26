@@ -1,9 +1,10 @@
 """Config + secrets loading.
 
 Behavior/config comes from ``config.yaml`` (typed via pydantic). Secrets come from
-the process environment / ``.env`` (loaded lazily, never written to config). The
-live-mode arming gate lives here: live trading requires BOTH ``mode == "live"`` AND
-``i_understand_live_trading == True``.
+the process environment / ``.env`` (loaded lazily, never written to config).
+
+``mode``, ``i_understand_live_trading``, and ``tax_reserve`` are not settings.
+An old file that still has them loads; those keys are ignored.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger("agentic.config")
 
@@ -221,10 +222,6 @@ class EntryConfig(BaseModel):
     # screen and sizer already approved; it never adds any. Off by default.
     setups: SetupConfig = Field(default_factory=SetupConfig)
     prefer_setups: bool = False
-    # Soft weekly over-trading throttle: once THIS week's collected CSP premium reaches this fraction
-    # of account value, further auto-entries are held for one-tap approval instead of firing
-    # automatically (not a hard cap). 0 = off. e.g. 0.02 = "auto-trade until ~2%/week, then ask me".
-    weekly_premium_target_pct: float = 0.0
     criteria: EntryCriteria = Field(default_factory=EntryCriteria)      # CSP screening
     cc_criteria: EntryCriteria = Field(default_factory=EntryCriteria)   # covered-call screening
     sizing: EntrySizing = Field(default_factory=EntrySizing)
@@ -347,37 +344,9 @@ class WebConfig(BaseModel):
     signal_ttl_seconds: int = 600  # how long a queued TradingView signal stays actionable
 
 
-class TaxReserveConfig(BaseModel):
-    """Weekly sweep of a share of NET realized gains into a cash-equivalent ETF (services/tax_reserve.py).
-    Runs at the ET weekday/time below -- inside the NYSE trading window after trading_start,
-    because share orders only fill then. Losses carry forward; the bot never sells the reserve; the reserve is walled off
-    from the sizer, the covered-call scanner and assignment detection."""
-    enabled: bool = False
-    pct: float = 0.20
-    symbol: str = "SGOV"
-    weekday: int = 4                 # Friday
-    hour: int = 15
-    minute: int = 40
-    min_order_dollars: float = 5.0   # smaller amounts roll into the next period
-    dry_run: bool = True             # log + ledger the intended order without placing it
-    # Off by default. When true, the broker may place ONE 1-share SGOV limit buy as a
-    # deliberate connectivity test even if the bot is not live-armed. Weekly sweeps still
-    # respect paper / dry-run and never become a real dollar-amount buy in paper mode.
-    allow_sgov_test_buy: bool = False
-    check_interval_seconds: int = 300
-
-
 class RiskConfig(BaseModel):
-    """Portfolio loss circuit breaker for a premium-SELLING book. Freezes NEW entries when realized
-    losses pile up — it NEVER force-closes (the monitor keeps managing/closing existing positions,
-    so you never dump short puts at the bottom). Keys on REALIZED P&L and losing streaks, not
-    unrealized marks: a short put's mark swing is noise for a hold-to-expiry seller, and assignment
-    is the wheel working, not a loss. Auto-evaluates each scan and clears itself as the loss window
-    rolls off. All opt-in / tunable."""
-    loss_breaker_enabled: bool = True
-    lookback_days: int = 7                  # rolling window for the realized-loss sum
-    max_realized_loss_pct: float = 0.10     # freeze new entries if window realized P&L <= -X% of account value (0 = off)
-    max_consecutive_losses: int = 4         # freeze new entries after K straight realized losers (0 = off)
+    """Sector concentration cap. An old file may still name the loss circuit breaker; those keys are ignored."""
+    model_config = ConfigDict(extra="ignore")
     # Correlation / sector concentration cap. Group names into sectors/themes via sector_map, then cap
     # how much of the account any ONE sector's cash-secured-put collateral can occupy — so a
     # 'diversified' book of many names can't secretly be one AI/nuclear/crypto bet that all craters
@@ -387,8 +356,11 @@ class RiskConfig(BaseModel):
 
 
 class Settings(BaseModel):
-    mode: Literal["paper", "live"] = "paper"
-    i_understand_live_trading: bool = False
+    """Runtime settings. ``mode``, ``i_understand_live_trading``, and ``tax_reserve`` are not fields.
+
+    An old config file that still has them loads. Pydantic drops the keys.
+    """
+    model_config = ConfigDict(extra="ignore")
 
     broker: Literal["paper", "robinhood_mcp", "robinstocks", "alpaca"] = "paper"
     broker_fallback: Literal["paper", "robinhood_mcp", "robinstocks", "alpaca"] | None = None
@@ -424,18 +396,12 @@ class Settings(BaseModel):
     news: NewsConfig = Field(default_factory=NewsConfig)
     roll: RollConfig = Field(default_factory=RollConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
-    tax_reserve: TaxReserveConfig = Field(default_factory=TaxReserveConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     tunnel: TunnelConfig = Field(default_factory=TunnelConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     rules: list[RuleConfig] = Field(default_factory=list)
 
     # --- derived helpers ---
-    @property
-    def is_live(self) -> bool:
-        """True only when explicitly armed for live trading."""
-        return self.mode == "live" and self.i_understand_live_trading
-
     @property
     def public_base_url(self) -> str:
         """Base URL for one-tap approval links. Uses the public tunnel hostname when set
@@ -610,33 +576,6 @@ def get_secret(name: str, default: str | None = None) -> str | None:
     """Read a secret from the environment. Loads .env on first call if present."""
     _ensure_dotenv_loaded()
     return os.environ.get(name, default)
-
-
-def _action_token(kind: str, decision_id: str) -> str | None:
-    """Per-decision one-tap approval credential = HMAC(CONTROL_TOKEN, "kind:decision_id").
-
-    Lets an approval notification link authorize ONLY that specific, already-vetted action —
-    without embedding the master CONTROL_TOKEN or requiring a dashboard login (so the phone one-tap
-    flow is preserved). ``kind`` (entry/close) domain-separates the two so a token for one can't
-    authorize the other. Returns None when no CONTROL_TOKEN is set -> the endpoints must refuse.
-    """
-    import hashlib
-    import hmac as _hmac
-
-    secret = get_secret("CONTROL_TOKEN")
-    if not is_usable_secret(secret):
-        return None
-    return _hmac.new(secret.encode(), f"{kind}:{decision_id}".encode(), hashlib.sha256).hexdigest()
-
-
-def entry_action_token(decision_id: str) -> str | None:
-    """One-tap token for approving a throttled ENTRY (places a real order)."""
-    return _action_token("entry", decision_id)
-
-
-def close_action_token(decision_id: str) -> str | None:
-    """One-tap token for approving a gated CLOSE (buys to close a real position)."""
-    return _action_token("close", decision_id)
 
 
 _dotenv_loaded = False

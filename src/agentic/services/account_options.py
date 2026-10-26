@@ -85,13 +85,7 @@ async def account_option_suggestions(
     covered_calls: list[dict[str, Any]] = []
     holdings_out: list[dict[str, Any]] = []
     chain_cache: dict[str, Any] = {}
-    from .holdings import reserve_symbols
-    reserve = reserve_symbols(settings)
     for h in holdings:
-        if h.symbol.upper() in reserve:
-            holdings_out.append({"symbol": h.symbol, "shares": h.quantity,
-                                 "cost_basis": round(h.average_cost, 4), "coverable": 0, "reserve": True})
-            continue
         coverable = h.quantity // 100 - short_calls.get(h.symbol, 0)
         holdings_out.append({"symbol": h.symbol, "shares": h.quantity,
                              "cost_basis": round(h.average_cost, 4), "coverable": max(0, coverable)})
@@ -133,7 +127,7 @@ async def account_option_suggestions(
 
     covered_calls.sort(key=lambda x: x["weekly_dollars"], reverse=True)
     cash_secured_puts.sort(key=lambda x: x["weekly_dollars"], reverse=True)
-    wk_pct = settings.entry.weekly_premium_target_pct
+    wk_pct = 0.0
     return {
         "account_number": account_number,
         "buying_power": round(buying_power, 2),

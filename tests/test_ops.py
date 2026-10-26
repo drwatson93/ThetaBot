@@ -12,7 +12,7 @@ from agentic.store.ai_reviews import AIReviewStore
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.store.trade_journal import TradeJournalStore
@@ -49,7 +49,8 @@ def test_ops_snapshot(tmp_path):
     client = TestClient(create_app(WebDeps(**base)))
     ops = client.get("/api/ops").json()
 
-    assert ops["mode"] == "live" and ops["live_armed"] is True and ops["paused"] is False
+    assert ops["paused"] is False
+    assert "mode" not in ops and "live_armed" not in ops
     assert ops["killswitch"]["consecutive_errors"] == 1
     assert ops["loops"]["monitor_poll"]["lag_seconds"] is not None
     assert ops["sync"] == {"broker_open": 1, "store_open": 1, "in_sync": True, "healed": []}

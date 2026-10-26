@@ -80,20 +80,17 @@ async def test_enabled_signal_rule_routes_and_disabled_does_not(tmp_path, requir
     )
     _queue(signals, "live-1")
     await processor.process_pending()
+    # A match is recorded. Nothing is sent to an executor or an approval gate.
     assert len(decisions.recent()) == 1
-    if requires_approval:
-        assert len(gate.requests) == 1
-        assert executor.closes == []
-    else:
-        assert len(executor.closes) == 1
-        assert gate.requests == []
+    assert executor.closes == []
+    assert gate.requests == []
 
     # Hot edit on the shared Settings object, after the processor was built.
     settings.rules = [_rule(enabled=False, requires_approval=requires_approval)]
     queued = _queue(signals, "while-off")
     await processor.process_pending()
-    assert len(executor.closes) == (0 if requires_approval else 1)
-    assert len(gate.requests) == (1 if requires_approval else 0)
+    assert executor.closes == []
+    assert gate.requests == []
     assert len(decisions.recent()) == 1
     assert signals.get(queued.id).status == SignalStatus.NO_MATCH
 
@@ -101,18 +98,14 @@ async def test_enabled_signal_rule_routes_and_disabled_does_not(tmp_path, requir
     settings.rules = [_rule(enabled=True, requires_approval=requires_approval)]
     await processor.process_pending()
     assert len(decisions.recent()) == 1
-    assert len(executor.closes) == (0 if requires_approval else 1)
-    assert len(gate.requests) == (1 if requires_approval else 0)
+    assert executor.closes == []
+    assert gate.requests == []
 
     _queue(signals, "after-on")
     await processor.process_pending()
     assert len(decisions.recent()) == 2
-    if requires_approval:
-        assert len(gate.requests) == 2
-        assert executor.closes == []
-    else:
-        assert len(executor.closes) == 2
-        assert gate.requests == []
+    assert executor.closes == []
+    assert gate.requests == []
 
 
 @pytest.mark.asyncio
@@ -121,7 +114,7 @@ async def test_webhook_expire_is_not_replayed_if_reenabled_before_process(tmp_pa
     from fastapi.testclient import TestClient
 
     from agentic.services.killswitch import KillSwitch
-    from agentic.store.orders import OrderStore
+    from tests.fakes import OrderStore
     from agentic.web.app import WebDeps, create_app
 
     monkeypatch.setenv("TRADINGVIEW_WEBHOOK_TOKEN", "test-webhook-token-ok")
@@ -161,7 +154,7 @@ async def test_webhook_expire_is_not_replayed_if_reenabled_before_process(tmp_pa
     assert live.json()["status"] == "queued"
     await processor.process_pending()
     assert len(decisions.recent()) == 1
-    assert len(executor.closes) == 1
+    assert executor.closes == []
     assert gate.requests == []
 
 
@@ -171,15 +164,17 @@ async def test_disable_mid_batch_expires_the_rest(tmp_path):
         tmp_path, enabled=True, requires_approval=False,
     )
 
-    async def _close_and_disable(position, decision, quote=None):
-        executor.closes.append(decision)
+    original = processor._process_one
+
+    async def _record_then_disable(sig):
+        await original(sig)
         settings.rules = [_rule(enabled=False, requires_approval=False)]
 
-    executor.execute_close = _close_and_disable
+    processor._process_one = _record_then_disable
     _queue(signals, "batch-1")
     _queue(signals, "batch-2")
     await processor.process_pending()
-    assert len(executor.closes) == 1
+    assert executor.closes == []
     assert len(decisions.recent()) == 1
     assert gate.requests == []
     matched = signals.list_by_status(SignalStatus.MATCHED)
@@ -190,7 +185,7 @@ async def test_disable_mid_batch_expires_the_rest(tmp_path):
 
 @pytest.mark.asyncio
 async def test_monitor_expires_disabled_signals_outside_the_order_window(tmp_path, monkeypatch):
-    from agentic.brokers.paper_broker import PaperBroker
+    from tests.fakes import PaperBroker
     from agentic.marketdata.base import PaperMarketData
     from agentic.services.killswitch import KillSwitch
     from agentic.services.monitor import MonitorLoop

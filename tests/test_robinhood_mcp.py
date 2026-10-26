@@ -23,48 +23,10 @@ def _broker(account_number="1234567890", settings=None):
     return RobinhoodMCPBroker(account_number=account_number, settings=settings)
 
 
-def test_build_close_order_args_uses_legs_and_strings():
-    order = Order(
-        decision_id="d1", position_id="p1", occ_symbol="AAPL260622C00250000",
-        option_id="683f926d-2462-4402-bc01-bd4bfbdbcf24",
-        quantity=2, limit_price=1.5, is_paper=False, client_order_id="close-abc",
-    )
-    args = _broker()._build_close_order_args(order)
-    assert args["account_number"] == "1234567890"
-    assert args["legs"] == [{
-        "option_id": "683f926d-2462-4402-bc01-bd4bfbdbcf24",
-        "side": "buy",
-        "position_effect": "close",
-    }]
-    assert args["quantity"] == "2"          # string, not int
-    assert args["price"] == "1.50"          # 2-decimal string
-    assert args["type"] == "limit"
-    assert args["time_in_force"] == "gfd"
-    assert "ref_id" in args
-    # Legacy placeholder keys must be gone.
-    assert "occ_symbol" not in args and "limit_price" not in args and "direction" not in args
 
 
-def test_build_close_order_args_requires_option_id():
-    order = Order(
-        decision_id="d1", position_id="p1", occ_symbol="AAPL260622C00250000",
-        quantity=1, limit_price=1.0, is_paper=False,
-    )  # option_id is None
-    with pytest.raises(RuntimeError):
-        _broker()._build_close_order_args(order)
 
 
-def test_ref_id_is_deterministic_uuid():
-    o1 = Order(decision_id="d", position_id="p", occ_symbol="X", option_id="i",
-               quantity=1, limit_price=1.0, is_paper=False, client_order_id="close-xyz")
-    o2 = Order(decision_id="d", position_id="p", occ_symbol="X", option_id="i",
-               quantity=1, limit_price=1.0, is_paper=False, client_order_id="close-xyz")
-    o3 = Order(decision_id="d", position_id="p", occ_symbol="X", option_id="i",
-               quantity=1, limit_price=1.0, is_paper=False, client_order_id="close-other")
-    rid = RobinhoodMCPBroker._ref_id(o1)
-    assert rid == RobinhoodMCPBroker._ref_id(o2)   # same key -> same ref_id (retry-safe)
-    assert rid != RobinhoodMCPBroker._ref_id(o3)
-    assert len(rid) == 36 and rid.count("-") == 4  # canonical UUID form
 
 
 def test_build_occ_symbol():
@@ -267,42 +229,8 @@ def test_match_order_record_by_id():
     assert RobinhoodMCPBroker._match_order_record(raw, "zzz") == {}
 
 
-@pytest.mark.asyncio
-async def test_resolve_placed_order_picks_most_recent_matching_effect(monkeypatch):
-    b = _broker()
-    b._roles = {"get_option_order": "get_option_orders"}
-    orders = {"data": {"results": [
-        _rh_order("old-close", "close", created="2026-08-01T10:00:00Z"),
-        _rh_order("new-close", "close", created="2026-08-13T14:23:29Z"),   # ours (most recent)
-        _rh_order("an-open", "open", created="2026-08-13T15:00:00Z"),       # wrong effect
-        _rh_order("other-name", "close", created="2026-08-13T16:00:00Z", option_id="DIFF"),
-    ]}}
-
-    async def fake(name, args):
-        return orders
-
-    monkeypatch.setattr(b, "_call_tool", fake)
-    rec = await b._resolve_placed_order(_order(), position_effect="close")
-    assert rec["id"] == "new-close"
 
 
-@pytest.mark.asyncio
-async def test_submit_close_confirms_when_place_response_lacks_id(monkeypatch):
-    b = _broker()
-    b._supports_options = True
-    b._roles = {"place_option_order": "place_option_order", "get_option_order": "get_option_orders"}
-    orders = {"data": {"results": [_rh_order("6a7dd361", "close")]}}
-
-    async def fake(name, args):
-        if name == "place_option_order":
-            return {"data": {}}          # RH place response with no usable id
-        return orders                    # get_option_orders list -> confirm here
-
-    monkeypatch.setattr(b, "_call_tool", fake)
-    out = await b.submit_close_order(_order())
-    assert out.broker_order_id == "6a7dd361"    # recovered via confirmation, not left None
-    assert out.status == OrderStatus.FILLED
-    assert out.filled_qty == 1
 
 
 @pytest.mark.asyncio

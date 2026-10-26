@@ -59,8 +59,7 @@ class MonitorLoop:
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
-        log.info("Monitor loop started (mode=%s, broker=%s).",
-                 self.settings.mode, self.broker.capabilities().name)
+        log.info("Monitor loop started (broker=%s).", self.broker.capabilities().name)
         while not self._stop.is_set():
             try:
                 await self.run_once()
@@ -115,10 +114,6 @@ class MonitorLoop:
             # Phase 1+: evaluate rules; persist new decisions and notify (regular session only).
             if can_trade and self.rules_engine is not None and self.decisions is not None:
                 await self._evaluate(pos, quote)
-            # Roll defense: a tested put near expiry is rolled out-and-down for a credit rather
-            # than stopped out or assigned at a bad basis (no-op unless roll.enabled + tested).
-            if can_trade and self.roll_manager is not None:
-                await self.roll_manager.try_roll(pos, quote)
 
         self.audit.record(
             AuditEventType.POLL,
@@ -137,8 +132,6 @@ class MonitorLoop:
                 self.signal_processor._expire_while_disabled()
             elif can_trade:
                 await self.signal_processor.process_pending()
-        if self.approval_gate is not None:
-            self.approval_gate.expire_stale()
 
         log.info("Polled %d open position(s).", len(broker_positions))
         return len(broker_positions)
@@ -177,14 +170,8 @@ class MonitorLoop:
                     position_id=pos.id,
                     decision_id=decision.id,
                 )
-            # Hybrid autonomy: auto rules go straight to the executor, which owns its
-            # own audit + notify; approval-gated decisions are notified here. A
-            # notify_only decision NEVER executes — it must not buy back a tested put
-            # at a loss; the roll manager or assignment handles a position moving against us.
-            if self.executor is not None and not decision.requires_approval and not decision.notify_only:
-                await self.executor.execute_close(pos, decision, quote)
-            else:
-                await self._notify_decision(pos, decision)
+            # Decisions are recorded and notified. Nothing here places an order.
+            await self._notify_decision(pos, decision)
 
     def _executes_close(self, decision) -> bool:
         """A rule that will actually send a buy-to-close this tick.
@@ -277,7 +264,7 @@ class MonitorLoop:
         message = (
             f"[{gate}] {decision.rule_name}\n{decision.reason}\n"
             f"qty={pos.quantity} mark={pos.current_mark} dte={pos.dte()} "
-            f"(mode={self.settings.mode}, no order placed in Phase 1)"
+            "(no order placed)"
         )
         priority = "high" if (not decision.requires_approval and not decision.notify_only) else "normal"
         await self.notifier.send(title, message, priority=priority)

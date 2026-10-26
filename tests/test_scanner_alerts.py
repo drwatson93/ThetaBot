@@ -137,7 +137,9 @@ async def test_csp_sized_to_buying_power_ignores_tax_reserve(tmp_path, _open):
         buying_power=10_000, account_value=200_000,
         holdings=[EquityHolding("SGOV", 100, 100.0)],
     )
-    scanner = _scanner(tmp_path, book, {"ZZZ": [put]}, ["ZZZ"], price=100.0)
+    # SGOV is a 100-share holding with its own chain so the feed gate does not
+    # treat it as an empty chain. Nothing is subtracted for a tax reserve.
+    scanner = _scanner(tmp_path, book, {"ZZZ": [put], "SGOV": [put]}, ["ZZZ"], price=100.0)
 
     n = await scanner.run_once()
 
@@ -148,12 +150,9 @@ async def test_csp_sized_to_buying_power_ignores_tax_reserve(tmp_path, _open):
     assert row["kind"] == "CSP" and row["underlying"] == "ZZZ"
     assert row["strike"] == 40.0 and row["contracts"] == 2
     assert row["dedup_key"] == f"CSP:ZZZ:{row['occ_symbol']}"
-    # 100 SGOV shares at $100 would have wiped the $10,000 buying power if subtracted.
-    assert scanner.last_reserve["symbol"] == "SGOV"
-    assert scanner.last_reserve["value"] == 10_000
-    # Caps see account value net of the reserve. Buying power does not, so the
-    # $10,000 SGOV holding still leaves room for 2 contracts.
-    assert scanner.last_account_value == 190_000
+    # 100 SGOV shares at $100 are not subtracted from buying power or account value.
+    assert scanner.last_reserve is None
+    assert scanner.last_account_value == 200_000
     runs = scanner.alerts.runs()
     assert len(runs) == 1 and runs[0]["status"] == "ok"
     # No webhook was configured, so the row stays pending and nothing counts as sent.
@@ -276,13 +275,12 @@ async def test_broker_down_sends_nothing_and_records_skip(tmp_path, _open):
     assert len(runs) == 1 and runs[0]["status"] == "skipped"
     assert runs[0]["reason"] == "broker degraded" and runs[0]["alerts_sent"] == 0
 
-    # Live-armed but sitting on the real paper broker is the same gate.
-    from agentic.brokers.paper_broker import PaperBroker
+    # A second disconnected session is the same gate. There is no paper fallback.
     live_settings = Settings(
-        mode="live", i_understand_live_trading=True, broker="robinhood_mcp",
+        broker="robinhood_mcp",
         market_data="paper", entry={"enabled": True, "watchlist": ["ZZZ"]},
     )
-    live_book = PaperBroker(seed_positions=[], buying_power=10_000)
+    live_book = _Book(buying_power=10_000, account_value=200_000, connected=False)
     db = Database(tmp_path / "live" / "alerts.db")
     audit = AuditStore(db)
     live = OpportunityScanner(
@@ -420,7 +418,6 @@ async def test_main_wiring_reads_robinhood_holdings(tmp_path, _open, monkeypatch
     """The process scanner sizes off the Robinhood read client, not the paper book."""
     from datetime import date, timedelta
 
-    from agentic.brokers.paper_broker import PaperBroker
     from agentic.brokers.robinhood_mcp import (
         READ_ONLY_MCP_TOOLS, RobinhoodMCPBroker, assert_mcp_tool_allowed,
     )
@@ -489,9 +486,9 @@ async def test_main_wiring_reads_robinhood_holdings(tmp_path, _open, monkeypatch
         EntryDecisionStore(db), _NoOrders(), audit, KillSwitch(db, audit),
     )
 
-    assert isinstance(broker, PaperBroker)
+    assert isinstance(broker, RobinhoodMCPBroker)
     assert scanner.read_broker is session and scanner.broker is broker
-    assert await broker.get_equity_positions() == []
+    assert broker is session
 
     assert await scanner.run_once() == 1
     alerts = scanner.alerts.all()

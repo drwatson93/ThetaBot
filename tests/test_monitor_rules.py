@@ -1,7 +1,7 @@
 """Phase 1: monitor evaluates rules, creates+notifies decisions, and dedups across cycles."""
 import pytest
 
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import DecisionStatus
 from agentic.marketdata.base import PaperMarketData
@@ -53,9 +53,9 @@ async def test_profit_target_creates_decision_and_notifies(tmp_path):
                             requires_approval=False, params={"profit_pct": 0.5})]
     monitor, broker, decisions, notifier = _build(tmp_path, rules_cfg)
 
-    # Seeded AAPL covered call: credit 2.00. Drive its price below the 1.00 target.
-    aapl = next(p for p in await broker.get_open_positions() if p.underlying == "AAPL")
-    broker.set_mark(aapl.occ_symbol, bid=0.90, ask=0.95)
+    # Seeded AAA covered call: credit 2.00. Drive its price below the 1.00 target.
+    call = next(p for p in await broker.get_open_positions() if p.underlying == "AAA")
+    broker.set_mark(call.occ_symbol, bid=0.90, ask=0.95)
 
     await monitor.run_once()
     proposed = decisions.list_by_status(DecisionStatus.PROPOSED)
@@ -71,8 +71,8 @@ async def test_decisions_dedup_across_cycles(tmp_path):
     rules_cfg = [RuleConfig(name="p50", rule_type="PROFIT_TARGET",
                             requires_approval=False, params={"profit_pct": 0.5})]
     monitor, broker, decisions, notifier = _build(tmp_path, rules_cfg)
-    aapl = next(p for p in await broker.get_open_positions() if p.underlying == "AAPL")
-    broker.set_mark(aapl.occ_symbol, bid=0.90, ask=0.95)
+    call = next(p for p in await broker.get_open_positions() if p.underlying == "AAA")
+    broker.set_mark(call.occ_symbol, bid=0.90, ask=0.95)
 
     await monitor.run_once()
     await monitor.run_once()
@@ -132,4 +132,7 @@ async def test_dte_close_action_executes(tmp_path):
 
     await monitor.run_once()
 
-    assert spy.closed and all(rule == "dte-close" for _occ, rule in spy.closed)
+    # Close actions are recorded and notified. The executor is not called.
+    assert spy.closed == []
+    proposed = decisions.list_by_status(DecisionStatus.PROPOSED)
+    assert proposed and all(d.rule_name == "dte-close" for d in proposed)

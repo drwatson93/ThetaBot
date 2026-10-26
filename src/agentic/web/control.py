@@ -20,8 +20,8 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Body, Depends, Header, Request
+from fastapi.responses import JSONResponse, Response
 
 from ..config import get_secret, is_usable_secret
 from ..domain.enums import AuditEventType
@@ -242,8 +242,6 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         return {
             "paused": deps.killswitch.is_paused(),
             "reason": deps.killswitch.reason(),
-            "mode": deps.settings.mode,
-            "live_armed": deps.settings.is_live,
             "alerts": alerts_from_deps(deps).status(),
         }
 
@@ -269,5 +267,57 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         except Exception as exc:  # noqa: BLE001 — surface the live-read failure verbatim
             out["read_error"] = f"{type(exc).__name__}: {exc}"
         return JSONResponse(out)
+
+    @router.get("/legacy-archive", dependencies=[Depends(require_owner)])
+    async def legacy_archive() -> Response:
+        """Zip of every legacy practice table (CSV + JSON) and manifest.json.
+
+        Read-only. Owner login or CONTROL_TOKEN. View-only login is 403.
+        """
+        import io
+        import shutil
+        import tempfile
+        import zipfile
+        from pathlib import Path
+
+        from ..cutover import export_archive, record_cutover
+
+        db = deps.audit.db
+        tmp = Path(tempfile.mkdtemp(prefix="legacy-archive-"))
+        try:
+            manifest = export_archive(db, tmp)
+            counts = {name: info["row_count"] for name, info in manifest["tables"].items()}
+            record_cutover(db, "export", counts)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in sorted(tmp.iterdir()):
+                    if path.is_file():
+                        archive.write(path, arcname=path.name)
+            payload = buf.getvalue()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="legacy-archive.zip"'},
+        )
+
+    @router.post("/legacy-wipe", dependencies=[Depends(require_owner)])
+    async def legacy_wipe(body: dict = Body(...)) -> JSONResponse:
+        """Empty the legacy tables when the body's manifest counts match live counts.
+
+        Does not drop schema. Does not touch alerts, scan_runs, scorecard, or audit.
+        """
+        from ..cutover import CutoverRefused, record_cutover, wipe_legacy
+
+        try:
+            wiped = wipe_legacy(deps.audit.db, body)
+        except CutoverRefused as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc), "mismatches": exc.mismatches},
+                status_code=409,
+            )
+        record_cutover(deps.audit.db, "wipe", wiped)
+        return JSONResponse({"ok": True, "wiped": wiped})
 
     return router

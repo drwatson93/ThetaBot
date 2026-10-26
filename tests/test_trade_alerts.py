@@ -20,13 +20,13 @@ from agentic.notify.trade_alerts import (
     INVALID_HEADER_NAME_ERROR, TradeAlerts, build_close_payload,
     build_open_payload, format_close_line, format_open_line, sanitize_error,
 )
-from agentic.services.executor import OrderExecutor
+from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
 from agentic.store.entry_decisions import EntryDecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -305,51 +305,6 @@ def test_dashboard_has_alerts_control(tmp_path, monkeypatch):
     assert HOOK not in html
 
 
-@pytest.mark.asyncio
-async def test_fill_hook_failure_does_not_break_trading(tmp_path, monkeypatch):
-    from agentic.brokers.paper_broker import PaperBroker
-    from agentic.marketdata.base import PaperMarketData
-    from agentic.domain.enums import DecisionStatus, PositionStatus, RuleType
-    from agentic.domain.models import CloseDecision
-    from agentic.brokers import paper_broker as pb
-
-    monkeypatch.setenv("TRADE_ALERT_URL", HOOK)
-    monkeypatch.setattr(ta_mod, "_http_post", lambda *a, **k: (_ for _ in ()).throw(
-        OSError(f"boom {HOOK}")
-    ))
-    db = Database(tmp_path / "exec-al.db")
-    audit = AuditStore(db)
-    positions = PositionStore(db)
-    decisions = DecisionStore(db)
-    orders = OrderStore(db)
-    killswitch = KillSwitch(db, audit)
-    settings = Settings(mode="paper", broker="paper", market_data="paper")
-    alerts = TradeAlerts(db, audit, settings, background=False)
-    pos = pb._default_seed()[0]
-    positions.upsert(pos)
-    pos = positions.get_by_occ(pos.occ_symbol)
-    decision = CloseDecision(
-        position_id=pos.id, rule_name="profit-50", rule_type=RuleType.PROFIT_TARGET,
-        reason="test", requires_approval=False, dedup_key=f"{pos.id}:PT:today",
-    )
-    decisions.insert_if_new(decision)
-    ex = OrderExecutor(
-        settings, PaperBroker(), PaperMarketData(), positions, orders, decisions,
-        audit, killswitch, trade_alerts=alerts, poll_interval_seconds=0.001,
-    )
-    order = await ex.execute_close(pos, decision)
-    assert order is not None
-    assert order.status == OrderStatus.FILLED
-    assert positions.get_by_occ(pos.occ_symbol).status == PositionStatus.CLOSED
-    assert decisions.get(decision.id).status == DecisionStatus.DONE
-    assert any(e["event_type"] == "ORDER_FILL" for e in audit.recent())
-    assert not any(
-        e["event_type"] == "ERROR" and "alert" in json.dumps(e["payload"]).lower()
-        for e in audit.recent()
-    )
-    st = alerts.status()
-    assert st["last_status"] == "error"
-    assert HOOK not in (st["last_error"] or "")
 
 
 def test_ops_last_error_untouched_by_alert_failure(tmp_path, monkeypatch):

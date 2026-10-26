@@ -3,7 +3,7 @@ from datetime import timedelta
 
 import pytest
 
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.domain.enums import Direction, OptionType, PositionStatus, Strategy
 from agentic.domain.models import Order, Position, utcnow
 from agentic.store.db import Database
@@ -50,41 +50,12 @@ def test_repeated_upsert_of_open_does_not_duplicate(tmp_path):
 
 # --- Fix 2: paper positions survive a restart ----------------------------------------------------
 
-def _open_order(occ="F260807P00012000"):
-    return Order(decision_id="d1", position_id="pos1", occ_symbol=occ, quantity=2,
-                 limit_price=0.22, is_paper=True, client_order_id=f"open-{occ}")
 
 
-@pytest.mark.asyncio
-async def test_paper_broker_persists_across_restart(tmp_path):
-    path = tmp_path / "paper.json"
-    b1 = PaperBroker(seed_positions=[], persist_path=path)
-    await b1.submit_open_order(_open_order())
-    assert path.exists()
-
-    # Simulate a redeploy: a brand-new broker instance must restore the open position.
-    b2 = PaperBroker(seed_positions=[], persist_path=path)
-    opens = await b2.get_open_positions()
-    assert any(p.occ_symbol == "F260807P00012000" for p in opens)
 
 
-@pytest.mark.asyncio
-async def test_paper_broker_close_drops_from_persisted(tmp_path):
-    path = tmp_path / "paper.json"
-    b1 = PaperBroker(seed_positions=[], persist_path=path)
-    await b1.submit_open_order(_open_order())
-    close = Order(decision_id="d1", position_id="pos1", occ_symbol="F260807P00012000",
-                  quantity=2, limit_price=0.10, is_paper=True, client_order_id="close-1")
-    await b1.submit_close_order(close)
-
-    b2 = PaperBroker(seed_positions=[], persist_path=path)
-    assert await b2.get_open_positions() == []        # closed -> not restored as open
 
 
-def test_no_persist_path_stays_in_memory(tmp_path):
-    # Default (tests) — no file written, seeds honored.
-    b = PaperBroker(seed_positions=[])
-    assert b._persist_path is None
 
 
 # --- one-time cleanup ---------------------------------------------------------------------------

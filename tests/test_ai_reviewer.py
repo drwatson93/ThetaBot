@@ -6,7 +6,7 @@ import pytest
 from agentic.ai.reviewer import AIReviewer, build_user_prompt
 from agentic.ai.schema import Verdict, normalize_verdict
 from agentic.config import AIConfig, Settings
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.domain.enums import DecisionStatus
 from agentic.domain.models import EntryDecision
 from agentic.entry.context import UnderlyingContext

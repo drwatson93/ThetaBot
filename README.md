@@ -1,19 +1,19 @@
 # ThetaBot
 
-**An autonomous options-*wheel* bot that runs entirely off your own Robinhood account — one login, one small server, no paid data feeds.**
+**An options-*wheel* scanner that runs off your own Robinhood account — one login, one small server, no paid data feeds.**
 
-It sells cash-secured puts on stocks you'd be happy to own, manages them to a profit target, and — if assigned — sells covered calls against the shares. The same disciplined rules every day, with no emotion. This is the **community edition**: all market data comes from the *same* Robinhood connection it trades through, so you don't need an Alpaca subscription, a TradingView Pro plan, or anything else.
+It screens cash-secured puts on stocks you'd be happy to own and covered calls on shares you already hold, then sends an alert. It does not place the order. This is the **community edition**: all market data comes from the *same* Robinhood connection, so you don't need an Alpaca subscription, a TradingView Pro plan, or anything else.
 
 ---
 
 > ## ⚠️ Read this before anything else
 >
-> - **This bot places real trades with real money.** There is no "demo money" once it's armed live.
+> - **This build scans and sends alerts. It does not place orders.** `ORDERS_HARD_DISABLED` stays on. An old config that still says `mode: live` is ignored. A human who trades an alert can still be assigned.
 > - **Selling puts means you can be assigned** — i.e. *forced to buy 100 shares per contract* at the strike. Only ever put names on your watchlist that you are genuinely willing to own, in sizes you can afford.
 > - **Options carry real, sometimes total, loss risk**, including sharp overnight/gap losses. A wheel is *not* a guaranteed-income machine.
 > - **This is not financial advice**, not a solicitation, and comes with **no warranty of any kind**. You run it entirely at your own risk.
 > - **Not affiliated with, endorsed by, or supported by Robinhood.** It uses Robinhood's agentic connection; you are responsible for complying with Robinhood's Terms of Service. Robinhood can change or revoke that access at any time.
-> - **Start in paper mode. Start tiny. Watch it for weeks before you trust it.**
+> - **Watch the alerts before you act on them.** The bot will not enter or close a position for you.
 >
 > If you are not comfortable reading logs, using SSH, and losing every dollar in the account, **do not run this.**
 
@@ -26,9 +26,9 @@ It sells cash-secured puts on stocks you'd be happy to own, manages them to a pr
 4. [Setup overview](#setup-overview)
 5. [Step 1 — Robinhood account + one-time login](#step-1--robinhood-account--one-time-login)
 6. [Step 2 — Spin up a Hostinger VPS](#step-2--spin-up-a-hostinger-vps)
-7. [Host on Render (paper practice week)](#host-on-render-paper-practice-week)
+7. [Host on Render (read-only scanner)](#host-on-render-read-only-scanner)
 8. [Step 3 — Install & deploy](#step-3--install--deploy)
-9. [Step 4 — First run, paper → live](#step-4--first-run-paper--live)
+9. [Step 4 — First run](#step-4--first-run)
 10. [Configuration reference](#configuration-reference)
 11. [Accessing your dashboard securely](#accessing-your-dashboard-securely)
 12. [Optional integrations (Alpaca / TradingView)](#optional-integrations-for-different-setups)
@@ -127,15 +127,15 @@ Browser:   open the dashboard → verify health → (when ready) arm live
    ssh root@YOUR_VPS_IP
    ```
 
-## Host on Render (paper practice week)
+## Host on Render (read-only scanner)
 
-For a one-week **paper** soak with real Robinhood quotes and **simulated** fills (no real orders):
+Real Robinhood quotes, no orders:
 
 1. On your **desktop**, run the one-time login (see Step 1) and copy the one-line `RH_OAUTH_JSON` it prints.
-2. Copy `config.render.example.yaml` into a Render **Secret File** named `config.yaml`. Fill `entry.watchlist` with names you are willing to own, and set `paper_buying_power` to your real account size. Keep `mode: paper`.
+2. Copy `config.render.example.yaml` into a Render **Secret File** named `config.yaml`. Fill `entry.watchlist` with names you are willing to own. `mode` and `i_understand_live_trading` are ignored if an old file still has them.
 3. In Render: **New → Blueprint**, point it at [drwatson93/ThetaBot](https://github.com/drwatson93/ThetaBot), apply `render.yaml`. Paste `RH_OAUTH_JSON` when prompted. Copy `DASHBOARD_PASSWORD` from the Environment tab after create. Optionally set `PAUSE_TOKEN` (Environment → add, a long random string *different* from `CONTROL_TOKEN`) so a monitoring bot can pause via `POST /control/pause-only` without getting the resume/approval secret.
 4. Open `https://<service>.onrender.com/health`. You want `"orders_hard_disabled":true`, a `scanner` object, and `feed_age_seconds`, plus `"robinhood_connected":true` and `"practice":true`. A closed market or an old quote stays HTTP 200. If `robinhood_connected` is false, the scanner has no real chains — re-check the token.
-5. Leave `mode: live` and `i_understand_live_trading` **off** for the whole practice week.
+5. Confirm `/health` still reports `orders_hard_disabled: true`. There is no live-arming switch in this build.
 
 The Blueprint uses one Starter web service, Virginia, a 1 GB disk at `/app/data` (required: the OAuth refresh token is rewritten on every use), and auto-deploy **off**. Free Render instances will not work (no disk, they sleep after 15 minutes).
 
@@ -220,15 +220,16 @@ On the VPS:
    nano config.yaml
    ```
 
-   The most important line to check first:
+   The lines to check first:
 
    ```yaml
-   mode: paper          # START HERE. Change to "live" only when you're ready.
    entry:
      enabled: true
      watchlist: [F, SOFI, ...]     # names you are happy to own
    market_data: robinhood          # default: all data from your Robinhood login (no Alpaca)
    ```
+
+   `mode` and `i_understand_live_trading` are ignored if an old file still has them. This build sends alerts and does not place orders.
 
    (Full options in the [Configuration reference](#configuration-reference).)
 
@@ -239,13 +240,13 @@ On the VPS:
    docker compose logs -f          # watch it boot; Ctrl-C to stop watching
    ```
 
-## Step 4 — First run, paper → live
+## Step 4 — First run
 
 1. **Open the dashboard via SSH tunnel** (port 8000 is bound to localhost only): `ssh -L 8000:localhost:8000 user@YOUR_VPS` then `http://localhost:8000` — log in with the `DASHBOARD_USER` / `DASHBOARD_PASSWORD` you set.
-2. **Confirm health:** the top banner should show the broker connected and *not degraded*. Check `http://localhost:8000/health` returns `ok`.
-3. **Let it run in paper mode for a while.** Watch it screen, "trade," and manage positions with no real money. Read the decision log — make sure its choices make sense to *you*.
-4. **Add HTTPS (recommended before going live).** Exposing a password over plain `http://` is risky. The simplest option is to put **Caddy** in front for automatic HTTPS with a domain you point at the VPS — see the wiki/`docs/`. At minimum, restrict port 8000 with a firewall to your own IP.
-5. **Go live only when you're ready:** set **both** `mode: live` **and** `i_understand_live_trading: true` in `config.yaml`, start with a **small** account and a **short** watchlist, then `docker compose up -d` to apply. The dashboard will show `live_armed: true`. Leaving the second flag false keeps the bot read-only even if `mode` says live.
+2. **Confirm health:** the top banner should show the broker connected. Check `http://localhost:8000/health` returns `ok` and `orders_hard_disabled: true`.
+3. **Let it scan.** It records CSP and covered-call alerts. It does not place orders. Read the decision log — make sure its choices make sense to *you*.
+4. **Add HTTPS.** Exposing a password over plain `http://` is risky. The simplest option is to put **Caddy** in front for automatic HTTPS with a domain you point at the VPS — see the wiki/`docs/`. At minimum, restrict port 8000 with a firewall to your own IP.
+5. **There is no live switch.** `mode` and `i_understand_live_trading` in an old `config.yaml` are ignored. Buying power for sizing is the broker's buying-power figure. A tax reserve is not subtracted.
 
 ---
 
@@ -284,9 +285,8 @@ Prefer to self-host HTTPS like a classic web app? Point a domain at the VPS and 
 `config.yaml` (hot-reloadable via the dashboard). Key sections:
 
 ```yaml
-mode: paper
-i_understand_live_trading: false   # required (with mode: live) before any real order
-trading_start: "10:00"             # America/New_York; no new entries/exits/stops before this
+# mode and i_understand_live_trading are ignored if an old file still has them
+trading_start: "10:00"             # America/New_York; scan window opens at this time
 
 market_data: robinhood       # robinhood | alpaca | paper  (see "Optional integrations")
 
@@ -317,18 +317,8 @@ entry:
     total_bp_utilization_target: 0.50
     buying_power_reserve_pct: 0.10
 
-tax_reserve:                     # weekly gains sweep — paper/dry-run never places a real buy
-  enabled: false
-  pct: 0.20
-  symbol: SGOV
-  dry_run: true
-  allow_sgov_test_buy: false     # optional 1-share SGOV connectivity test
-
-risk:                            # loss circuit breaker (freezes NEW entries; never force-closes)
-  loss_breaker_enabled: true
-  lookback_days: 7
-  max_realized_loss_pct: 0.10
-  max_consecutive_losses: 4
+risk:                            # optional sector cap; loss_breaker_* keys are ignored
+  max_pct_per_sector: null
 
 rules:                           # each rule needs rule_type (required by the config schema)
   - name: profit-target
@@ -411,17 +401,16 @@ If no fresh alert has arrived for a symbol, these gates simply **don't apply** (
 ## Operating the bot
 
 - **Dashboard** (`/`) -- tabbed and mobile-friendly:
-  - **Overview:** health, open positions, realized/unrealized P&L (this week **and** all-time), win rate, the reason behind each close, the **gains-sweep reserve** (held, swept to date, this week's net, next sweep) and **Ready to add** (tier names the account can now afford).
+  - **Overview:** health, open positions, realized/unrealized P&L (this week **and** all-time), win rate, the reason behind each close, and **Ready to add** (tier names the account can now afford).
   - **Watchlist:** the daily read on every name you watch. **Setups today** labels each name from completed daily bars -- *washout* (oversold), *quiet base*, *support test*, *coiling* (volatility squeeze), *breakout* / *breakdown* (confirmed on volume) -- plus a **live** column for today's unfinished bar breaking a range or support right now. Labels carry a put-seller bias (favorable / avoid / neutral). Below it, **Which setups have edge here** scores every fire on what actually happened 5 and 10 bars later on *your* names (hit rate, average move, worst 10-day dip), and **Per-name risk profile** measures, for each name, how often a put a given expected-move cushion below spot was touched or finished in the money over the last year, and suggests a wider cushion for names that run hot. Every watchlist add is profiled automatically. Endpoints: `/api/setups`, `/api/setups/accuracy`, `/api/risk-profile`.
   - **Brief:** the **Weekly tactical brief** (`/api/brief`) -- market backdrop, this week's catalysts, setups firing, per-name expected-move **cushion** (strike distance in option-implied moves), earnings-inside-the-contract flags, open-position **management** (roll window / moneyness), and **assignment capacity** (collateral if every short put were assigned vs. buying power). Every generated brief is **saved**: the tab opens on the latest one, a picker lists earlier ones (`/api/briefs`, `/api/briefs/{id}`), and **Generate new** builds a fresh one. Descriptive only -- not advice.
-  - **Tuning:** change config **live from your phone** -- no SSH, no restart. Multi-CSP cap, the entry gates, the **market regime** block (confirmed-downtrend skip), the **gains sweep** (on/off, percent, symbol, day/time, dry run), **setup gates** (`avoid_setups` / `require_setups`, a *prefer setups* ranking tilt, a one-tap *put-seller preset* that avoids the breakout family, and *apply suggested cushions* from the risk profile), the delta band, and per-ticker overrides, each schema-validated and persisted to a writable overlay (safety-critical keys stay locked). All setup gates are **off by default** and only ever tighten.
+  - **Tuning:** change config **live from your phone** -- no SSH, no restart. Multi-CSP cap, the entry gates, the **market regime** block (confirmed-downtrend skip), **setup gates** (`avoid_setups` / `require_setups`, a *prefer setups* ranking tilt, a one-tap *put-seller preset* that avoids the breakout family, and *apply suggested cushions* from the risk profile), the delta band, and per-ticker overrides, each schema-validated and persisted to a writable overlay (safety-critical keys stay locked). All setup gates are **off by default** and only ever tighten.
   - **On a phone** the tabs sit in a bottom bar within thumb reach, every card folds on a tap (remembered per device), and wide tables keep their first column pinned while you scroll sideways.
-- **Gains sweep / tax reserve** (`tax_reserve`, off by default): every week at the time you set, the bot takes a share of that week's **net** realized gains (losses carry forward, so a red week is netted against the next green one) and buys that many dollars of a symbol you choose with a small regular-hours market order -- **SGOV** (T-bills) to set money aside for taxes, or an index fund to reinvest premium. The holding is **walled off**: it never counts as trading capital, is never written against, and the bot never sells it. One ledger row per week (`GET /api/tax-reserve`), so a restart can't double-buy. Run it with `dry_run: true` for a cycle first; the ledger shows what it *would* have bought.
+- **Buying power:** CSP size uses the broker's buying-power figure. Nothing is subtracted for a tax reserve. The reserve service, card, and endpoint are gone.
 - **Ready to add** (`entry.watchlist_tiers`, optional): list quality names with the collateral one contract needs; once the account can hold one under the per-name cap, they show up on the Overview and Tuning tabs with a one-tap **Add** that carries their `per_ticker` overrides. The bot never adds names on its own (`GET /api/tiers`).
 - **Assignment clock** (`cc_below_basis_after_days`, opt-in, per ticker): by default calls are never sold below cost basis, which on volatile names can park capital for months. With a clock set, shares still under water that many days after assignment may be written against below basis inside a 5-10% OTM band, so the capital turns over. The holdings table shows each name's days held and whether below-basis calls are allowed.
 - **Open interest:** `GET /api/option-oi?symbol=SMR` returns the full call+put chain with OI, volume, IV and greeks (Robinhood-sourced; Alpaca's snapshots carry no OI).
-- **Pause / resume:** the kill switch halts *all* new orders instantly; use it any time you want to stop trading without touching positions. Resume needs the dashboard login plus `CONTROL_TOKEN`. A monitoring bot can pause (only) with `POST /control/pause-only?token=$PAUSE_TOKEN&reason=...` — that token cannot resume or approve trades.
-- **Loss circuit breaker:** trips automatically on a losing streak (see below) and shows in `/api/ops` — it freezes *new* entries but keeps managing what's open.
+- **Pause / resume:** pause mutes new alert webhooks. Resume needs the dashboard login. A monitoring bot can pause (only) with `POST /control/pause-only?token=$PAUSE_TOKEN&reason=...` — that token cannot resume.
 - **Logs:** `docker compose logs -f` on the VPS.
 - **Updating:** `git pull && docker compose up -d --build`.
 - **Backups:** your whole state is `data/` (the SQLite DB + `rh_oauth.json`). Back that folder up.
@@ -433,9 +422,8 @@ The bot is built to *survive*, not to gamble:
 - **Only sells names you list** — you curate the universe of what it can be assigned.
 - **Position + concentration caps** so no single trade dominates.
 - **Entry gates** — skips earnings, broken downtrends, illiquid contracts, and (opt-in) thin cushion or thin variance-risk-premium (the expected-move and IV/realized gates). An opt-in **confirmed-downtrend skip** pauses new puts market-wide once SPY has spent five straight sessions under its 200-day.
-- **Roll safety** — a roll that closes the old put but cannot open the new one is audited as an error and pushed to you as "Roll INCOMPLETE", never silently dropped.
-- **Loss circuit breaker** — freezes new entries after a bad realized run (default: −10% of account in 7 days, or 4 straight losers). It **never force-liquidates** — it stops digging, it doesn't panic-sell.
-- **Instant kill switch** — halts on broker errors or on your command.
+- **No order path** — the executor, approval gate, rolls, reconcile, and broker write methods are gone. `ORDERS_HARD_DISABLED` stays true.
+- **Pause** — mutes alert webhooks. It does not close positions, because this build never opened them.
 - **No hidden leverage** — cash-secured puts are fully collateralized.
 
 None of this removes market risk. A sharp gap down on a held name is still a real loss.
@@ -446,8 +434,8 @@ None of this removes market risk. A sharp gap down on a held name is still a rea
 |---|---|
 | Dashboard won't load | `docker compose ps` (is it running?), firewall allows port 8000, correct IP. |
 | Banner shows "degraded"/broker down | `rh_oauth.json` present in `data/`? Token still valid? Re-run `rh_login` on desktop and re-upload. |
-| No trades firing | Normal if nothing clears your criteria. Lower `min_annualized_yield` or check the decision log for the gate that's rejecting. |
-| "paused" and won't trade | Kill switch or loss breaker engaged — check `/api/ops` for the reason; resume from the dashboard. |
+| No alerts firing | Normal if nothing clears your criteria. Lower `min_annualized_yield` or check the decision log for the gate that's rejecting. |
+| "paused" and no webhooks | Pause is on — check `/api/ops` for the reason; resume from the dashboard. |
 | Token stopped refreshing | Re-run the desktop `rh_login` and re-upload `rh_oauth.json`. |
 
 ## Disclaimer & license

@@ -134,13 +134,16 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
     # All dashboard + data routes require auth (when a password is configured).
     router = APIRouter(dependencies=[Depends(require_auth)])
 
+    def _orders() -> list:
+        store = getattr(deps, "orders", None)
+        return store.list_all() if store is not None else []
+
     @router.get("/api/stats")
     async def api_stats() -> dict:
-        # Live mode: show only real trades (exclude leftover paper-soak history).
         positions = deps.positions.list_all()
-        orders = deps.orders.list_all()
+        orders = _orders()
         decisions = deps.decisions.recent(1000)
-        real_only = deps.settings.is_live
+        real_only = False
         # Top-level numbers are ALL-TIME (the dashboard's headline P&L). ``this_week`` re-runs the
         # same aggregation windowed to trades resolved since the most recent Monday 00:00 UTC — the
         # market week — so the card can show both without double-counting or a separate code path.
@@ -164,8 +167,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         positions = deps.positions.list_all()
         quotes = await load_underlying_quotes(deps, positions)
         rows = position_rows(
-            positions, deps.orders.list_all(), deps.decisions.recent(1000),
-            real_only=deps.settings.is_live,
+            positions, _orders(), deps.decisions.recent(1000),
+            real_only=False,
             underlying_quotes=quotes,
         )
         for row in rows:
@@ -477,14 +480,12 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             broker_block = {"name": caps.name, "is_paper": caps.is_paper,
                             "degraded": broker_degraded(deps.settings, brk)}
         return {
-            "mode": deps.settings.mode, "live_armed": deps.settings.is_live,
             "paused": ks.is_paused(), "pause_reason": ks.reason(),
             "broker": broker_block,
             "killswitch": {
                 "consecutive_errors": ks.consecutive_errors(),
                 "auto_trip_after": deps.settings.auto_trip_after_errors,
             },
-            "loss_breaker": getattr(sc, "last_breaker", None),
             "loops": {
                 "monitor_poll": lag(AuditEventType.POLL, "monitor"),
                 "reconcile": lag(AuditEventType.RECONCILE, "reconcile"),
@@ -710,21 +711,17 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 pos_all = []
             try:
                 from ..services.stats import compute_stats
-                stats = compute_stats(pos_all, deps.orders.list_all(),
-                                      deps.decisions.recent(1000), real_only=s.is_live)
+                stats = compute_stats(pos_all, _orders(),
+                                      deps.decisions.recent(1000), real_only=False)
             except Exception:  # noqa: BLE001
                 stats = None
             try:
-                from ..services.risk_breaker import evaluate_risk_breaker
                 acct_no = getattr(s.robinhood, "account_number", None)
                 acct_val = next((a.get("account_value") for a in accounts
                                  if a.get("account_number") == acct_no), None)
                 if acct_val is None:
                     acct_val = sum(a.get("account_value", 0) or 0 for a in accounts if "error" not in a) or None
-                lb = evaluate_risk_breaker(deps.trade_journal, s.risk, acct_val, now)
-                risk = {"loss_breaker": {k: lb.get(k) for k in
-                        ("tripped", "reason", "window_realized", "loss_limit", "consecutive_losses")},
-                        "sector_exposure": _sector_exposure(pos_all, s.risk, acct_val)}
+                risk = {"sector_exposure": _sector_exposure(pos_all, s.risk, acct_val)}
             except Exception:  # noqa: BLE001
                 risk = None
             try:
@@ -737,10 +734,6 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             except Exception:  # noqa: BLE001
                 setup_accuracy = None
             risk_profiles = dict(getattr(sc, "last_risk_profile", {}) or {}) if sc else None
-            try:
-                tax_reserve = _reserve_payload()
-            except Exception:  # noqa: BLE001
-                tax_reserve = None
 
             # Open short options (for the management + assignment-capacity reads) and total buying
             # power across accounts. Drop paper positions in live mode.
@@ -748,7 +741,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 open_positions = [p for p in pos_all
                                   if str(getattr(getattr(p, "status", None), "value",
                                                  getattr(p, "status", None))).upper() in ("OPEN", "CLOSING")
-                                  and not (s.is_live and getattr(p, "is_paper", False))]
+                                  ]
             except Exception:  # noqa: BLE001
                 open_positions = []
             total_bp = sum(a.get("buying_power", 0) or 0
@@ -775,7 +768,7 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 tv_by_symbol=tv_by_symbol, regime=regime, news_by_symbol=news_by_symbol,
                 accounts=accounts, econ_events=econ_events, now=now, ai_analysis=ai_analysis,
                 open_positions=open_positions, total_buying_power=total_bp,
-                tax_reserve=tax_reserve, tier_proposals=(list(getattr(sc, "last_tier_proposals", []) or []) if sc else []))
+                tier_proposals=(list(getattr(sc, "last_tier_proposals", []) or []) if sc else []))
             out = {"title": title, "body": body, "created_at": now.isoformat(),
                    "has_ai": ai_analysis is not None, "id": None}
             # Persist every generation so the brief can be re-read from a phone later without
@@ -837,8 +830,6 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         sc = deps.scanner
         holds = list(getattr(sc, "last_holdings", []) or []) if sc else []
         from ..domain.enums import Direction, OptionType
-        from ..services.holdings import reserve_symbols
-        reserve = reserve_symbols(deps.settings)
         clock = dict(getattr(sc, "last_cc_clock", {}) or {}) if sc else {}
         covered: dict[str, int] = {}
         for p in deps.positions.list_open():
@@ -847,34 +838,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         return {"holdings": [{
             "symbol": h.symbol, "shares": h.quantity, "average_cost": h.average_cost,
             "coverable": int(h.quantity // 100), "covered": covered.get(h.symbol, 0),
-            "reserve": h.symbol.upper() in reserve, "clock": clock.get(h.symbol),
+            "clock": clock.get(h.symbol),
         } for h in holds]}
-
-    def _reserve_payload() -> dict:
-        """Tax-reserve state for the dashboard, digest and brief: config, held shares (walled off),
-        ledger totals, recent periods, what the next sweep would do."""
-        sc = deps.scanner
-        loop = getattr(deps, "tax_reserve", None)
-        store = getattr(deps, "tax_reserve_store", None)
-        out: dict = {"config": deps.settings.tax_reserve.model_dump(),
-                     "holding": (getattr(sc, "last_reserve", None) if sc else None),
-                     "clock": (dict(getattr(sc, "last_cc_clock", {}) or {}) if sc else {}),
-                     "status": None, "totals": None, "recent": []}
-        try:
-            out["status"] = loop.status() if loop is not None else None
-        except Exception as exc:  # noqa: BLE001
-            out["status_error"] = str(exc)
-        try:
-            if store is not None:
-                out["totals"] = store.totals()
-                out["recent"] = store.recent(12)
-        except Exception as exc:  # noqa: BLE001
-            out["ledger_error"] = str(exc)
-        return out
-
-    @router.get("/api/tax-reserve")
-    async def api_tax_reserve() -> dict:
-        return _reserve_payload()
 
     @router.get("/api/tiers")
     async def api_tiers() -> dict:
@@ -1354,7 +1319,7 @@ _PAGE = """<!doctype html>
 
   <div class="ribbon">
     <div class="ribbon-top" id="conn-top"><span class="conn"><span class="dot"></span> Checking connection…</span></div>
-    <div class="ribbon-note" id="conn-note">This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.</div>
+    <div class="ribbon-note" id="conn-note">This banner turns <b>red</b> the moment the bot loses its Robinhood connection.</div>
   </div>
 
   <nav class="tabs" id="tabs">
@@ -1411,10 +1376,6 @@ _PAGE = """<!doctype html>
           <div class="say" id="al-say"></div>
         </div>
       </section>
-      <section class="card2" id="reserve-card">
-        <div class="card-h"><h2>Tax reserve</h2><span class="count" id="rsv-note"></span></div>
-        <div id="reserve"></div>
-      </section>
       <section class="card2" id="tiers-card" data-fold="closed">
         <div class="card-h"><h2>Ready to add</h2><span class="count" id="tiers-note"></span></div>
         <div class="ctl" id="tiers"></div>
@@ -1470,15 +1431,6 @@ _PAGE = """<!doctype html>
           <div class="hint">Aim for 10–25 names you'd be happy to own. Changes apply live. Owner login can edit; view-only cannot. Overlay values on the data disk override config.yaml.</div>
           <div class="hint ov-note" id="wl-ov-note"></div>
           <div class="say" id="wl-say"></div>
-
-      <div class="ctl-lab" style="margin-top:16px">Weekly premium target</div>
-      <div class="row">
-        <input class="f wk mono" id="wk-in" inputmode="decimal" placeholder="0"/>
-        <span class="muted" style="font-size:13px">% of account</span>
-        <button class="go owner-only" id="wk-save">Save</button>
-      </div>
-      <div class="hint">Past this, new entries wait for your one-tap OK instead of auto-firing. 0 = off.</div>
-      <div class="say" id="wk-say"></div>
 
       <div class="scanline" id="scanline"></div>
     </div>
@@ -1576,20 +1528,7 @@ _PAGE = """<!doctype html>
     <div class="hint">Strategy knobs apply live and persist on the data-disk overlay (which overrides config.yaml). Owner login can edit; view-only cannot. Mode, live-arming, and broker stay file-only. Real orders and limit-only are locked in code.</div>
     <div class="ctl">
       <div class="hint ov-note" id="tn-ov-note"></div>
-      <div class="ctl-lab">Tax reserve / gains sweep</div>
-      <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-on"/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
-      <div class="scr-filters">
-        <label>% of net gains<input class="f scrn" id="tn-tr-pct" inputmode="decimal" placeholder="20"/></label>
-        <label>Symbol<input class="f scrn" id="tn-tr-sym" placeholder="SGOV" maxlength="6" autocapitalize="characters"/></label>
-        <label>Day<select class="f" id="tn-tr-day"><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option></select></label>
-        <label>Time (ET)<input class="f scrn" id="tn-tr-time" placeholder="15:40"/></label>
-        <button class="go" id="tn-tr-save">Save</button>
-      </div>
-      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-dry"/> Dry run (log what it would buy, place nothing)</label></div>
-      <div class="hint">Applies live and persists on the data-disk overlay. Dry-run logs the intended buy without placing it.</div>
-      <div class="say" id="tn-tr-say"></div>
-
-      <div class="ctl-lab" style="margin-top:18px">Market regime</div>
+      <div class="ctl-lab">Market regime</div>
       <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-skip-dt"/> Pause new puts in a confirmed downtrend</label></div>
       <div class="row" style="margin-top:8px">
         <span class="muted" style="font-size:13px">SPY below its 200-day for</span>
@@ -1781,7 +1720,6 @@ async function loadConn(){
   const al = st.alerts || {};
   const alLabel = al.mode==="instant" ? "Alerts instant" : (al.mode==="regular" ? "Alerts regular" : (al.mode==="off" ? "Alerts off" : ""));
   const alChip = alLabel ? `<span class="chip ${al.mode==="instant"&&al.webhook_configured?"good":""}">${esc(alLabel)}</span>` : "";
-  const paper = bs.is_paper === true, live = st.mode === "live";
   let scanChip = "";
   if(sc){
     const lastAgo = sc.last_scan_at ? agoStr((Date.now()-new Date(sc.last_scan_at).getTime())/1000) : null;
@@ -1792,13 +1730,10 @@ async function loadConn(){
   }
   let klass="", label="", sub="";
   if(bs.read_error){ klass="bad"; label="Broker connection problem"; sub="· "+bs.read_error; }
-  else if(paper && live){ klass="bad"; label="Running on the SIMULATOR"; sub="· not trading your real account"; }
-  else if(paper){ klass="warn"; label="Paper (simulation) mode"; sub="· no real orders"; }
-  else if(bs.broker==="robinhood_mcp"){ klass=""; label="Connected to Robinhood"; sub="· real account"; }
+  else if(bs.broker==="robinhood_mcp"){ klass=""; label="Connected to Robinhood"; sub="· read only"; }
   else { klass="warn"; label="Broker: "+esc(bs.broker||"unknown"); sub=""; }
   top.innerHTML = `<span class="conn ${klass}"><span class="dot"></span> ${esc(label)} <small>${esc(sub)}</small></span>
     <div class="chips">
-      <span class="chip ${live?"good":""}">${live?"Live trading armed":"Paper mode"}</span>
       <span class="chip ${st.paused?"warn":""}">${st.paused?"⏸ Paused":"Running"}</span>
       ${alChip}
       ${scanChip}
@@ -1807,7 +1742,7 @@ async function loadConn(){
     </div>`;
   note.innerHTML = (klass==="bad")
     ? `<b style="color:var(--neg)">Heads up:</b> the bot is not managing your real Robinhood positions right now.`
-    : `This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.`;
+    : `This banner turns <b>red</b> the moment the bot loses its Robinhood connection.`;
   const nd=$("nav-status"); if(nd) nd.className="nav-dot "+(klass||"good");
   renderAlerts(al);
 }
@@ -1957,22 +1892,7 @@ async function loadWeek(){
     <div class="wkline"><span class="wklbl">This week</span> ${wk}</div>`;
 }
 
-/* ---- tax reserve + capital unlocks ---- */
-function dayName(i){ return ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][i] || ""; }
-async function loadReserve(){
-  const el = $("reserve"); if(!el) return;
-  const d = await getJSON("/api/tax-reserve");
-  const cfg = d.config || {}, h = d.holding, t = d.totals || {}, st = d.status || {};
-  if($("rsv-note")) $("rsv-note").textContent = cfg.enabled ? (cfg.dry_run ? "on · dry run" : "on") : "off";
-  const when = st.next_sweep_at ? new Date(st.next_sweep_at).toLocaleString(undefined,{weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}) : "—";
-  const last = (d.recent||[])[0];
-  el.innerHTML = `
-    <div class="stat"><span class="k">Held in ${esc(cfg.symbol||"SGOV")}</span><span class="v">${h ? money(h.value) : "$0.00"}</span></div>
-    <div class="stat"><span class="k">Swept to date</span><span class="v">${money(t.swept_dollars||0)} <span class="badge">${t.sweeps||0} sweeps</span></span></div>
-    <div class="stat"><span class="k">Net realized since last sweep</span><span class="v ${cls(st.pending_net_since_last)}">${money(st.pending_net_since_last)}</span></div>
-    <div class="stat"><span class="k">Next sweep would buy</span><span class="v">${money(st.would_sweep||0)}</span></div>
-    <div class="wkline"><span class="wklbl">Next</span> ${esc(when)}${cfg.enabled ? "" : " · turn on in Tuning"}${last ? ` · last: ${esc(last.status)} ${last.dollar_amount ? money(last.dollar_amount) : ""}` : ""}</div>`;
-}
+/* ---- capital unlocks ---- */
 async function loadTiers(){
   const el = $("tiers"); if(!el) return;
   const d = await getJSON("/api/tiers");
@@ -1992,25 +1912,6 @@ async function loadTiers(){
     } catch(e){ say("tiers-say", "Couldn't add: "+e.message, false); }
   });
 }
-function fillReserve(tr){
-  if(document.activeElement !== $("tn-tr-on")) $("tn-tr-on").checked = !!tr.enabled;
-  if(document.activeElement !== $("tn-tr-dry")) $("tn-tr-dry").checked = tr.dry_run !== false;
-  _setIf("tn-tr-pct", tr.pct != null ? (tr.pct*100).toFixed(0) : "20");
-  _setIf("tn-tr-sym", tr.symbol || "SGOV");
-  _setIf("tn-tr-day", tr.weekday != null ? String(tr.weekday) : "4");
-  _setIf("tn-tr-time", (tr.hour != null ? String(tr.hour).padStart(2,"0") : "15") + ":" + (tr.minute != null ? String(tr.minute).padStart(2,"0") : "40"));
-}
-async function saveReserve(){
-  const pct = parseFloat(($("tn-tr-pct").value||"").trim()); const sym = ($("tn-tr-sym").value||"").trim().toUpperCase();
-  const tm = ($("tn-tr-time").value||"15:40").trim().split(":"); const hh = parseInt(tm[0],10), mm = parseInt(tm[1]||"0",10);
-  if(isNaN(pct) || pct <= 0 || pct > 60){ say("tn-tr-say","Enter a percent between 1 and 60.",false); return; }
-  if(!/^[A-Z]{1,6}$/.test(sym)){ say("tn-tr-say","Enter a stock or ETF ticker, e.g. SGOV.",false); return; }
-  if(isNaN(hh) || isNaN(mm) || hh < 9 || hh > 15 || (hh === 9 && mm < 35)){ say("tn-tr-say","Time must be inside market hours (09:35 to 15:55 ET).",false); return; }
-  try { await postConfig({tax_reserve:{enabled:$("tn-tr-on").checked, dry_run:$("tn-tr-dry").checked, pct: pct/100, symbol: sym, weekday: parseInt($("tn-tr-day").value,10), hour: hh, minute: mm}});
-    say("tn-tr-say", $("tn-tr-on").checked ? (($("tn-tr-dry").checked ? "On (dry run): " : "On: ") + pct + "% of net gains into " + sym + " every " + dayName(parseInt($("tn-tr-day").value,10)) + ".") : "Off.", true);
-  } catch(e){ say("tn-tr-say","Couldn't save: "+e.message,false); }
-}
-
 /* ---- activity ---- */
 const RULE_LABEL = {"profit-trail":"Took profit","profit-target":"Took profit","profit-50":"Took profit",
   "roll":"Rolled a position","dte-2":"Expiry check","dte-close":"Expiry close","stop-loss":"Stop-loss",
@@ -2131,11 +2032,8 @@ async function loadControls(){
   const e = cfg.editable.entry || {};
   watchlist = (e.watchlist || []).slice();
   renderWatchlist();
-  const wt = e.weekly_premium_target_pct;
-  if(document.activeElement !== $("wk-in")) $("wk-in").value = wt ? (wt*100).toFixed(wt*100 % 1 ? 1 : 0) : "0";
   fillTuning(e);
   fillMacro(cfg.editable.macro || {});
-  fillReserve((cfg.editable && cfg.editable.tax_reserve) || {});
 }
 function fillMacro(m){
   if(document.activeElement !== $("tn-skip-dt")) $("tn-skip-dt").checked = !!m.skip_confirmed_downtrend;
@@ -2267,12 +2165,6 @@ function addTicker(){
   saveWatchlist(next, "Added "+t+"."+(next.length>25?" (that's a lot — 10–25 is the sweet spot.)":""));
 }
 function removeTicker(t){ saveWatchlist(watchlist.filter(x=>x!==t), "Removed "+t+"."); }
-async function saveWeekly(){
-  const raw=($("wk-in").value||"").trim(); const v=parseFloat(raw);
-  if(isNaN(v) || v<0 || v>100){ say("wk-say","Enter a percent between 0 and 100.",false); return; }
-  try { await postConfig({entry:{weekly_premium_target_pct: v/100}}); say("wk-say", v>0?("Target set to "+v+"% of account."):"Weekly target turned off.", true); }
-  catch(e){ say("wk-say","Couldn't save: "+e.message, false); }
-}
 
 /* ---- detailed tables (unchanged data, collapsed) ---- */
 async function loadTables(){
@@ -2309,8 +2201,7 @@ async function loadTables(){
   const {holdings} = await getJSON("/api/holdings");
   $("holdings").querySelector("tbody").innerHTML = holdings.map(h => {
     const c = h.clock || {};
-    const note = h.reserve ? '<span class="pill fav">tax reserve</span>'
-      : (c.days_held != null ? (c.below_basis_allowed ? `<span class="pill mixed">stuck ${c.days_held}d · calls below basis allowed</span>`
+    const note = (c.days_held != null ? (c.below_basis_allowed ? `<span class="pill mixed">stuck ${c.days_held}d · calls below basis allowed</span>`
          : `<span class="pill">held ${c.days_held}d${c.under_water ? " · under water" : ""}${c.clock_days ? " · clock " + c.clock_days + "d" : ""}</span>`) : "");
     return `<tr><td>${esc(h.symbol)}</td><td class="num">${h.shares}</td><td class="num">${money(h.average_cost)}</td>
     <td class="num">${h.coverable}</td><td class="num">${h.covered}/${h.coverable}</td><td>${note}</td></tr>`; }).join("")
@@ -2865,7 +2756,7 @@ async function loadAll(){
                            [loadFeed,"feed"],[loadScanStatus,"scan"],[loadTvLevels,"tv"],
                            [loadQuality,"quality"],[loadSetups,"setups"],[loadSetupAccuracy,"setupacc"],
                            [loadRiskProfile,"riskprofile"],[loadRegimeStatus,"regime"],
-                           [loadReserve,"reserve"],[loadTiers,"tiers"],[loadTables,"tables"],
+                           [loadTiers,"tiers"],[loadTables,"tables"],
                            [loadRules,"rules"],[loadAlerts,"alerts"]]) {
     try { await fn(); } catch(e){ console.error(name, e); }
   }
@@ -2889,11 +2780,8 @@ $("scr-run").onclick = runScreen;
 $("scr-scan").onclick = runScan;
 $("wl-add").onclick = addTicker;
 $("wl-in").addEventListener("keydown", e => { if(e.key==="Enter") addTicker(); });
-$("wk-save").onclick = saveWeekly;
-$("wk-in").addEventListener("keydown", e => { if(e.key==="Enter") saveWeekly(); });
 $("tn-uc-save").onclick = saveMulti;
 $("tn-dt-save").onclick = saveDowntrend;
-$("tn-tr-save").onclick = saveReserve;
 $("tn-gates-save").onclick = saveGates;
 $("tn-global-save").onclick = saveGlobal;
 $("tn-pt-save").onclick = savePerTicker;

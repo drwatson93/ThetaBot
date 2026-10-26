@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
@@ -163,10 +162,6 @@ _ROLE_HINTS: dict[str, tuple[tuple[str, ...], ...]] = {
     "get_equity_orders": (("equity", "order", "get"), ("get", "equity", "order")),
 }
 
-# UUIDv5 namespace for deriving a stable RH ``ref_id`` from our (non-UUID) client_order_id.
-_REF_ID_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
-
-
 class RobinhoodMCPBroker(ExecutionBroker):
     def __init__(self, url: str = MCP_URL, account_number: str = "", settings=None):
         self.url = url
@@ -288,39 +283,6 @@ class RobinhoodMCPBroker(ExecutionBroker):
         raw = await self._call_tool(role, {"account_number": self._account_number})
         rec = self._match_order_record(raw, order.broker_order_id)
         return self._apply_order_status(order, rec) if rec else order
-
-    def _require_live(self, *, kind: str = "option", symbol: str | None = None,
-                      quantity: float | None = None, side: str | None = None) -> None:
-        from .live_guard import assert_live_order_allowed
-        assert_live_order_allowed(
-            self._settings, kind=kind, symbol=symbol, quantity=quantity, side=side
-        )
-
-    # ------------------------------------------------------------------ writes
-    async def submit_close_order(self, order: Order) -> Order:
-        """Submit a buy-to-close option order. Idempotent on ``order.client_order_id``.
-
-        We pass ``client_order_id`` through to the broker so a retried submit with the same
-        key does not create a duplicate fill (the broker dedups). If the broker has no such
-        field, the executor's persist-before-submit + get_order reconciliation is the
-        backstop.
-        """
-        if not self._supports_options:
-            raise RuntimeError(
-                "Robinhood MCP did not expose option order tools; configure broker_fallback."
-            )
-        self._require_live(kind="option", side="buy")
-        return await self._place_and_confirm(
-            order, self._build_close_order_args(order), position_effect="close")
-
-    async def review_close_order(self, order: Order) -> dict[str, Any]:
-        """Dry-run a close via the review/simulate tool. Used to confirm buy-to-close on a
-        short is accepted *before* arming live (no order is placed). Returns the raw review
-        payload for inspection/audit; raises if no review tool resolved."""
-        role = self._roles.get("review_option_order")
-        if not role:
-            raise RuntimeError("No option-order review/simulate tool resolved on this account.")
-        return await self._call_tool(role, self._build_close_order_args(order))
 
     async def get_index_quote(self, symbol: str) -> float | None:
         """Current level of a market index (e.g. 'VIX'), or None if unavailable. Resolves the
@@ -489,27 +451,6 @@ class RobinhoodMCPBroker(ExecutionBroker):
         rec = self._first_record(raw)
         return str(rec.get("id")) if rec.get("id") else None
 
-    # ---- share orders (tax reserve BUY only) -------------------------------------------------
-    def _build_equity_order_args(self, *, symbol: str, ref_id: str, limit_price: float,
-                                dollar_amount: float | None = None,
-                                quantity: float | None = None) -> dict[str, Any]:
-        """Limit BUY, regular hours. Never a market order."""
-        args: dict[str, Any] = {
-            "account_number": self._account_number,
-            "symbol": symbol.upper(),
-            "side": "buy",
-            "type": "limit",
-            "price": f"{float(limit_price):.2f}",
-            "time_in_force": "gfd",
-            "market_hours": "regular_hours",
-            "ref_id": ref_id,
-        }
-        if dollar_amount:
-            args["dollar_amount"] = f"{float(dollar_amount):.2f}"
-        elif quantity:
-            args["quantity"] = str(quantity)
-        return args
-
     @staticmethod
     def _parse_equity_order(rec: dict[str, Any]) -> dict[str, Any]:
         state = str(rec.get("state") or rec.get("status") or "").lower()
@@ -536,38 +477,6 @@ class RobinhoodMCPBroker(ExecutionBroker):
         return {"order_id": str(rec.get("id") or rec.get("order_id") or "") or None, "status": status,
                 "shares": qty, "avg_price": px, "dollars": dollars, "raw_state": state}
 
-    async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
-                                  quantity: float | None = None, order_type: str = "limit",
-                                  ref_id: str | None = None, price_hint: float | None = None,
-                                  timeout_seconds: float = 90.0, poll_seconds: float = 3.0) -> dict[str, Any]:
-        """BUY shares (tax reserve or the optional 1-share SGOV test). Limit orders only."""
-        self._require_live(kind="equity", symbol=symbol, quantity=quantity, side=side)
-        if side != "buy" or order_type != "limit":
-            raise RuntimeError("submit_equity_order only supports limit BUY.")
-        if (not dollar_amount or dollar_amount <= 0) and not quantity:
-            raise RuntimeError("submit_equity_order needs a dollar_amount or quantity.")
-        if price_hint is None or float(price_hint) <= 0:
-            raise RuntimeError("submit_equity_order needs a positive limit price (price_hint).")
-        role = self._roles.get("place_equity_order")
-        if not role or not self._account_number:
-            raise RuntimeError("Robinhood MCP did not expose place_equity_order (or account_number unset).")
-        args = self._build_equity_order_args(
-            symbol=symbol, ref_id=ref_id or str(uuid.uuid4()), limit_price=float(price_hint),
-            dollar_amount=float(dollar_amount) if dollar_amount else None,
-            quantity=quantity,
-        )
-        raw = await self._call_tool(role, args)
-        result = self._parse_equity_order(self._first_record(raw))
-        deadline = asyncio.get_event_loop().time() + timeout_seconds
-        while result["status"] in ("submitted", "partial", "unknown") and result.get("order_id") \
-                and asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(poll_seconds)
-            try:
-                result = await self.get_equity_order(result["order_id"])
-            except Exception as exc:  # noqa: BLE001 -- keep polling on a transient read error
-                log.warning("get_equity_order failed: %s", exc)
-        return result
-
     async def get_equity_order(self, order_id: str) -> dict[str, Any]:
         role = self._roles.get("get_equity_orders")
         if not role:
@@ -576,52 +485,35 @@ class RobinhoodMCPBroker(ExecutionBroker):
         rec = self._match_order_record(raw, order_id) or self._first_record(raw)
         return self._parse_equity_order(rec)
 
-    async def submit_open_order(self, order: Order) -> Order:
-        """Submit a sell-to-open (CSP). Idempotent on order.client_order_id via ref_id."""
-        if not self._supports_options:
-            raise RuntimeError(
-                "Robinhood MCP did not expose option order tools; configure broker_fallback."
-            )
-        self._require_live(kind="option", side="sell")
-        return await self._place_and_confirm(
-            order, self._build_open_order_args(order), position_effect="open")
+    def __getattr__(self, name: str):
+        """Refuse a removed write name without opening a session.
 
-    async def review_open_order(self, order: Order) -> dict[str, Any]:
-        """Dry-run a sell-to-open via the review tool (no order placed)."""
-        role = self._roles.get("review_option_order")
-        if not role:
-            raise RuntimeError("No option-order review/simulate tool resolved on this account.")
-        return await self._call_tool(role, self._build_open_order_args(order))
-
-    def _build_open_order_args(self, order: Order) -> dict[str, Any]:
-        """Build a sell-to-open request: a SHORT (sell) put with position_effect=open, as a
-        limit order collecting a credit. Same single-leg schema as close, side/effect flipped."""
-        if not order.option_id:
-            raise RuntimeError(
-                "Order has no option_id; cannot build an RH open order (resolve the contract's "
-                "instrument UUID before submitting)."
-            )
-        return {
-            "account_number": self._account_number,
-            "legs": [{
-                "option_id": order.option_id,
-                "side": "sell",                # sell-to-open a short put
-                "position_effect": "open",
-            }],
-            "quantity": str(order.quantity),
-            "type": "limit",
-            "price": f"{order.limit_price:.2f}",
-            "time_in_force": "gfd",
-            "ref_id": self._ref_id(order),
-        }
-
-    async def cancel_order(self, order: Order) -> None:
-        role = self._roles.get("cancel_option_order")
-        if not role or not order.broker_order_id:
-            return
-        await self._call_tool(
-            role, {"account_number": self._account_number, "order_id": order.broker_order_id}
+        The methods are not defined. Attribute access raises the same lock error
+        the guard raises, so a leftover caller cannot place an order.
+        """
+        refused = (
+            name.startswith("submit_")
+            or name.startswith("review_")
+            or name in {
+                "cancel_order",
+                "_place_and_confirm",
+                "_resolve_placed_order",
+                "_require_live",
+                "_build_open_order_args",
+                "_build_close_order_args",
+                "_build_equity_order_args",
+                "_ref_id",
+            }
         )
+        if not refused:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+        async def _blocked(*_args, **_kwargs):
+            raise RobinhoodWriteBlocked(
+                f"ORDERS_HARD_DISABLED: refusing Robinhood MCP tool {name!r}"
+            )
+
+        return _blocked
 
     # ------------------------------------------------------------------ MCP plumbing
     @staticmethod
@@ -731,69 +623,6 @@ class RobinhoodMCPBroker(ExecutionBroker):
                 return rec
         return {}
 
-    @staticmethod
-    def _order_created_key(rec: dict[str, Any]) -> str:
-        """Sort key for 'most recently created order' — RH created_at is a fixed-format ISO ts,
-        so a lexicographic compare orders them correctly."""
-        return str(rec.get("created_at") or rec.get("updated_at") or "")
-
-    async def _place_and_confirm(
-        self, order: Order, args: dict[str, Any], *, position_effect: str
-    ) -> Order:
-        """Place an option order, then ensure the returned Order carries a broker id + state.
-
-        RH's ``place_option_order`` response does not reliably surface the created order's id/state,
-        which left our orders stuck at PENDING with ``broker_order_id=None`` — so the executor's
-        fill poll had nothing to track, timed out, and marked genuine fills FAILED (while RH filled
-        the order and reconcile booked an estimated P&L). When the place response lacks an id, we
-        confirm the order from RH's recent order list.
-        """
-        role = self._roles["place_option_order"]
-        raw = await self._call_tool(role, args)
-        result = self._apply_order_status(order, self._first_record(raw))
-        if not result.broker_order_id:
-            rec = await self._resolve_placed_order(result, position_effect=position_effect)
-            if rec:
-                result = self._apply_order_status(result, rec)
-        return result
-
-    async def _resolve_placed_order(
-        self, order: Order, *, position_effect: str
-    ) -> dict[str, Any]:
-        """Find the just-placed order in RH's recent order list (get_option_orders) when the place
-        response didn't carry a usable id. Matches the MOST RECENT order whose leg is our
-        ``option_id`` with the given ``position_effect`` (open/close). RH doesn't echo our ref_id,
-        so we match on option_id + effect + recency — safe because closes are serialized and we hold
-        one CSP per underlying. Best-effort: returns ``{}`` (caller keeps the order) on any failure.
-        """
-        role = self._roles.get("get_option_order")
-        if not role or not order.option_id:
-            return {}
-        try:
-            raw = await self._call_tool(role, {"account_number": self._account_number})
-        except Exception as exc:  # noqa: BLE001 — confirmation is best-effort
-            log.warning("Post-submit order confirmation failed for %s: %s", order.occ_symbol, exc)
-            return {}
-        best: dict[str, Any] = {}
-        best_key = ""
-        for rec in self._iter_records(raw):
-            legs = rec.get("legs") or []
-            matched = any(
-                isinstance(leg, dict)
-                and str(leg.get("option_id")) == str(order.option_id)
-                and str(leg.get("position_effect", "")).lower() == position_effect
-                for leg in legs
-            )
-            if not matched:
-                continue
-            key = self._order_created_key(rec)
-            if not best or key > best_key:
-                best, best_key = rec, key
-        if best:
-            log.info("Confirmed %s order %s via get_option_orders (state=%s).",
-                     position_effect, best.get("id"), best.get("state"))
-        return best
-
     async def _fetch_instruments(self, option_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Map option_id -> instrument record (strike_price, type, chain_symbol, expiration).
 
@@ -809,12 +638,6 @@ class RobinhoodMCPBroker(ExecutionBroker):
             if iid:
                 out[str(iid)] = rec
         return out
-
-    @staticmethod
-    def _ref_id(order: Order) -> str:
-        """Stable UUID idempotency key. Our client_order_id (``close-<hex>``) isn't a UUID,
-        so derive a deterministic UUIDv5 from it — same logical order ⇒ same ref_id on retry."""
-        return str(uuid.uuid5(_REF_ID_NS, order.client_order_id))
 
     @staticmethod
     def _build_occ_symbol(
@@ -891,33 +714,6 @@ class RobinhoodMCPBroker(ExecutionBroker):
             option_id=oid or None,
             status=PositionStatus.OPEN,
         )
-
-    def _build_close_order_args(self, order: Order) -> dict[str, Any]:
-        """Build the place/review request for a buy-to-close (single-leg).
-
-        Closing a SHORT option = BUY with position_effect=close (confirmed by the live
-        review dry-run). The order is fully identified by option_id; chain_symbol/
-        underlying_type (fee/collateral hints) are omitted intentionally — they are optional
-        and we don't carry them on the Order.
-        """
-        if not order.option_id:
-            raise RuntimeError(
-                "Order has no option_id; cannot build an RH close order. The position read "
-                "must capture option_id (see get_open_positions)."
-            )
-        return {
-            "account_number": self._account_number,
-            "legs": [{
-                "option_id": order.option_id,
-                "side": "buy",              # buy-to-close a short
-                "position_effect": "close",
-            }],
-            "quantity": str(order.quantity),
-            "type": "limit",
-            "price": f"{order.limit_price:.2f}",
-            "time_in_force": "gfd",         # good-for-day
-            "ref_id": self._ref_id(order),  # UUID idempotency key
-        }
 
     @staticmethod
     def _apply_order_status(order: Order, raw: Any) -> Order:

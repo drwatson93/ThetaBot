@@ -15,7 +15,7 @@ from agentic.services.stats import compute_stats, position_pnl, position_rows
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -137,8 +137,8 @@ def _bare_app(tmp_path):
 def test_dashboard_ships_control_ui(tmp_path):
     """The redesigned page must include the connection hero + the editable controls."""
     page = _bare_app(tmp_path).get("/dashboard").text
-    for marker in ('id="wl-in"', 'id="wk-in"', "What you&#39;re holding".replace("&#39;", "'"),
-                   "Weekly premium target", "Connected to Robinhood", "TradingView levels",
+    for marker in ('id="wl-in"', "What you&#39;re holding".replace("&#39;", "'"),
+                   "Connected to Robinhood", "TradingView levels",
                    'id="tv-levels"', "powered by AgenticRobinhood",
                    # Tuning panel: mobile config controls (multi-CSP, gates, per-ticker overrides)
                    'data-tab="tuning"', 'id="tn-uc"', 'id="tn-em"', 'id="tn-vrp"',

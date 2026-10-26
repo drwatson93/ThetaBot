@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
 
 from ..domain.models import EquityHolding, Order, Position
 
@@ -20,7 +19,7 @@ class BrokerCapabilities:
     supports_options_orders: bool
     is_paper: bool
     notes: str = ""
-    supports_equity_orders: bool = False   # share BUY orders (tax-reserve sweep); never sells
+    supports_equity_orders: bool = False
 
 
 class ExecutionBroker(ABC):
@@ -37,21 +36,10 @@ class ExecutionBroker(ABC):
         """Return current open OPTION positions from the broker (source of truth)."""
 
     @abstractmethod
-    async def submit_close_order(self, order: Order) -> Order:
-        """Submit a buy-to-close order. Must be idempotent on order.client_order_id.
-
-        Returns the order updated with broker_order_id and status. Phase 2+.
-        """
-
-    @abstractmethod
     async def get_order(self, order: Order) -> Order:
         """Refresh and return the latest state of a previously submitted order."""
 
-    @abstractmethod
-    async def cancel_order(self, order: Order) -> None:
-        """Cancel a working order (best-effort)."""
-
-    # --- entry-side (opening CSPs); default no-op/unsupported so close-only brokers work ---
+    # --- account reads; default empty so a quote-only session still type-checks ---
     async def get_buying_power(self) -> float:
         """Cash/buying power available for new cash-secured puts. Default: 0 (no entries)."""
         return 0.0
@@ -65,24 +53,8 @@ class ExecutionBroker(ABC):
         return []
 
     async def resolve_option_id(self, occ_symbol: str) -> str | None:
-        """Resolve an OCC symbol to this broker's option-instrument id (for opening a new
-        contract we don't already hold). Default: unknown."""
+        """Resolve an OCC symbol to this broker's option-instrument id. Default: unknown."""
         return None
-
-    async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
-                                  quantity: float | None = None, order_type: str = "limit",
-                                  ref_id: str | None = None, price_hint: float | None = None) -> dict:
-        """Place a SHARE order (used only to BUY the tax reserve). Returns
-        ``{order_id, status, shares, avg_price, dollars}``. Default: unsupported."""
-        raise NotImplementedError("This broker does not place share orders.")
 
     async def get_equity_order(self, order_id: str) -> dict:
         raise NotImplementedError("This broker does not read share orders.")
-
-    async def submit_open_order(self, order: Order) -> Order:
-        """Submit a sell-to-open order (CSP). Idempotent on order.client_order_id."""
-        raise NotImplementedError("This broker does not support opening orders.")
-
-    async def review_open_order(self, order: Order) -> dict[str, Any]:
-        """Dry-run a sell-to-open (no order placed). Used to confirm acceptance before live."""
-        raise NotImplementedError("This broker does not support opening orders.")

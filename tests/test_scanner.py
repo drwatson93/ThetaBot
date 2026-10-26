@@ -4,13 +4,13 @@ from datetime import timedelta
 import pytest
 from fastapi.testclient import TestClient
 
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.config import EntryConfig, Settings
 from agentic.domain.enums import OptionType, PositionStatus
 from agentic.domain.models import utcnow
 from agentic.marketdata.base import MarketDataProvider
 from agentic.marketdata.quote import OptionContractQuote
-from agentic.services.executor import OrderExecutor
+from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.services.scanner import OpportunityScanner
 from agentic.store.audit import AuditStore
@@ -18,7 +18,7 @@ from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
 from agentic.store.entry_candidates import EntryCandidateStore
 from agentic.store.entry_decisions import EntryDecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -171,20 +171,3 @@ async def test_dashboard_surfaces_candidates_and_entries(ctx):
     assert "X" in tech["symbols"] and "sma200" in tech["symbols"]["X"]  # trend inputs surfaced
 
 
-@pytest.mark.asyncio
-async def test_loss_breaker_freezes_new_entries(ctx):
-    """Loss circuit breaker: a losing streak freezes NEW entries (no orders), without closing
-    anything. Mirrors the killswitch guard but is a distinct, self-evaluating state."""
-    class _LosingJournal:                       # 4 straight realized losers -> trips the streak rule
-        def realized_since(self, since_iso):
-            return (-40.0, 4)
-        def resolved_pnls(self, limit=50):
-            return [-8.0, -12.0, -5.0, -15.0, 20.0][:limit]
-    ctx["scanner"].trade_journal = _LosingJournal()
-
-    submitted = await ctx["scanner"].run_once()
-    assert submitted == 0                                   # no new alerts
-    assert ctx["entry_decisions"].recent() == []            # nothing written
-    assert ctx["scanner"].alerts.all() == []
-    brk = ctx["scanner"].last_breaker
-    assert brk is not None and brk["tripped"] is True and "consecutive" in brk["reason"]

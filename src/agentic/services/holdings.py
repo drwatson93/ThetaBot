@@ -1,19 +1,9 @@
-"""Share-holding helpers: which holdings are tradable (not the tax reserve), how long shares have
-been held since assignment, and whether the assignment clock allows calls below cost basis. Pure."""
+"""Share-holding helpers: how long shares have been held since assignment, and whether the
+assignment clock allows calls below cost basis. Pure."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Iterable
-
-
-def reserve_symbols(settings) -> set[str]:
-    cfg = getattr(settings, "tax_reserve", None)
-    return {str(cfg.symbol).upper()} if cfg is not None and getattr(cfg, "symbol", None) else set()
-
-
-def tradable_holdings(holdings: Iterable[Any], reserve: set[str]) -> list[Any]:
-    """Holdings the wheel may write calls on / count as assignment evidence."""
-    return [h for h in holdings if str(getattr(h, "symbol", "")).upper() not in reserve]
 
 
 def held_since(journal_entries: Iterable[Any], symbol: str) -> datetime | None:

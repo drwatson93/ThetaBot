@@ -8,20 +8,20 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from agentic.brokers.paper_broker import PaperBroker
+from tests.fakes import PaperBroker
 from agentic.config import RuleConfig, Settings, load_config, load_overlay
 from agentic.domain.enums import AuditEventType, DecisionStatus, Direction, OptionType, Strategy
 from agentic.domain.models import Position, utcnow
 from agentic.marketdata.base import PaperMarketData
 from agentic.marketdata.quote import OptionQuote
 from agentic.rules.engine import RulesEngine
-from agentic.services.approval import ApprovalGate
-from agentic.services.executor import OrderExecutor
+from tests.fakes import ApprovalGate
+from tests.fakes import OrderExecutor
 from agentic.services.killswitch import KillSwitch
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from agentic.store.orders import OrderStore
+from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -162,8 +162,6 @@ def test_owner_can_toggle_and_tune_rules(client):
     assert body["role"] == "owner"
     assert settings.rules[0].params["profit_pct"] == 0.6
     assert settings.rules[1].enabled is False
-    assert settings.mode == "paper"
-    assert settings.i_understand_live_trading is False
     assert "mode" not in body["editable"]
     assert "broker" not in body["editable"]
     row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
@@ -361,7 +359,7 @@ def test_refresh_stops_a_disabled_rule_from_firing(client):
 @pytest.mark.asyncio
 async def test_monitor_poll_refreshes_and_skips_disabled_rule(tmp_path):
     """The monitor calls refresh before evaluate. No executor, so this cannot place an order."""
-    from agentic.brokers.paper_broker import PaperBroker
+    from tests.fakes import PaperBroker
     from agentic.marketdata.base import PaperMarketData
     from agentic.services.killswitch import KillSwitch
     from agentic.services.monitor import MonitorLoop
@@ -416,7 +414,6 @@ def test_overlay_persists_rules_across_reload(client, tmp_path):
     assert saved["rules"][1]["params"]["delta_stop"] == 0.5
     assert "mode" not in saved
     reloaded = load_config(base)
-    assert reloaded.mode == "paper"
     assert reloaded.rules[1].params["loss_mult"] is None
     assert reloaded.rules[1].params["delta_stop"] == 0.5
     assert reloaded.rules[1].enabled is True

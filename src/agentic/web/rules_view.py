@@ -32,16 +32,11 @@ def describe_active_rules(
     e = s.entry
     sz = e.sizing
     crit = e.criteria
-    tr = s.tax_reserve
-    risk = s.risk
     rows: list[dict[str, Any]] = []
 
     def add(group: str, name: str, value: str, detail: str = "") -> None:
         rows.append({"group": group, "name": name, "value": value, "detail": detail})
 
-    mode_label = "paper (no real orders)" if not s.is_live else "LIVE — real orders armed"
-    add("Mode", "Trading mode", mode_label,
-        "Live requires both mode: live and i_understand_live_trading: true.")
     if ORDERS_HARD_DISABLED:
         add("Mode", "Real orders", "HARD DISABLED in code",
             f"{REAL_ORDERS_LOCK_LABEL}. Hard-coded in the Robinhood MCP client. "
@@ -52,8 +47,8 @@ def describe_active_rules(
         "Robinhood quotes are treated as real-time. Alpaca needs feed=opra for live entry.")
 
     add("Hours", "Trading start", f"{_hhmm(s.trading_start)} America/New_York",
-        "No new entries, profit-target exits, stop-loss exits, DTE closes, signal closes, "
-        "rolls, or tax-reserve equity buys before this time.")
+        "Scans and exit alerts (profit-target, stop-loss, DTE, and signal closes) "
+        "wait until this time.")
     add("Hours", "Regular session", "09:30–16:00 ET on NYSE trading days",
         "Closed weekends, NYSE full-day holidays, and after 1:00 PM ET on early-close days. "
         "Quotes still refresh from 09:30; orders wait for the trading-start clock so the "
@@ -109,13 +104,9 @@ def describe_active_rules(
         add("Sizing", "Puts per name", "one at a time",
             "A name already holding a put is not added to on a later scan.")
 
-    add("Risk", "Daily / window loss limit",
-        f"{_pct(risk.max_realized_loss_pct)} of account over {risk.lookback_days} days"
-        if risk.loss_breaker_enabled and risk.max_realized_loss_pct else "off",
-        "Freezes NEW entries only. Never force-closes open positions.")
-    add("Risk", "Consecutive-loss halt",
-        f"{risk.max_consecutive_losses} losers in a row" if risk.max_consecutive_losses else "off",
-        "Uses journaled realized P&L, including assignment mark-to-market.")
+    if s.risk.max_pct_per_sector:
+        add("Risk", "Sector cap", _pct(s.risk.max_pct_per_sector),
+            "Drops a new put that would push one sector over this share of account value.")
 
     for rule in s.rules:
         params = rule.params or {}
@@ -181,11 +172,5 @@ def describe_active_rules(
 
     add("Rolls", "Roll tested puts", _on(s.roll.enabled),
         "Both legs must be ready before the old put is bought back. A half-roll is never started on purpose.")
-
-    add("Tax reserve", "Weekly sweep",
-        _on(tr.enabled) + (f" · { _pct(tr.pct) } of net gains → {tr.symbol}" if tr.enabled else ""),
-        f"Ticker is {tr.symbol}. Dry-run is {_on(tr.dry_run)}. Paper mode never places a real buy.")
-    add("Tax reserve", "1-share SGOV test buy", _on(tr.allow_sgov_test_buy),
-        "Off by default. When on, the broker may place one 1-share SGOV limit buy to test connectivity.")
 
     return rows

@@ -1,10 +1,8 @@
-"""NYSE holiday calendar and the order / tax-reserve windows that use it."""
+"""NYSE holiday calendar and the order window that uses it."""
 from datetime import date, datetime, time
 
-import pytest
 from zoneinfo import ZoneInfo
 
-from agentic.config import Settings, TaxReserveConfig
 from agentic.services.market_hours import is_market_hours, is_order_window
 from agentic.services.nyse_calendar import (
     is_nyse_early_close,
@@ -14,11 +12,6 @@ from agentic.services.nyse_calendar import (
     session_close,
     western_easter,
 )
-from agentic.services.tax_reserve import TaxReserveLoop
-from agentic.store.audit import AuditStore
-from agentic.store.db import Database
-from agentic.store.tax_reserve import TaxReserveStore
-from agentic.services.killswitch import KillSwitch
 
 ET = ZoneInfo("America/New_York")
 
@@ -110,40 +103,3 @@ def test_order_window_closed_on_holiday_and_after_early_close():
     assert is_order_window(_et(monday, 9, 30), start="10:00") is False
     assert is_market_hours(_et(monday, 9, 30)) is True
     assert is_order_window(_et(monday, 10, 0), start="10:00") is True
-
-
-def _reserve_loop(tmp_path, name, **tax_kw):
-    class _Journal:
-        def realized_since(self, _since):
-            return 500.0, 1
-
-    db = Database(tmp_path / name)
-    audit = AuditStore(db)
-    settings = Settings(
-        mode="paper",
-        trading_start="10:00",
-        tax_reserve=TaxReserveConfig(enabled=True, dry_run=True, **tax_kw),
-    )
-    return TaxReserveLoop(
-        settings, None, None, _Journal(), TaxReserveStore(db), audit,
-        KillSwitch(db, audit),
-    )
-
-
-@pytest.mark.asyncio
-async def test_tax_reserve_waits_for_trading_start(tmp_path):
-    loop = _reserve_loop(tmp_path, "start.db", weekday=4, hour=9, minute=0)
-    # Sweep time has passed, but 09:45 is still before trading_start.
-    assert await loop.run_once(now=_et(date(2026, 9, 11), 9, 45)) is None
-    assert loop.store.last() is None
-
-
-@pytest.mark.asyncio
-async def test_tax_reserve_closed_on_holiday_and_after_early_close(tmp_path):
-    thanks = _reserve_loop(tmp_path, "holiday.db", weekday=3, hour=11, minute=0)
-    assert await thanks.run_once(now=_et(date(2026, 11, 26), 11, 30)) is None
-    assert thanks.store.last() is None
-
-    early = _reserve_loop(tmp_path, "early.db", weekday=4, hour=12, minute=0)
-    assert await early.run_once(now=_et(date(2026, 11, 27), 13, 30)) is None
-    assert early.store.last() is None
