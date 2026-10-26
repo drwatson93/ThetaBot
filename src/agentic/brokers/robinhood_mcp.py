@@ -351,7 +351,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
         if not acct:
             return []
         raw = await self._call_tool(role, self._list_positions_args(acct))
-        records = self._iter_records(raw)
+        records = self._position_records(raw)
         # get_option_positions records carry option_id but NOT strike / call-put — enrich
         # those from get_option_instruments (one batched lookup by id).
         option_ids = [str(r["option_id"]) for r in records if r.get("option_id")]
@@ -407,14 +407,10 @@ class RobinhoodMCPBroker(ExecutionBroker):
             if iid is None:
                 raw = await self._call_tool("get_indexes", {})
                 for rec in self._iter_records(raw):
-                    nested = rec.get("indexes")
-                    rows = nested if isinstance(nested, list) else [rec]
-                    for idx in rows:
-                        if not isinstance(idx, dict):
-                            continue
+                    for idx in (rec.get("indexes") or []):
                         sym, i = idx.get("symbol"), idx.get("id")
                         if sym and i:
-                            self._index_ids[str(sym).upper()] = i
+                            self._index_ids[sym.upper()] = i
                 iid = self._index_ids.get(symbol.upper())
             if not iid:
                 return None
@@ -723,33 +719,53 @@ class RobinhoodMCPBroker(ExecutionBroker):
         """Normalize a tool result into a list of record dicts.
 
         RH MCP wraps payloads as ``{"data": {...}, "guide": ...}`` — unwrap ``data`` first,
-        then pull the inner collection (positions / option_positions / orders /
-        instruments / results / items). One unrecognized list-of-dicts value is
-        used too, with a warning that names the key.
+        then pull the inner collection (positions / orders / instruments / results / items).
         """
         if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
             raw = raw["data"]
         if isinstance(raw, list):
             return [r for r in raw if isinstance(r, dict)]
         if isinstance(raw, dict):
-            for key in (
-                "results", "positions", "option_positions", "orders", "instruments", "items",
-            ):
+            for key in ("results", "positions", "orders", "instruments", "items"):
                 val = raw.get(key)
                 if isinstance(val, list):
                     return [r for r in val if isinstance(r, dict)]
-            lists = [
-                (key, val) for key, val in raw.items()
-                if isinstance(val, list) and all(isinstance(item, dict) for item in val)
-            ]
-            if len(lists) == 1:
-                key, val = lists[0]
-                if key not in RobinhoodMCPBroker._unknown_record_keys_logged:
-                    RobinhoodMCPBroker._unknown_record_keys_logged.add(key)
-                    log.warning("Tool reply used unrecognized list key %s", key)
-                return list(val)
             return [raw]
         return []
+
+    @staticmethod
+    def _position_records(raw: Any) -> list[dict[str, Any]]:
+        """Position rows, including ``option_positions`` and one unknown list.
+
+        Only this path may treat a single unrecognized list of dicts as the
+        record list. ``_iter_records`` stays the shared shape so a portfolio
+        ``equities`` list or a historicals ``bars`` list is left intact.
+        The unknown list must be non-empty; an empty list is not a collection.
+        """
+        body: Any = raw
+        if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+            body = raw["data"]
+        if isinstance(body, list):
+            return [r for r in body if isinstance(r, dict)]
+        if not isinstance(body, dict):
+            return []
+        for key in (
+            "results", "positions", "option_positions", "orders", "instruments", "items",
+        ):
+            val = body.get(key)
+            if isinstance(val, list):
+                return [r for r in val if isinstance(r, dict)]
+        lists = [
+            (key, val) for key, val in body.items()
+            if isinstance(val, list) and all(isinstance(item, dict) for item in val)
+        ]
+        if len(lists) == 1 and lists[0][1]:
+            key, val = lists[0]
+            if key not in RobinhoodMCPBroker._unknown_record_keys_logged:
+                RobinhoodMCPBroker._unknown_record_keys_logged.add(key)
+                log.warning("Tool reply used unrecognized list key %s", key)
+            return list(val)
+        return [body]
 
     @classmethod
     def _first_record(cls, raw: Any) -> dict[str, Any]:
@@ -790,13 +806,22 @@ class RobinhoodMCPBroker(ExecutionBroker):
         return f"{underlying}{expiration:%y%m%d}{cp}{int(round(strike * 1000)):08d}"
 
     @staticmethod
-    def _reply_key_names(raw: Any) -> list[str]:
-        """Top-level key names of a tool reply. A list has no keys."""
-        if isinstance(raw, dict):
-            return sorted(str(k) for k in raw.keys())
+    def _reply_key_names(raw: Any) -> str:
+        """Key names only. Inner ``data`` keys are included so the list name shows.
+
+        A reply ``{"data": {"option_positions": ...}, "guide": ...}`` logs as
+        ``data,guide inner=option_positions``. Values are never included.
+        """
         if isinstance(raw, list):
-            return ["list"]
-        return []
+            return "list"
+        if not isinstance(raw, dict):
+            return "-"
+        top = ",".join(sorted(str(k) for k in raw.keys())) or "-"
+        data = raw.get("data")
+        if isinstance(data, dict):
+            inner = ",".join(sorted(str(k) for k in data.keys())) or "-"
+            return f"{top} inner={inner}"
+        return top
 
     def _log_position_poll(
         self, acct: str, raw: Any, raw_count: int, mapped: int, drops: dict[str, int],
@@ -812,7 +837,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
             tuple(drops[k] for k in (
                 "not_short", "qty_0", "missing_fields", "instrument_lookup", "other",
             )),
-            tuple(keys),
+            keys,
         )
         now = time.monotonic()
         changed = signature != self._position_poll_sig
@@ -827,7 +852,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
         log.info(
             "Option position poll acct=****%s raw=%d keys=%s mapped=%d "
             "dropped=not_short:%d,qty_0:%d,missing_fields:%d,instrument_lookup:%d,other:%d",
-            last4, raw_count, ",".join(keys) if keys else "-", mapped,
+            last4, raw_count, keys, mapped,
             drops["not_short"], drops["qty_0"], drops["missing_fields"],
             drops["instrument_lookup"], drops["other"],
         )

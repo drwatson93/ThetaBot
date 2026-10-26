@@ -132,12 +132,19 @@ async def test_option_positions_key_is_unwrapped(monkeypatch, caplog):
         "get_option_positions": {"data": {"option_positions": [rec]}},
         "get_option_instruments": {"results": [_inst("TSTA", "oid-opt", typ="call")]},
     })
-    with caplog.at_level(logging.WARNING, logger="agentic.brokers.rh_mcp"):
+    with caplog.at_level(logging.INFO, logger="agentic.brokers.rh_mcp"):
         positions = await broker.get_open_positions()
     assert len(positions) == 1
     assert positions[0].underlying == "TSTA"
     assert positions[0].option_type is OptionType.CALL
     assert not any("unrecognized list key" in r.getMessage() for r in caplog.records)
+    lines = [
+        r.getMessage() for r in caplog.records if "Option position poll" in r.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "inner=option_positions" in lines[0]
+    assert "TSTA" not in lines[0]
+    assert ACCT not in lines[0]
 
 
 @pytest.mark.asyncio
@@ -153,15 +160,21 @@ async def test_long_rows_are_dropped(monkeypatch):
     assert calls == [{"account_number": ACCT, "nonzero": True, "type": "short"}]
 
 
-def test_unrecognized_list_key_is_used_and_named(caplog):
+def test_unrecognized_list_key_is_position_only(caplog):
     RobinhoodMCPBroker._unknown_record_keys_logged.discard("held_contracts")
     raw = {"guide": "skip", "held_contracts": [{"option_id": "oid-x"}]}
+    # Shared parser stays on main: the wrapper is the record, not the unknown list.
+    assert RobinhoodMCPBroker._iter_records(raw) == [raw]
     with caplog.at_level(logging.WARNING, logger="agentic.brokers.rh_mcp"):
-        recs = RobinhoodMCPBroker._iter_records(raw)
+        recs = RobinhoodMCPBroker._position_records(raw)
     assert recs == [{"option_id": "oid-x"}]
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings == ["Tool reply used unrecognized list key held_contracts"]
     assert "oid-x" not in warnings[0]
+    # An empty list is not a collection (all([]) is true, but it must not unwrap).
+    empty = {"held_contracts": []}
+    assert RobinhoodMCPBroker._position_records(empty) == [empty]
+    assert RobinhoodMCPBroker._iter_records(empty) == [empty]
 
 
 @pytest.mark.asyncio
@@ -310,7 +323,7 @@ async def test_poll_log_has_counts_and_last4_only(monkeypatch, caplog):
     assert len(lines) == 1
     line = lines[0]
     assert "raw=5" in line
-    assert "keys=data,guide" in line
+    assert "keys=data,guide inner=positions" in line
     assert "mapped=1" in line
     assert "not_short:1" in line
     assert "qty_0:1" in line
@@ -351,3 +364,105 @@ async def test_poll_log_always_when_rows_do_not_map(monkeypatch, caplog):
     assert len(lines) == 2
     assert all("raw=1" in line and "mapped=0" in line and "not_short:1" in line for line in lines)
     assert all("TSTB" not in line and ACCT not in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_position_fallback_maps_unknown_nonempty_list(monkeypatch, caplog):
+    RobinhoodMCPBroker._unknown_record_keys_logged.discard("held_contracts")
+    broker = _broker()
+    rec = _short("TSTA", "oid-x")
+    _install(monkeypatch, broker, {
+        "get_option_positions": {"data": {"held_contracts": [rec]}, "guide": "skip"},
+        "get_option_instruments": {"results": [_inst("TSTA", "oid-x")]},
+    })
+    with caplog.at_level(logging.WARNING, logger="agentic.brokers.rh_mcp"):
+        positions = await broker.get_open_positions()
+    assert len(positions) == 1
+    assert positions[0].underlying == "TSTA"
+    assert positions[0].strike == 10.0
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == ["Tool reply used unrecognized list key held_contracts"]
+    assert "TSTA" not in warnings[0]
+    assert "88.50" not in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_portfolio_equities_list_keeps_buying_power(monkeypatch, caplog):
+    """A sole equities list must not become the portfolio record."""
+    for equities in ([{"symbol": "TSTA", "quantity": "1"}], []):
+        broker = _broker()
+        _install(monkeypatch, broker, {
+            "get_portfolio": {"data": {
+                "buying_power": {"buying_power": "1500.00"},
+                "total_value": "8000.00",
+                "equities": equities,
+            }},
+        })
+        with caplog.at_level(logging.WARNING, logger="agentic.brokers.rh_mcp"):
+            assert await broker.get_buying_power() == 1500.0
+            assert await broker.get_account_value() == 8000.0
+        assert not any("unrecognized list key" in r.getMessage() for r in caplog.records)
+        caplog.clear()
+
+
+@pytest.mark.asyncio
+async def test_sole_bars_list_still_parses(monkeypatch):
+    from agentic.marketdata.robinhood_md import RobinhoodMarketData
+
+    broker = _broker()
+    payload = {"data": {"bars": [{
+        "open_price": "9", "high_price": "11", "low_price": "8",
+        "close_price": "10", "volume": "100", "session": "reg",
+    }]}}
+    assert RobinhoodMCPBroker._iter_records(payload)[0].get("bars")
+
+    async def fake(name, args):
+        assert name == "get_equity_historicals"
+        assert args["symbols"] == ["TSTA"]
+        return payload
+
+    monkeypatch.setattr(broker, "_call_tool", fake)
+    bars = await RobinhoodMarketData(broker).get_underlying_bars("TSTA", lookback_days=5)
+    assert bars == [{"o": 9.0, "h": 11.0, "l": 8.0, "c": 10.0, "v": 100}]
+
+
+@pytest.mark.asyncio
+async def test_poll_log_repeats_after_fifteen_minutes(monkeypatch, caplog):
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(
+        "agentic.brokers.robinhood_mcp.time.monotonic", lambda: clock["t"],
+    )
+    broker = _broker()
+    _install(monkeypatch, broker, {
+        "get_option_positions": {"data": {"positions": [_short("TSTA", "oid-good")]}},
+        "get_option_instruments": {"results": [_inst("TSTA", "oid-good")]},
+    })
+
+    def poll_lines():
+        return [
+            r.getMessage() for r in caplog.records
+            if "Option position poll" in r.getMessage()
+        ]
+
+    with caplog.at_level(logging.INFO, logger="agentic.brokers.rh_mcp"):
+        await broker.get_open_positions()
+    assert len(poll_lines()) == 1
+    assert f"****{LAST4}" in poll_lines()[0]
+    assert "TSTA" not in poll_lines()[0]
+    caplog.clear()
+
+    clock["t"] += 14 * 60
+    with caplog.at_level(logging.INFO, logger="agentic.brokers.rh_mcp"):
+        await broker.get_open_positions()
+    assert poll_lines() == []
+
+    clock["t"] += 60
+    with caplog.at_level(logging.INFO, logger="agentic.brokers.rh_mcp"):
+        await broker.get_open_positions()
+    lines = poll_lines()
+    assert len(lines) == 1
+    assert "raw=1" in lines[0] and "mapped=1" in lines[0]
+    assert f"****{LAST4}" in lines[0]
+    assert ACCT not in lines[0]
+    assert "TSTA" not in lines[0]
+    assert "88.50" not in lines[0]
