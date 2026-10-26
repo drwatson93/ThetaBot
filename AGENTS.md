@@ -45,7 +45,7 @@ Alpaca or TradingView account is required.
 src/agentic/            # the application (package is "agentic")
   services/scanner.py     # screens, sizes, sends scan alerts, scores them
   services/monitor.py     # prices open positions and sends close signals (no orders)
-  services/risk_breaker.py# sector cap for the CSP sizer (no loss circuit breaker)
+  services/risk_breaker.py# sector cap for the CSP sizer
   marketdata/robinhood_md.py  # this edition's data source (Robinhood reads)
   marketdata/alpaca_md.py     # optional alternative data source
   brokers/robinhood_mcp.py    # read-only Robinhood connection; order lock is in this file

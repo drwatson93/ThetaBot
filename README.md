@@ -50,7 +50,7 @@ A person who acts on an alert can still be assigned. Use 7–14 day expirations 
 | Component | Job |
 |---|---|
 | **Scanner** | During the scan window: screen, size, and POST one alert per new CSP or covered call. |
-| **Score** | Mark each open alert taken, stale, or expired. One exit webhook per held short. One scorecard row at expiry. |
+| **Score** | Mark each open alert taken, stale, or expired. One exit webhook per held short. One scorecard row is created with the alert and graded after expiry. |
 | **Monitor** | Price positions already on the account and send a close signal. It does not submit an order. |
 | **Dashboard** | Password-protected page: health, positions, the decision log, setups, the weekly brief, and config edits. |
 
@@ -216,7 +216,7 @@ On the VPS:
    ```yaml
    entry:
      enabled: true
-     watchlist: [F, SOFI, ...]     # names you are happy to own
+     watchlist: [AAA, BBB, ...]    # names you are happy to own
    market_data: robinhood          # default: all data from your Robinhood login (no Alpaca)
    ```
 
@@ -237,7 +237,7 @@ On the VPS:
 2. **Confirm health:** the top banner should show the broker connected. Check `http://localhost:8000/health` returns `ok` and `orders_hard_disabled: true`.
 3. **Let it scan.** It records CSP and covered-call alerts. It does not place orders. Read the decision log — make sure its choices make sense to *you*.
 4. **Add HTTPS.** Exposing a password over plain `http://` is risky. The simplest option is to put **Caddy** in front for automatic HTTPS with a domain you point at the VPS — see the wiki/`docs/`. At minimum, restrict port 8000 with a firewall to your own IP.
-5. **Old keys are ignored.** `mode` and `i_understand_live_trading` in an old `config.yaml` are ignored. Buying power for sizing is the broker's buying-power figure. A tax reserve is not subtracted.
+5. **Old keys are ignored.** `mode` and `i_understand_live_trading` in an old `config.yaml` are ignored.
 
 ---
 
@@ -283,7 +283,7 @@ market_data: robinhood       # robinhood | alpaca | paper (paper: local quote st
 
 entry:
   enabled: true
-  watchlist: [F, SOFI, T, ...]   # ONLY names you'd own
+  watchlist: [AAA, BBB, XYZ, ...]   # ONLY names you'd own
   feed: indicative               # ignored for the robinhood provider; use opra only with Alpaca
   earnings_gate: true            # never hold a short put through earnings
   criteria:                      # the CSP screen — matches config.example.yaml
@@ -397,11 +397,11 @@ If no fresh alert has arrived for a symbol, these gates simply **don't apply** (
   - **Brief:** the **Weekly tactical brief** (`/api/brief`) -- market backdrop, this week's catalysts, setups firing, per-name expected-move **cushion** (strike distance in option-implied moves), earnings-inside-the-contract flags, open-position **management** (roll window / moneyness), and **assignment capacity** (collateral if every short put were assigned vs. buying power). Every generated brief is **saved**: the tab opens on the latest one, a picker lists earlier ones (`/api/briefs`, `/api/briefs/{id}`), and **Generate new** builds a fresh one. Descriptive only -- not advice.
   - **Tuning:** change config from your phone, with no SSH and no restart. Multi-CSP cap, the entry gates, the **market regime** block (confirmed-downtrend skip), **setup gates** (`avoid_setups` / `require_setups`, a *prefer setups* ranking tilt, a put-seller preset that avoids the breakout family, and *apply suggested cushions* from the risk profile), the delta band, and per-ticker overrides, each schema-validated and persisted to a writable overlay (safety-critical keys stay locked). All setup gates are **off by default** and only ever tighten.
   - **On a phone** the tabs sit in a bottom bar within thumb reach, every card folds on a tap (remembered per device), and wide tables keep their first column pinned while you scroll sideways.
-- **Buying power:** CSP size uses the broker's buying-power figure. Nothing is subtracted for a tax reserve. The reserve service, card, and endpoint are gone.
+- **Buying power:** CSP size uses the broker's buying-power figure.
 - **Ready to add** (`entry.watchlist_tiers`, optional): list quality names with the collateral one contract needs; once the account can hold one under the per-name cap, they show up on the Overview and Tuning tabs with an **Add** button that carries their `per_ticker` overrides. The bot never adds names on its own (`GET /api/tiers`).
 - **Assignment clock** (`cc_below_basis_after_days`, opt-in, per ticker): by default calls are never sold below cost basis, which on volatile names can park capital for months. With a clock set, shares still under water that many days after assignment may be written against below basis inside a 5-10% OTM band, so the capital turns over. The holdings table shows each name's days held and whether below-basis calls are allowed.
-- **Open interest:** `GET /api/option-oi?symbol=SMR` returns the full call+put chain with OI, volume, IV and greeks (Robinhood-sourced; Alpaca's snapshots carry no OI).
-- **Pause / resume:** pause mutes new alert webhooks. Resume needs the dashboard login. A monitoring bot can pause (only) with `POST /control/pause-only?token=$PAUSE_TOKEN&reason=...` — that token cannot resume.
+- **Open interest:** `GET /api/option-oi?symbol=AAA` returns the full call+put chain with OI, volume, IV and greeks (Robinhood-sourced; Alpaca's snapshots carry no OI).
+- **Pause / resume:** pause mutes new alert webhooks. Resume needs the dashboard login or `CONTROL_TOKEN`. A monitoring bot can pause (only) with `POST /control/pause-only?token=$PAUSE_TOKEN&reason=...` — that token cannot resume.
 - **Logs:** `docker compose logs -f` on the VPS.
 - **Updating:** `git pull && docker compose up -d --build`.
 - **Backups:** your whole state is `data/` (the SQLite DB + `rh_oauth.json`). Back that folder up.
