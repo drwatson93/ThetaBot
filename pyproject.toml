@@ -16,14 +16,10 @@ dependencies = [
 # Pinned: a newer mcp moved/renamed streamablehttp_client, silently breaking the RH connect at
 # startup (bot falls back to paper). Pin to the known-good version so rebuilds are reproducible.
 mcp = ["mcp==1.28.1"]
-robinhood = ["robin_stocks>=3.0"]
-alpaca = ["alpaca-py>=0.20"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "httpx>=0.27"]
 ai = ["anthropic>=0.69"]
 all = [
     "mcp==1.28.1",
-    "robin_stocks>=3.0",
-    "alpaca-py>=0.20",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "httpx>=0.27",

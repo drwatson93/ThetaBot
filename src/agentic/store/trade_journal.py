@@ -151,26 +151,6 @@ class TradeJournalStore:
         )
         self.db.conn.commit()
 
-    def realized_since(self, since_iso: str) -> tuple[float, int]:
-        """(sum, count) of realized P&L for trades RESOLVED on/after ``since_iso`` (by close time).
-        Feeds the loss circuit breaker's rolling-window realized-loss check."""
-        rows = self.db.conn.execute(
-            "SELECT realized_pnl FROM trade_journal "
-            "WHERE closed_at IS NOT NULL AND closed_at >= ? AND realized_pnl IS NOT NULL",
-            (since_iso,),
-        ).fetchall()
-        return round(sum(r["realized_pnl"] for r in rows), 2), len(rows)
-
-    def resolved_pnls(self, limit: int = 50) -> list[float]:
-        """Realized P&L of the most-recently-CLOSED trades, newest first — for a loss-streak read."""
-        rows = self.db.conn.execute(
-            "SELECT realized_pnl FROM trade_journal "
-            "WHERE closed_at IS NOT NULL AND realized_pnl IS NOT NULL "
-            "ORDER BY closed_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [r["realized_pnl"] for r in rows]
-
     def recent(self, limit: int = 200) -> list[TradeJournalEntry]:
         rows = self.db.conn.execute(
             "SELECT * FROM trade_journal ORDER BY entered_at DESC LIMIT ?", (limit,)

@@ -1,14 +1,10 @@
-"""Limit-only house rule + the quote snapshot recorded with every order.
+"""Read-only pricing snapshots for dashboard and journal JSON.
 
-Monitor bots verify that the engine never sends a market order. Every order path
-(paper or live) must stamp ``order_type``, ``limit_price``, bid/ask/mid at pricing
-time, and time-in-force, then refuse anything that isn't a limit.
+These copy stored order fields onto API responses. Nothing here submits an order.
 """
 from __future__ import annotations
 
 from typing import Any
-
-DEFAULT_TIME_IN_FORCE = "gfd"
 
 PRICING_FIELDS = (
     "order_type",
@@ -28,63 +24,8 @@ CLOSE_PRICING_FIELDS = (
 )
 
 
-class NonLimitOrderRefused(RuntimeError):
-    """A code path tried to build or submit a non-limit order."""
-
-
 def normalize_order_type(order_type: str | None) -> str:
     return (order_type or "").strip().lower()
-
-
-def is_limit_order(order_type: str | None) -> bool:
-    return normalize_order_type(order_type) == "limit"
-
-
-def assert_limit_only(order_type: str | None, *, where: str, **ctx: Any) -> None:
-    """Refuse anything other than a limit order. Safe to call in paper mode too."""
-    if is_limit_order(order_type):
-        return
-    bits = [f"{k}={v}" for k, v in ctx.items() if v is not None]
-    extra = f" ({', '.join(bits)})" if bits else ""
-    shown = normalize_order_type(order_type) or "missing"
-    raise NonLimitOrderRefused(
-        f"LIMIT-ONLY RULE: refusing {shown} order at {where}{extra}"
-    )
-
-
-def snapshot_from_quote(quote: Any | None) -> dict[str, float | None]:
-    """Bid/ask/mid from an OptionQuote or OptionContractQuote (all None if missing)."""
-    if quote is None:
-        return {"bid": None, "ask": None, "mid": None}
-    mid = getattr(quote, "midpoint", None)
-    return {
-        "bid": getattr(quote, "bid", None),
-        "ask": getattr(quote, "ask", None),
-        "mid": mid,
-    }
-
-
-def stamp_order_quote(order: Any, quote: Any | None, *,
-                      time_in_force: str = DEFAULT_TIME_IN_FORCE) -> None:
-    """Copy the pricing quote onto the order and default time-in-force."""
-    snap = snapshot_from_quote(quote)
-    order.bid = snap["bid"]
-    order.ask = snap["ask"]
-    order.mid = snap["mid"]
-    if not getattr(order, "time_in_force", None):
-        order.time_in_force = time_in_force
-
-
-def pricing_kwargs(order: Any) -> dict[str, Any]:
-    """Keyword args for persisting a pricing snapshot from an Order."""
-    return {
-        "order_type": normalize_order_type(getattr(order, "order_type", None)) or None,
-        "limit_price": getattr(order, "limit_price", None),
-        "bid": getattr(order, "bid", None),
-        "ask": getattr(order, "ask", None),
-        "mid": getattr(order, "mid", None),
-        "time_in_force": getattr(order, "time_in_force", None),
-    }
 
 
 def public_pricing_fields(obj: Any | None, *, prefix: str = "") -> dict[str, Any]:
