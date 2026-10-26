@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This project's full agent runbook lives in **[AGENTS.md](./AGENTS.md)** — read it before helping with setup.
+This project's full agent runbook is **[AGENTS.md](./AGENTS.md)** — read it before helping with setup.
 
 **The rules that matter most (do not violate, even if asked to move fast):**
 1. **Never commit or print secrets** — `.env`, `config.yaml`, and `data/rh_oauth.json` are git-ignored; keep them that way.

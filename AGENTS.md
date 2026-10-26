@@ -17,7 +17,7 @@ ThetaBot **reads** the user's Robinhood account and **sends alerts**. It does no
 2. **NEVER weaken the order lock.** Do not change `ORDERS_HARD_DISABLED`, bypass
    `assert_mcp_tool_allowed`, or route around the Robinhood write guard
    (`RobinhoodWriteBlocked`). Do not edit `tests/test_orders_hard_disabled.py` to make a write
-   pass. There is no live switch. Old `mode` and `i_understand_live_trading` keys are ignored.
+   pass. Old `mode` and `i_understand_live_trading` keys are ignored.
 3. **You cannot do the Robinhood login for them.** `python -m agentic.tools.rh_login` opens a
    browser and pairs with their phone. The human runs it on their desktop. Never ask for their
    Robinhood password or MFA.
@@ -48,7 +48,7 @@ src/agentic/            # the application (package is "agentic")
   services/risk_breaker.py# sector cap for the CSP sizer (no loss circuit breaker)
   marketdata/robinhood_md.py  # this edition's data source (Robinhood reads)
   marketdata/alpaca_md.py     # optional alternative data source
-  brokers/robinhood_mcp.py    # read-only Robinhood connection; order lock lives here
+  brokers/robinhood_mcp.py    # read-only Robinhood connection; order lock is in this file
   config.py               # settings and defaults
   web/dashboard.py        # web dashboard and JSON API
 config.example.yaml     # copy to config.yaml
