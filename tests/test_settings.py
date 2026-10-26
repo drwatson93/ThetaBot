@@ -105,11 +105,9 @@ def test_owner_can_edit_trading_start(tmp_path):
     apply_patch(settings, {
         "trading_start": "10:30",
         "entry": {"enabled": True},
-        "roll": {"enabled": True},
     }, overlay_path=ov)
     assert settings.trading_start == "10:30"
     assert settings.entry.enabled is True
-    assert settings.roll.enabled is True
     saved = load_overlay(ov)
     assert saved["trading_start"] == "10:30"
     assert "tax_reserve" not in saved
@@ -185,12 +183,50 @@ def test_overlay_applies_strategy_keys_but_not_mode(tmp_path, monkeypatch, caplo
     assert "mode" in caplog.text
 
 
-def test_execution_leaves_still_editable(tmp_path):
+def test_old_execution_and_roll_blocks_still_load(tmp_path, monkeypatch):
+    """An old file or overlay that still names execution or roll loads. The keys are ignored."""
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        "broker: paper\n"
+        "market_data: paper\n"
+        "execution:\n"
+        "  limit_buffer_pct: 0.09\n"
+        "  slippage_cap_pct: 0.05\n"
+        "  fill_timeout_seconds: 15\n"
+        "  reprice_after_seconds: 5\n"
+        "roll:\n"
+        "  enabled: true\n"
+        "  roll_dte: 2\n"
+        "entry:\n"
+        "  watchlist: [AAA]\n",
+        encoding="utf-8",
+    )
+    ov = tmp_path / "overlay.yaml"
+    monkeypatch.setattr("agentic.config.OVERLAY_PATH", ov)
+    save_overlay({
+        "execution": {"limit_buffer_pct": 0.01},
+        "roll": {"enabled": False, "roll_delta": 0.40},
+        "entry": {"watchlist": ["BBB"]},
+    }, ov)
+    s = load_config(base)
+    assert not hasattr(s, "execution")
+    assert not hasattr(s, "roll")
+    assert "execution" not in s.model_dump()
+    assert "roll" not in s.model_dump()
+    assert s.entry.watchlist == ["BBB"]
+
+
+@pytest.mark.parametrize("patch", [
+    {"execution": {"limit_buffer_pct": 0.03}},
+    {"roll": {"enabled": True}},
+])
+def test_execution_and_roll_are_not_editable(tmp_path, patch):
     settings = Settings(broker="paper", market_data="paper")
-    apply_patch(settings, {"execution": {"limit_buffer_pct": 0.03}}, overlay_path=tmp_path / "o.yaml")
-    assert settings.execution.limit_buffer_pct == 0.03
-    saved = load_overlay(tmp_path / "o.yaml")
-    assert saved["execution"]["limit_buffer_pct"] == 0.03
+    with pytest.raises(SettingsEditError):
+        apply_patch(settings, patch, overlay_path=tmp_path / "o.yaml")
+    assert not hasattr(settings, "execution")
+    assert not hasattr(settings, "roll")
+    assert not (tmp_path / "o.yaml").exists()
 
 
 # --- endpoint tests ----------------------------------------------------------------------------
@@ -313,13 +349,15 @@ def test_post_protected_edit_rejected_even_with_control_token(client, patch):
 def test_post_config_audits_leaf_old_new(client):
     """CONFIG_EDIT records every changed leaf as old→new, never the token."""
     c, settings, audit, _ = client
-    r = c.post("/api/config", json={"execution": {"limit_buffer_pct": 0.03}})
+    r = c.post("/api/config", json={"entry": {"criteria": {"min_annualized_yield": 0.25}}})
     assert r.status_code == 200
     row = audit.latest(AuditEventType.CONFIG_EDIT, source="dashboard")
     assert row is not None
     assert row["payload"]["who"] == "owner"
-    assert row["payload"]["changed"] == ["execution"]
-    assert row["payload"]["values"]["execution.limit_buffer_pct"] == {"old": 0.02, "new": 0.03}
+    assert row["payload"]["changed"] == ["entry"]
+    assert row["payload"]["values"]["entry.criteria.min_annualized_yield"] == {
+        "old": 0.20, "new": 0.25,
+    }
     blob = json.dumps(row)
     assert CONTROL not in blob
     assert PAUSE not in blob

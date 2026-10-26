@@ -1,7 +1,7 @@
 # Read-only scanner. Paste this as a Secret File named "config.yaml"
 # in the Render Dashboard (it appears at /etc/secrets/config.yaml).
 # Behavior only — NO secrets. Fill the watchlist with names YOU are willing to own.
-# Old mode / i_understand_live_trading / tax_reserve / loss_breaker keys are ignored.
+# Old mode / i_understand_live_trading / tax_reserve / loss_breaker / execution / roll keys are ignored.
 
 broker: robinhood_mcp
 broker_fallback: null
@@ -20,12 +20,6 @@ max_quote_age_seconds: 90          # reject quotes older than this when executin
 trading_start: "10:00"             # no new entries, exits, stops, or tax-reserve buys before this ET time
                                    # (also closed on NYSE full-day holidays and after 1pm early closes)
 auto_trip_after_errors: 0          # auto-engage kill switch after N consecutive errors (0=off)
-
-execution:
-  limit_buffer_pct: 0.02     # buy-to-close limit = mid * (1 + buffer)
-  slippage_cap_pct: 0.05     # never pay more than ask * (1 + cap)
-  fill_timeout_seconds: 60
-  reprice_after_seconds: 20
 
 robinhood:
   # Brokerage account that automated closes route through. MUST be agentic_allowed=true
@@ -110,19 +104,6 @@ ai:
   mode: advisory             # advisory = annotate only; veto = skip the trade on a "skip" verdict
   max_candidates_per_scan: 3 # cap Claude calls per scan (cost control)
   effort: medium             # low | medium | high | xhigh | max
-
-# --- Roll defense (tested short puts) ---
-# When a put is tested near expiry, roll it OUT (and down a strike) for a NET CREDIT instead of
-# realizing a loss or accepting a bad-basis assignment. Only rolls for a credit; else it leaves the
-# position to ride to assignment. Off by default.
-roll:
-  enabled: false
-  roll_dte: 3              # only consider rolling within this many days of expiry
-  roll_delta: 0.45         # ...and only when the put is tested (|delta| >= this)
-  target_dte_min: 7        # roll out to a new expiry in this window
-  target_dte_max: 14
-  min_net_credit: 0.0      # require net credit >= this (0 = never pay to roll)
-  max_target_delta: 0.35   # don't roll into an even more-tested put
 
 # --- Scheduled push reports (hands-off heartbeat) ---
 # For when you can't watch during the day: a daily digest (so 'no news' means 'all fine', not

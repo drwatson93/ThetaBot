@@ -3,8 +3,8 @@
 Behavior/config comes from ``config.yaml`` (typed via pydantic). Secrets come from
 the process environment / ``.env`` (loaded lazily, never written to config).
 
-``mode``, ``i_understand_live_trading``, and ``tax_reserve`` are not settings.
-An old file that still has them loads; those keys are ignored.
+``mode``, ``i_understand_live_trading``, ``tax_reserve``, ``execution``, and ``roll``
+are not settings. An old file that still has them loads; those keys are ignored.
 """
 from __future__ import annotations
 
@@ -40,13 +40,6 @@ RENDER_SECRET_CONFIG = Path("/etc/secrets/config.yaml")
 # Writable overlay (lives in the persistent data volume, NOT the read-only mounted base config)
 # where the in-app settings editor persists runtime edits. Deep-merged over the base at load.
 OVERLAY_PATH = REPO_ROOT / "data" / "config_overlay.yaml"
-
-
-class ExecutionConfig(BaseModel):
-    limit_buffer_pct: float = 0.02
-    slippage_cap_pct: float = 0.05
-    fill_timeout_seconds: int = 60
-    reprice_after_seconds: int = 20
 
 
 class RobinhoodConfig(BaseModel):
@@ -284,20 +277,6 @@ class AIConfig(BaseModel):
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
 
 
-class RollConfig(BaseModel):
-    # Roll a TESTED short put near expiry instead of realizing a loss or accepting an unfavorable
-    # assignment: buy it back and sell a further-dated put (down a strike if needed) for a NET
-    # CREDIT — lowering the effective cost basis and buying time. Only rolls for a credit; if no
-    # acceptable roll exists it leaves the position alone (rides to assignment).
-    enabled: bool = False
-    roll_dte: int = 3                  # only consider rolling within this many days of expiry
-    roll_delta: float = 0.45           # ...and only when the put is tested (|delta| >= this)
-    target_dte_min: int = 7            # roll OUT to a new expiry in this window
-    target_dte_max: int = 14
-    min_net_credit: float = 0.0        # require net credit >= this (0 = never pay to roll)
-    max_target_delta: float = 0.35     # don't roll into an even more-tested put
-
-
 class ReportingConfig(BaseModel):
     # Scheduled push reports for hands-off operation: a daily digest (heartbeat: "here's what I did /
     # I'm alive") + a weekly performance rollup. Times are US/Eastern.
@@ -355,7 +334,8 @@ class RiskConfig(BaseModel):
 
 
 class Settings(BaseModel):
-    """Runtime settings. ``mode``, ``i_understand_live_trading``, and ``tax_reserve`` are not fields.
+    """Runtime settings. ``mode``, ``i_understand_live_trading``, ``tax_reserve``,
+    ``execution``, and ``roll`` are not fields.
 
     An old config file that still has them loads. Pydantic drops the keys.
     """
@@ -386,14 +366,12 @@ class Settings(BaseModel):
     trading_start: str = "10:00"
     auto_trip_after_errors: int = 0  # auto-engage kill switch after N consecutive errors (0=off)
 
-    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     robinhood: RobinhoodConfig = Field(default_factory=RobinhoodConfig)
     entry: EntryConfig = Field(default_factory=EntryConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     macro: RegimeConfig = Field(default_factory=RegimeConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     news: NewsConfig = Field(default_factory=NewsConfig)
-    roll: RollConfig = Field(default_factory=RollConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     tunnel: TunnelConfig = Field(default_factory=TunnelConfig)
