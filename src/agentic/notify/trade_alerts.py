@@ -247,6 +247,48 @@ def build_scan_alert_payload(
     }
 
 
+def build_exit_alert_payload(position, decision) -> dict[str, Any]:
+    """Monitor exit on the scan-alert webhook the receiver already accepts.
+
+    Same event as a scan (``scan_alert``), kind ``exit``, action ``BTC``.
+    ``trade_id`` is the decision id. ``source`` is ``monitor`` so it is distinct
+    from the scanner's own kind-exit alert, which leaves source unset. No
+    balances, account numbers, or secrets.
+    """
+    mark = position.current_mark
+    limit = decision.limit_price
+    shown = limit if limit is not None else mark
+    payload = build_scan_alert_payload(
+        alert_id=decision.id,
+        kind="exit",
+        underlying=position.underlying,
+        occ=position.occ_symbol,
+        strike=float(position.strike),
+        expiration=position.expiration,
+        contracts=int(position.quantity),
+        bid=position.current_bid,
+        ask=position.current_ask,
+        mid=None if shown is None else float(shown),
+    )
+    if decision.notify_only:
+        gate = "ALERT"
+    elif decision.requires_approval:
+        gate = "NEEDS APPROVAL"
+    else:
+        gate = "AUTO"
+    rule_type = getattr(decision.rule_type, "value", decision.rule_type)
+    payload.update({
+        "source": "monitor",
+        "rule_name": decision.rule_name,
+        "rule_type": str(rule_type),
+        "gate": gate,
+        "reason": decision.reason,
+        "dte": position.dte(),
+        "mark": None if mark is None else float(mark),
+    })
+    return payload
+
+
 def build_test_payload(mode: str) -> dict[str, Any]:
     now = utcnow()
     return {

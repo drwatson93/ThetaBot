@@ -194,7 +194,7 @@ async def main_async(config_path: str | None = None) -> None:
     monitor = MonitorLoop(
         settings, broker, market_data, positions, audit, killswitch,
         rules_engine=rules_engine, decisions=decisions, notifier=notifier,
-        signal_processor=signal_processor,
+        signal_processor=signal_processor, trade_alerts=trade_alerts,
     )
 
     web_server = build_web_server(

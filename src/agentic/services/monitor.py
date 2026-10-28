@@ -16,6 +16,7 @@ from ..domain.models import utcnow
 from ..marketdata.base import MarketDataProvider
 from ..brokers.base import ExecutionBroker
 from ..notify.base import Notifier
+from ..notify.trade_alerts import build_exit_alert_payload, sanitize_error
 from ..store.audit import AuditStore
 from ..store.decisions import DecisionStore
 from ..store.positions import PositionStore
@@ -42,6 +43,7 @@ class MonitorLoop:
         signal_processor=None,    # set in Phase 3
         approval_gate=None,       # set in Phase 3
         roll_manager=None,        # tested-put roll defense
+        trade_alerts=None,        # instant TRADE_ALERT_URL webhook; optional
     ):
         self.settings = settings
         self.broker = broker
@@ -56,6 +58,7 @@ class MonitorLoop:
         self.signal_processor = signal_processor
         self.approval_gate = approval_gate
         self.roll_manager = roll_manager
+        self.trade_alerts = trade_alerts
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -289,6 +292,14 @@ class MonitorLoop:
             {"notified": True, "rule": decision.rule_name},
             source="monitor", position_id=pos.id, decision_id=decision.id,
         )
+        if self.trade_alerts is None:
+            return
+        try:
+            await self.trade_alerts.deliver_scan_alert(
+                build_exit_alert_payload(pos, decision)
+            )
+        except Exception as exc:  # noqa: BLE001 — webhook must not break the monitor
+            log.warning("exit alert dispatch failed: %s", sanitize_error(exc))
 
     def stop(self) -> None:
         self._stop.set()
