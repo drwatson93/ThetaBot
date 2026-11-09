@@ -155,13 +155,6 @@ rules:
       delta_stop: 0.5        # close when |delta| >= 0.50. null = this trigger off
       # Dashboard: owner can edit these live. An enabled stop must keep one trigger;
       # both null is rejected — set enabled: false to turn the rule off. 0 is not "off".
-  - name: dte-close
-    rule_type: DTE
-    enabled: true
-    requires_approval: false
-    params:
-      dte_threshold: 2         # weeklies: close/let-expire near expiry (was 21 for monthlies)
-      action: close            # alert | close
   - name: tv-signal
     rule_type: SIGNAL
     enabled: true

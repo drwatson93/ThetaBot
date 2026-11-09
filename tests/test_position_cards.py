@@ -39,10 +39,6 @@ def _rules(
     stop_approval: bool = False,
     loss_mult: float | None = 2.0,
     delta_stop: float | None = 0.5,
-    dte_on: bool = True,
-    dte_approval: bool = False,
-    dte_threshold: int = 2,
-    dte_action: str = "close",
     signal_on: bool = True,
     signal_approval: bool = True,
 ) -> list[RuleConfig]:
@@ -60,11 +56,6 @@ def _rules(
             params={"loss_mult": loss_mult, "delta_stop": delta_stop},
         ),
         RuleConfig(
-            name="dte-close", rule_type="DTE", enabled=dte_on,
-            requires_approval=dte_approval,
-            params={"dte_threshold": dte_threshold, "action": dte_action},
-        ),
-        RuleConfig(
             name="tv-signal", rule_type="SIGNAL", enabled=signal_on,
             requires_approval=signal_approval, params={"match": "underlying"},
         ),
@@ -74,7 +65,6 @@ def _rules(
 _ALL_ON_80 = (
     "Closes at 80% of the credit. "
     "Buys it back if cost reaches 2× the credit or |delta| reaches 0.5. "
-    "Buys the option back at 2 days left. "
     "A TradingView signal closes it, with your approval."
 )
 
@@ -151,7 +141,6 @@ def test_plan_stop_loss_off_is_omitted():
     text = holding_plan(_rules(profit_pct=0.8, stop_on=False))
     assert text == (
         "Closes at 80% of the credit. "
-        "Buys the option back at 2 days left. "
         "A TradingView signal closes it, with your approval."
     )
     assert "cost reaches" not in text
@@ -168,25 +157,6 @@ def test_plan_one_stop_trigger_off():
     assert "cost reaches" not in only_delta
 
 
-def test_plan_dte_uses_threshold_and_real_action():
-    assert "Buys the option back at 7 days left." in holding_plan(
-        _rules(dte_threshold=7)
-    )
-    assert "Buys the option back at 1 day left." in holding_plan(
-        _rules(dte_threshold=1)
-    )
-    alert = holding_plan(_rules(dte_action="alert", dte_threshold=2))
-    assert "Alerts you at 2 days left and does not buy the option back." in alert
-    assert "Buys the option back" not in alert
-
-    other = holding_plan(_rules(dte_action="notify", dte_threshold=5))
-    assert (
-        "At 5 days left it alerts you (action: notify) and does not buy the option back."
-        in other
-    )
-    assert "Buys the option back" not in other
-
-
 def test_plan_tv_signal_off_and_without_approval():
     """A disabled tv-signal is left out of the plan.
 
@@ -199,10 +169,9 @@ def test_plan_tv_signal_off_and_without_approval():
     assert "TradingView" not in off
     assert off == (
         "Closes at 80% of the credit. "
-        "Buys it back if cost reaches 2× the credit or |delta| reaches 0.5. "
-        "Buys the option back at 2 days left."
+        "Buys it back if cost reaches 2× the credit or |delta| reaches 0.5."
     )
-    auto = holding_plan(_rules(signal_approval=False, profit_on=False, stop_on=False, dte_on=False))
+    auto = holding_plan(_rules(signal_approval=False, profit_on=False, stop_on=False))
     assert auto == (
         "A TradingView signal closes it. "
         "A symbol matching more than one open position still asks for approval."
@@ -211,7 +180,7 @@ def test_plan_tv_signal_off_and_without_approval():
 
 def test_plan_all_off():
     text = holding_plan(_rules(
-        profit_on=False, stop_on=False, dte_on=False, signal_on=False,
+        profit_on=False, stop_on=False, signal_on=False,
     ))
     assert text == "No exit rules are on"
     assert holding_plan([]) == "No exit rules are on"
@@ -221,7 +190,7 @@ def test_plan_all_off():
 def test_plan_trailing_profit_target_describes_the_exit():
     text = holding_plan(_rules(
         profit_pct=0.8, trailing=True, trail_gap=0.2,
-        stop_on=False, dte_on=False, signal_on=False,
+        stop_on=False, signal_on=False,
     ))
     assert text == (
         "Arms at 80% of the credit, then buys it back after a 20% give-back "
@@ -238,22 +207,17 @@ def test_plan_trailing_profit_target_describes_the_exit():
 
 def test_plan_approval_is_not_an_automatic_close():
     profit = holding_plan(_rules(
-        profit_pct=0.8, profit_approval=True, stop_on=False, dte_on=False, signal_on=False,
+        profit_pct=0.8, profit_approval=True, stop_on=False, signal_on=False,
     ))
     assert profit == "Asks for approval to close at 80% of the credit."
     stop = holding_plan(_rules(
         stop_approval=True, loss_mult=2.0, delta_stop=None,
-        profit_on=False, dte_on=False, signal_on=False,
+        profit_on=False, signal_on=False,
     ))
     assert stop == "Asks for approval to buy it back if cost reaches 2× the credit."
-    dte = holding_plan(_rules(
-        dte_approval=True, dte_threshold=2, dte_action="close",
-        profit_on=False, stop_on=False, signal_on=False,
-    ))
-    assert dte == "Asks for approval to buy the option back at 2 days left."
     trail = holding_plan(_rules(
         profit_pct=0.8, trailing=True, trail_gap=0.15, profit_approval=True,
-        stop_on=False, dte_on=False, signal_on=False,
+        stop_on=False, signal_on=False,
     ))
     assert trail == (
         "Arms at 80% of the credit, then asks for approval to buy it back "
@@ -264,35 +228,11 @@ def test_plan_approval_is_not_an_automatic_close():
 def test_plan_keeps_configured_threshold_precision():
     text = holding_plan(_rules(
         profit_pct=0.575, loss_mult=2.25, delta_stop=0.575,
-        dte_on=False, signal_on=False,
+        signal_on=False,
     ))
     assert text == (
         "Closes at 57.5% of the credit. "
         "Buys it back if cost reaches 2.25× the credit or |delta| reaches 0.575."
-    )
-
-
-def test_plan_dte_matches_dte_rule_exactly():
-    # Only the exact string "close" buys back. "Close" does not.
-    titled = holding_plan(_rules(
-        dte_action="Close", dte_threshold=2,
-        profit_on=False, stop_on=False, signal_on=False,
-    ))
-    assert titled == "At 2 days left it alerts you (action: Close) and does not buy the option back."
-    assert "Buys the option back" not in titled
-
-    missing = RuleConfig(
-        name="dte-close", rule_type="DTE", enabled=True, requires_approval=False,
-        params={"action": "close"},
-    )
-    assert holding_plan([missing]) == "Buys the option back at 21 days left."
-
-    no_action = RuleConfig(
-        name="dte-close", rule_type="DTE", enabled=True, requires_approval=False,
-        params={"dte_threshold": 4},
-    )
-    assert holding_plan([no_action]) == (
-        "Alerts you at 4 days left and does not buy the option back."
     )
 
 
@@ -366,7 +306,7 @@ def test_api_cards_use_displayed_dollars(tmp_path, monkeypatch):
 
 
 def test_api_bad_credit_or_missing_pnl_is_null(tmp_path, monkeypatch):
-    settings = Settings(mode="paper", rules=_rules(profit_on=False, stop_on=False, dte_on=False, signal_on=False))
+    settings = Settings(mode="paper", rules=_rules(profit_on=False, stop_on=False, signal_on=False))
     client, _settings = _client(tmp_path, monkeypatch, settings, [
         _pos("ZZZ", 0, 0.20, strike=10),       # zero credit
         _pos("QQQX", -0.39, 0.10, strike=20),  # negative credit
@@ -404,7 +344,6 @@ def test_hot_rules_edit_changes_the_plan_without_restart(tmp_path, monkeypatch):
     assert before["plan"] == (
         "Closes at 50% of the credit. "
         "Buys it back if cost reaches 2× the credit or |delta| reaches 0.5. "
-        "Buys the option back at 2 days left. "
         "A TradingView signal closes it, with your approval."
     )
     assert {row["underlying"] for row in before["positions"]} == {"ZZZ", "QQQX"}

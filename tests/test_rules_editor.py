@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -62,8 +63,6 @@ def _rules() -> list[RuleConfig]:
                    requires_approval=False, params={"profit_pct": 0.5}),
         RuleConfig(name="stop-loss", rule_type="STOP_LOSS", enabled=True,
                    requires_approval=False, params={"loss_mult": 2.0, "delta_stop": 0.5}),
-        RuleConfig(name="dte-close", rule_type="DTE", enabled=True,
-                   requires_approval=False, params={"dte_threshold": 2, "action": "close"}),
         RuleConfig(name="tv-signal", rule_type="SIGNAL", enabled=True,
                    requires_approval=True, params={"match": "underlying"}),
     ]
@@ -225,10 +224,6 @@ def test_noop_rules_post_writes_no_audit_row(client, monkeypatch):
     (lambda rules: _edit(rules, "stop-loss", loss_mult=10.01), "between"),
     (lambda rules: _edit(rules, "stop-loss", delta_stop=0.09), "between"),
     (lambda rules: _edit(rules, "stop-loss", delta_stop=1.01), "between"),
-    (lambda rules: _edit(rules, "dte-close", dte_threshold=-1), "whole number"),
-    (lambda rules: _edit(rules, "dte-close", dte_threshold=31), "whole number"),
-    (lambda rules: _edit(rules, "dte-close", dte_threshold=2.5), "whole number"),
-    (lambda rules: _edit(rules, "dte-close", dte_threshold="2"), "must be a number"),
     (lambda rules: _edit(rules, "stop-loss", loss_mult=None, delta_stop=None), "both triggers"),
 ])
 def test_invalid_rules_rejected_with_no_change(client, mutate, needle):
@@ -244,7 +239,7 @@ def test_invalid_rules_rejected_with_no_change(client, mutate, needle):
     assert settings.rules[0].params["profit_pct"] == 0.5
     assert settings.rules[1].params["loss_mult"] == 2.0
     assert settings.rules[1].params["delta_stop"] == 0.5
-    assert settings.rules[2].params["dte_threshold"] == 2
+    assert settings.rules[2].params["match"] == "underlying"
     assert settings.paper_buying_power == 100_000.0
     assert _audit_count(audit) == 0
     assert load_overlay() == {}
@@ -256,34 +251,30 @@ def test_boundary_values_are_accepted(client):
     rules = _dump(settings)
     _edit(rules, "profit-target", profit_pct=0.05)
     _edit(rules, "stop-loss", loss_mult=1.0, delta_stop=1.0)
-    _edit(rules, "dte-close", dte_threshold=0)
     r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     assert settings.rules[0].params["profit_pct"] == 0.05
     assert settings.rules[1].params["loss_mult"] == 1.0
     assert settings.rules[1].params["delta_stop"] == 1.0
-    assert settings.rules[2].params["dte_threshold"] == 0
     rules = _dump(settings)
     _edit(rules, "profit-target", profit_pct=0.95)
     _edit(rules, "stop-loss", loss_mult=10, delta_stop=0.1)
-    _edit(rules, "dte-close", dte_threshold=30)
     r = _post_rules(c, settings, rules)
     assert r.status_code == 200, r.text
     assert settings.rules[0].params["profit_pct"] == 0.95
     assert settings.rules[1].params["loss_mult"] == 10
     assert settings.rules[1].params["delta_stop"] == 0.1
-    assert settings.rules[2].params["dte_threshold"] == 30
 
 
 @pytest.mark.parametrize("mutate,needle", [
     (lambda rules: rules[1].__setitem__("name", "nope"), "Unknown rule name"),
     (lambda rules: rules[1].__setitem__("rule_type", "NOPE"), "Unknown rule type"),
-    (lambda rules: rules[1].__setitem__("rule_type", "DTE"), "Cannot change rule_type"),
+    (lambda rules: rules[1].__setitem__("rule_type", "DTE"), "Unknown rule type"),
     (lambda rules: rules.append(copy.deepcopy(rules[0]) | {"name": "extra"}), "Cannot add or remove"),
     (lambda rules: rules.pop(), "Cannot add or remove"),
-    (lambda rules: rules.__setitem__(slice(None), [rules[1], rules[0], rules[2], rules[3]]),
+    (lambda rules: rules.__setitem__(slice(None), [rules[1], rules[0], rules[2]]),
      "same names"),
-    (lambda rules: rules[2]["params"].__setitem__("action", "alert"), "Cannot change"),
+    (lambda rules: rules[2]["params"].__setitem__("match", "occ"), "Cannot change"),
     (lambda rules: rules[0]["params"].__setitem__("nope", 1), "Unknown parameter"),
 ])
 def test_identity_changes_rejected_with_no_change(client, mutate, needle):
@@ -295,10 +286,10 @@ def test_identity_changes_rejected_with_no_change(client, mutate, needle):
     assert r.status_code == 400, r.text
     assert needle in r.json()["error"]
     assert [rule.name for rule in settings.rules] == [
-        "profit-target", "stop-loss", "dte-close", "tv-signal",
+        "profit-target", "stop-loss", "tv-signal",
     ]
     assert settings.rules[1].rule_type == "STOP_LOSS"
-    assert settings.rules[2].params["action"] == "close"
+    assert settings.rules[2].params["match"] == "underlying"
     assert _audit_count(audit) == 0
     assert load_overlay() == {}
 
@@ -400,14 +391,11 @@ def test_overlay_persists_rules_across_reload(client, tmp_path):
         "     requires_approval: false, params: {profit_pct: 0.5}}\n"
         "  - {name: stop-loss, rule_type: STOP_LOSS, enabled: true,\n"
         "     requires_approval: false, params: {loss_mult: 2.0, delta_stop: 0.5}}\n"
-        "  - {name: dte-close, rule_type: DTE, enabled: true,\n"
-        "     requires_approval: false, params: {dte_threshold: 2, action: close}}\n"
         "  - {name: tv-signal, rule_type: SIGNAL, enabled: true,\n"
         "     requires_approval: true, params: {match: underlying}}\n",
         encoding="utf-8",
     )
     rules = _edit(_dump(settings), "stop-loss", loss_mult=None)
-    _edit(rules, "dte-close", dte_threshold=7)
     assert _post_rules(c, settings, rules).status_code == 200
     saved = load_overlay()
     assert saved["rules"][1]["params"]["loss_mult"] is None
@@ -417,9 +405,8 @@ def test_overlay_persists_rules_across_reload(client, tmp_path):
     assert reloaded.rules[1].params["loss_mult"] is None
     assert reloaded.rules[1].params["delta_stop"] == 0.5
     assert reloaded.rules[1].enabled is True
-    assert reloaded.rules[2].params == {"dte_threshold": 7, "action": "close"}
-    assert reloaded.rules[3].params["match"] == "underlying"
-    assert reloaded.rules[3].requires_approval is True
+    assert reloaded.rules[2].params["match"] == "underlying"
+    assert reloaded.rules[2].requires_approval is True
 
 
 def test_rules_view_describes_off_trigger_and_disabled_rule():
@@ -544,3 +531,36 @@ def test_reenable_stop_with_loss_mult_fires_after_refresh(client):
     hits = engine.evaluate(pos, quote)
     assert len(hits) == 1 and "Stop-loss" in hits[0].reason
     assert engine.evaluate(pos, _quote(bid=1.1, ask=1.2, delta=-0.8)) == []
+
+
+def test_stale_dte_close_is_ignored_on_load(tmp_path, caplog):
+    """A saved file that still lists dte-close loads. The rule is not kept."""
+    base = tmp_path / "stale.yaml"
+    base.write_text(
+        "broker: paper\nmarket_data: paper\n"
+        "rules:\n"
+        "  - {name: profit-target, rule_type: PROFIT_TARGET, enabled: true,\n"
+        "     requires_approval: false, params: {profit_pct: 0.5}}\n"
+        "  - {name: dte-close, rule_type: DTE, enabled: true,\n"
+        "     requires_approval: false, params: {dte_threshold: 2, action: close}}\n"
+        "  - {name: expiry-check, rule_type: DTE, enabled: true,\n"
+        "     requires_approval: false, params: {dte_threshold: 21, action: alert}}\n"
+        "  - {name: stop-loss, rule_type: STOP_LOSS, enabled: true,\n"
+        "     requires_approval: false, params: {loss_mult: 2.0, delta_stop: 0.5}}\n"
+        "  - {name: tv-signal, rule_type: SIGNAL, enabled: true,\n"
+        "     requires_approval: true, params: {match: underlying}}\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger="agentic.config"):
+        loaded = load_config(base, apply_overlay=False)
+    assert [rule.name for rule in loaded.rules] == [
+        "profit-target", "stop-loss", "tv-signal",
+    ]
+    assert loaded.rules[0].params["profit_pct"] == 0.5
+    assert loaded.rules[1].params == {"loss_mult": 2.0, "delta_stop": 0.5}
+    assert loaded.rules[2].rule_type == "SIGNAL"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [
+        "Ignoring removed exit rule(s) dte-close, expiry-check; "
+        "dte-close is no longer evaluated",
+    ]

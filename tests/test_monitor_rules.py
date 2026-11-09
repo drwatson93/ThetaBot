@@ -1,14 +1,14 @@
 """Phase 1: monitor evaluates rules, creates+notifies decisions, and dedups across cycles."""
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
 from tests.fakes import PaperBroker
 from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import DecisionStatus, Direction, OptionType, RuleType, Strategy
-from agentic.domain.models import CloseDecision, Position
+from agentic.domain.models import CloseDecision, Position, utcnow
 from agentic.marketdata.base import PaperMarketData
 from agentic.notify.base import Notifier
 from agentic.notify.trade_alerts import TradeAlerts, build_exit_alert_payload
@@ -39,13 +39,13 @@ class RecordingNotifier(Notifier):
         self.sent.append((title, message, priority))
 
 
-def _build(tmp_path, rules_cfg, *, trade_alerts=None):
+def _build(tmp_path, rules_cfg, *, trade_alerts=None, seed=None):
     db = Database(tmp_path / "t.db")
     audit = AuditStore(db)
     positions = PositionStore(db)
     decisions = DecisionStore(db)
     killswitch = KillSwitch(db, audit)
-    broker = PaperBroker()
+    broker = PaperBroker() if seed is None else PaperBroker(seed_positions=seed)
     notifier = RecordingNotifier()
     settings = Settings(mode="paper", broker="paper", market_data="paper", rules=rules_cfg)
     engine = RulesEngine(build_rules(rules_cfg))
@@ -127,50 +127,45 @@ async def test_no_decision_when_target_not_met(tmp_path):
     assert decisions.list_by_status(DecisionStatus.PROPOSED) == []
 
 
-class _SpyExecutor:
-    def __init__(self):
-        self.closed = []
-
-    async def execute_close(self, pos, decision, quote):
-        self.closed.append((pos.occ_symbol, decision.rule_name))
-        return None
-
-
-@pytest.mark.asyncio
-async def test_dte_alert_never_executes_even_with_executor(tmp_path):
-    # Regression: a DTE action=alert rule (requires_approval=false) is a heads-up only. Even with an
-    # executor wired in, it must NOT auto buy-to-close — that footgun realized a loss on a tested
-    # ONDS put right before it recovered. It notifies; the roll manager / assignment handle exits.
-    rules_cfg = [RuleConfig(name="dte-2", rule_type="DTE", requires_approval=False,
-                            params={"dte_threshold": 90, "action": "alert"})]  # 90 -> always triggers
-    monitor, broker, decisions, notifier = _build(tmp_path, rules_cfg)
-    spy = _SpyExecutor()
-    monitor.executor = spy
-
-    await monitor.run_once()
-
-    assert spy.closed == []                                          # never routed to the executor
-    proposed = decisions.list_by_status(DecisionStatus.PROPOSED)
-    assert proposed and all(d.rule_name == "dte-2" for d in proposed)
-    assert any("[ALERT]" in m for _t, m, _p in notifier.sent)       # labeled as an alert, not AUTO
-    assert all(p == "normal" for _t, _m, p in notifier.sent)        # not high-priority
+def _near_expiry(days_left: int) -> Position:
+    """Synthetic short put. Marks miss the 50% target and both stop triggers."""
+    exp = utcnow().date() + timedelta(days=days_left)
+    return Position(
+        occ_symbol="ZZZ" + exp.strftime("%y%m%d") + "P00010000",
+        underlying="ZZZ",
+        option_type=OptionType.PUT,
+        strategy=Strategy.CASH_SECURED_PUT,
+        direction=Direction.SHORT,
+        quantity=1,
+        strike=10.0,
+        expiration=exp,
+        credit_received=1.00,
+        current_bid=0.70,
+        current_ask=0.80,
+        current_mark=0.75,
+        delta=-0.20,
+    )
 
 
 @pytest.mark.asyncio
-async def test_dte_close_action_executes(tmp_path):
-    # The escape hatch still works: action=close is executable and routes to the executor.
-    rules_cfg = [RuleConfig(name="dte-close", rule_type="DTE", requires_approval=False,
-                            params={"dte_threshold": 90, "action": "close"})]
-    monitor, broker, decisions, notifier = _build(tmp_path, rules_cfg)
-    spy = _SpyExecutor()
-    monitor.executor = spy
+@pytest.mark.parametrize("days_left", [0, 2])
+async def test_short_dated_position_has_no_exit_without_profit_or_stop(tmp_path, days_left):
+    """dte-close used to fire at 2 DTE or less. Profit-target and stop-loss still do not."""
+    rules_cfg = [
+        RuleConfig(name="profit-target", rule_type="PROFIT_TARGET",
+                   requires_approval=False, params={"profit_pct": 0.5}),
+        RuleConfig(name="stop-loss", rule_type="STOP_LOSS",
+                   requires_approval=False, params={"loss_mult": 2.0, "delta_stop": 0.5}),
+    ]
+    pos = _near_expiry(days_left)
+    assert pos.dte() == days_left
+    monitor, _broker, decisions, notifier = _build(tmp_path, rules_cfg, seed=[pos])
 
     await monitor.run_once()
 
-    # Close actions are recorded and notified. The executor is not called.
-    assert spy.closed == []
-    proposed = decisions.list_by_status(DecisionStatus.PROPOSED)
-    assert proposed and all(d.rule_name == "dte-close" for d in proposed)
+    assert decisions.list_by_status(DecisionStatus.PROPOSED) == []
+    assert notifier.sent == []
+    assert [rule.name for rule in monitor.rules_engine.rules] == ["profit-target", "stop-loss"]
 
 
 def test_exit_alert_payload_shape():

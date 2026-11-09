@@ -879,7 +879,7 @@ async function loadTiers(){
 }
 /* ---- activity ---- */
 const RULE_LABEL = {"profit-trail":"Took profit","profit-target":"Took profit","profit-50":"Took profit",
-  "roll":"Rolled a position","dte-2":"Expiry check","dte-close":"Expiry close","stop-loss":"Stop-loss",
+  "roll":"Rolled a position","stop-loss":"Stop-loss",
   "deep-itm-alert":"Deep-ITM alert","tv-signal":"TradingView signal","csp-screener":"Opened a put"};
 const RULE_ICON = {"Took profit":["win","✓"],"Rolled a position":["", "↻"],"TradingView signal":["info","⚡"],
   "Opened a put":["info","+"]};
@@ -1442,10 +1442,6 @@ function renderRulesEditor(rules, signature){
       };
       fields = `<div class="scr-filters">${trig("loss_mult","1","10")}${trig("delta_stop","0.1","1")}</div>
         <div class="hint">Null means that trigger is off. Leave at least one on, or turn the whole rule off.</div>`;
-    } else if(rule.rule_type === "DTE"){
-      fields = `<div class="scr-filters"><label>dte_threshold
-        <input class="f scrn rule-num" data-i="${i}" data-param="dte_threshold" inputmode="numeric" value="${esc(numAttr(p.dte_threshold))}"/></label></div>
-        <div class="hint">Whole number 0–30. Action stays ${esc(p.action || "alert")}.</div>`;
     } else {
       fields = `<div class="hint">Match is display-only (${esc(p.match || "underlying")}): the matcher always tries the exact contract, then the underlying. Requires approval: ${rule.requires_approval ? "yes" : "no"}. No numeric parameter.</div>`;
     }
@@ -1477,14 +1473,6 @@ function readTrigger(i, param, lo, hi){
   if(!box || !box.checked) return null;
   return readDecimal(i, param, lo, hi);
 }
-function readWhole(i, param, lo, hi){
-  const el = document.querySelector(`#rules-editor input.rule-num[data-i="${i}"][data-param="${param}"]`);
-  const raw = (el && el.value || "").trim();
-  if(!/^[0-9]+$/.test(raw)) throw new Error(param + " must be a whole number from " + lo + " to " + hi + ".");
-  const n = Number(raw);
-  if(n < lo || n > hi) throw new Error(param + " must be a whole number from " + lo + " to " + hi + ".");
-  return n;
-}
 function collectRules(){
   if(!rulesSnapshot) throw new Error("Rules are still loading.");
   return rulesSnapshot.map((rule, i) => {
@@ -1498,7 +1486,7 @@ function collectRules(){
       if(enabled && params.loss_mult == null && params.delta_stop == null){
         throw new Error("Stop-loss is on but both triggers are off. Turn the rule off, or leave one trigger on.");
       }
-    } else if(rule.rule_type === "DTE") params.dte_threshold = readWhole(i, "dte_threshold", 0, 30);
+    }
     return {
       name: rule.name,
       rule_type: rule.rule_type,
@@ -1510,7 +1498,7 @@ function collectRules(){
 }
 function rulesDiff(before, after){
   const lines = [];
-  const keys = ["profit_pct", "loss_mult", "delta_stop", "dte_threshold"];
+  const keys = ["profit_pct", "loss_mult", "delta_stop"];
   for(let i = 0; i < before.length; i++){
     const a = before[i], b = after[i];
     if(!!a.enabled !== !!b.enabled){

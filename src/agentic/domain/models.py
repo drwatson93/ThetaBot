@@ -93,9 +93,9 @@ class CloseDecision:
     requires_approval: bool
     dedup_key: str
     status: DecisionStatus = DecisionStatus.PROPOSED
-    # A notify-only decision (e.g. a DTE "action=alert" heads-up) is NEVER routed to the executor,
-    # even when requires_approval is false — it only notifies. Runtime routing flag; not persisted
-    # (dedup_key handles de-dup, and routing is decided at evaluate time, never from a DB read).
+    # A notify-only decision is never routed to an executor, even when requires_approval is
+    # false — it only notifies. Runtime routing flag; not persisted (dedup_key handles de-dup,
+    # and routing is decided at evaluate time, never from a DB read).
     notify_only: bool = False
     id: str = field(default_factory=_uuid)
     created_at: datetime = field(default_factory=utcnow)

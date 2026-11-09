@@ -5,6 +5,7 @@ the process environment / ``.env`` (loaded lazily, never written to config).
 
 ``mode``, ``i_understand_live_trading``, ``tax_reserve``, ``execution``, and ``roll``
 are not settings. An old file that still has them loads; those keys are ignored.
+A ``rules`` entry named ``dte-close`` or with ``rule_type: DTE`` is dropped on load.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 log = logging.getLogger("agentic.config")
 
@@ -309,10 +310,42 @@ class TunnelConfig(BaseModel):
 
 class RuleConfig(BaseModel):
     name: str
-    rule_type: Literal["PROFIT_TARGET", "STOP_LOSS", "DTE", "SIGNAL"]
+    rule_type: Literal["PROFIT_TARGET", "STOP_LOSS", "SIGNAL"]
     enabled: bool = True
     requires_approval: bool = True
     params: dict[str, Any] = Field(default_factory=dict)
+
+
+def _rule_name_and_type(item: Any) -> tuple[str | None, str | None]:
+    if isinstance(item, dict):
+        name, rtype = item.get("name"), item.get("rule_type")
+    else:
+        name, rtype = getattr(item, "name", None), getattr(item, "rule_type", None)
+    if hasattr(rtype, "value"):
+        rtype = rtype.value
+    name_s = name if isinstance(name, str) else None
+    type_s = rtype if isinstance(rtype, str) else None
+    return name_s, type_s
+
+
+def drop_removed_exit_rules(rules: Any) -> Any:
+    """Drop the removed dte-close rule. One warning per load, not one per entry."""
+    if not isinstance(rules, list):
+        return rules
+    kept: list[Any] = []
+    dropped: list[str] = []
+    for item in rules:
+        name, rtype = _rule_name_and_type(item)
+        if rtype == "DTE" or name == "dte-close":
+            dropped.append(name or rtype or "dte-close")
+            continue
+        kept.append(item)
+    if dropped:
+        log.warning(
+            "Ignoring removed exit rule(s) %s; dte-close is no longer evaluated",
+            ", ".join(dropped),
+        )
+    return kept
 
 
 class WebConfig(BaseModel):
@@ -377,6 +410,15 @@ class Settings(BaseModel):
     tunnel: TunnelConfig = Field(default_factory=TunnelConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     rules: list[RuleConfig] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_removed_exit_rules(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "rules" in value:
+            data = dict(value)
+            data["rules"] = drop_removed_exit_rules(data["rules"])
+            return data
+        return value
 
     # --- derived helpers ---
     def http_bind_port(self) -> int:
