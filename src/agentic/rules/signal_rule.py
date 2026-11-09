@@ -1,6 +1,6 @@
 """Signal -> position matching for TradingView close alerts (Phase 3).
 
-Unlike PROFIT_TARGET/DTE (evaluated per position each cycle), a SIGNAL is evaluated
+Unlike profit-target and stop-loss (evaluated per position each cycle), a SIGNAL is evaluated
 against the set of open positions when a webhook arrives:
 
   * If the signal carries an exact ``occ`` symbol that matches an open position -> that one.

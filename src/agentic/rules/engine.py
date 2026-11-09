@@ -9,17 +9,16 @@ from ..config import RuleConfig
 from ..domain.models import CloseDecision, Position, utcnow
 from ..marketdata.quote import OptionQuote
 from .base import Rule
-from .dte import DteRule
 from .profit_target import ProfitTargetRule
 from .stop_loss import StopLossRule
 
 log = logging.getLogger("agentic.rules")
 
 # SIGNAL rules are evaluated separately (against inbound webhooks), not per-position here.
+# DTE (dte-close) is not a position rule. A stale config entry is dropped at load.
 _RULE_CLASSES = {
     "PROFIT_TARGET": ProfitTargetRule,
     "STOP_LOSS": StopLossRule,
-    "DTE": DteRule,
 }
 
 

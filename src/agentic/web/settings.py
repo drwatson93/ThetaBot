@@ -74,7 +74,7 @@ class RulesConflict(SettingsEditError):
 
 
 # Identity of a rule is (name, rule_type). The dashboard may tune these fields only.
-_ALLOWED_RULE_TYPES = frozenset({"PROFIT_TARGET", "STOP_LOSS", "DTE", "SIGNAL"})
+_ALLOWED_RULE_TYPES = frozenset({"PROFIT_TARGET", "STOP_LOSS", "SIGNAL"})
 # kind, lo, hi, nullable. Null is meaningful only for the two stop-loss triggers.
 _TUNABLE_PARAMS: dict[str, dict[str, tuple[str, float, float, bool]]] = {
     "PROFIT_TARGET": {"profit_pct": ("float", 0.05, 0.95, False)},
@@ -82,7 +82,6 @@ _TUNABLE_PARAMS: dict[str, dict[str, tuple[str, float, float, bool]]] = {
         "loss_mult": ("float", 1.0, 10.0, True),
         "delta_stop": ("float", 0.1, 1.0, True),
     },
-    "DTE": {"dte_threshold": ("int", 0, 30, False)},
     "SIGNAL": {},
 }
 

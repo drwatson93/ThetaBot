@@ -32,6 +32,7 @@ class RuleType(str, Enum):
     PROFIT_TARGET = "PROFIT_TARGET"
     STOP_LOSS = "STOP_LOSS"
     ROLL = "ROLL"
+    # Older close-decision rows store this. The dte-close rule is not configured or evaluated.
     DTE = "DTE"
     SIGNAL = "SIGNAL"
 

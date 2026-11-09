@@ -111,11 +111,6 @@ def _pct_label(fraction: float) -> str:
     return _trim(Decimal(str(fraction)) * Decimal(100)) + "%"
 
 
-def _days_left(threshold: int) -> str:
-    unit = "day" if threshold == 1 else "days"
-    return f"{threshold} {unit} left"
-
-
 def _params(rule: Any) -> dict:
     params = getattr(rule, "params", None) or {}
     return params if isinstance(params, dict) else {}
@@ -123,16 +118,6 @@ def _params(rule: Any) -> dict:
 
 def _asks(rule: Any) -> bool:
     return getattr(rule, "requires_approval", False) is True
-
-
-def _dte_days(params: dict) -> int:
-    """Days-left threshold DteRule actually uses. Missing means 21."""
-    if "dte_threshold" not in params or params.get("dte_threshold") is None:
-        return 21
-    n = _number(params.get("dte_threshold"))
-    if n is None:
-        return 21
-    return int(n)
 
 
 def _profit_bit(rule: Any, params: dict) -> str:
@@ -178,24 +163,6 @@ def _stop_bit(rule: Any, params: dict) -> str | None:
     return f"Buys it back if {joined}."
 
 
-def _dte_bit(rule: Any, params: dict) -> str:
-    when = _days_left(_dte_days(params))
-    # DteRule buys back only when action == "close" exactly. "Close" and
-    # " close" are notify-only. A missing action defaults to "alert".
-    if "action" not in params or params.get("action") is None:
-        action = "alert"
-    else:
-        action = params.get("action")
-    if action == "close":
-        if _asks(rule):
-            return f"Asks for approval to buy the option back at {when}."
-        return f"Buys the option back at {when}."
-    if action == "alert":
-        return f"Alerts you at {when} and does not buy the option back."
-    label = action if isinstance(action, str) else str(action)
-    return f"At {when} it alerts you (action: {label}) and does not buy the option back."
-
-
 def _signal_bit(rule: Any) -> str:
     if _asks(rule):
         return "A TradingView signal closes it, with your approval."
@@ -207,7 +174,7 @@ def _signal_bit(rule: Any) -> str:
 
 
 def _rule_bits(rule: Any) -> str | None:
-    # Profit, stop, and DTE are already skipped by RulesEngine when disabled.
+    # Profit and stop are already skipped by RulesEngine when disabled.
     # tv-signal is not: on main, SignalProcessor ignores enabled and still closes.
     # Leaving a disabled tv-signal out of this sentence assumes PR #13
     # (branch cursor/rules-tab-editor-3b4c), which does not match or close when
@@ -221,7 +188,7 @@ def _rule_bits(rule: Any) -> str | None:
     if kind == "STOP_LOSS":
         return _stop_bit(rule, params)
     if kind == "DTE":
-        return _dte_bit(rule, params)
+        return None
     if kind == "SIGNAL":
         return _signal_bit(rule)
     name = str(getattr(rule, "name", "") or "").strip() or "a rule"

@@ -329,7 +329,6 @@ The owner login can tune exit rules on the dashboard **Rules** tab. The view-onl
 | `profit_pct` | profit target | 0.05–0.95 |
 | `loss_mult` | stop loss | 1.0–10, or off |
 | `delta_stop` | stop loss | 0.1–1.0, or off |
-| `dte_threshold` | DTE | whole number 0–30 |
 
 **Stop-loss triggers.** `null` means that trigger is off. `0` is not off (it would trip immediately) and is rejected. Turning off `loss_mult` leaves `delta_stop` active, and the other way around. Turning **both** triggers off while the rule stays enabled is rejected — disable the rule itself (`enabled: false`) to turn stop-loss off. You can turn the rule back on later and set either trigger again.
 
@@ -337,7 +336,7 @@ Saving posts the full rules list plus the signature of the rules the form was lo
 
 A successful save that actually changes a value is applied in place, written to the data-disk overlay (it overrides `config.yaml`), and recorded as a `CONFIG_EDIT` audit row. Changed fields are stored as `rules.<name>.<field>: {old, new}` — for example `rules.stop-loss.params.loss_mult` from `2.0` to `null`. A save whose leaf diff is empty writes no `CONFIG_EDIT` row, so a no-op does not ping Watchman. Every real change still does.
 
-The monitor reloads these rules on its next poll. A disabled profit-target, stop-loss, or DTE rule is not evaluated. Turning **tv-signal** off is read on the next cycle. An alert that arrives while it is off is stored expired, and any still-new alerts are expired every cycle, including outside the scan window. The processor checks the rule again before each alert in a batch, so turning it back on does not replay them. A later alert is recorded only. This screen does not place an order. `ORDERS_HARD_DISABLED` stays on.
+The monitor reloads these rules on its next poll. A disabled profit-target or stop-loss rule is not evaluated. Turning **tv-signal** off is read on the next cycle. An alert that arrives while it is off is stored expired, and any still-new alerts are expired every cycle, including outside the scan window. The processor checks the rule again before each alert in a batch, so turning it back on does not replay them. A later alert is recorded only. This screen does not place an order. `ORDERS_HARD_DISABLED` stays on.
 
 Tune the yield floor and delta band to your own risk tolerance. Higher `min_annualized_yield` = fewer, richer, higher-IV trades; lower = more, thinner ones. The defaults above are the ones that survived a real-option-print backtest under both fair and worst-case fills; **[docs/backtests.md](docs/backtests.md)** lists every lever tested, what held up, and what did not.
 
