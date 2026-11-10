@@ -670,8 +670,12 @@ async def test_exit_uses_fill_price_when_the_alert_was_taken(tmp_path, _open, mo
 
 
 @pytest.mark.asyncio
-async def test_stale_quote_on_a_held_name_skips_the_scan(tmp_path, _open):
-    """A stale quote fetched for a held name sends nothing and does not reconcile."""
+async def test_stale_quote_on_a_held_name_blocks_that_name_only(tmp_path, _open):
+    """A stale quote on a held name blocks that name's exit, not the scan.
+
+    The fresh watchlist name is still reconciled. The stale held quote does
+    not emit an exit.
+    """
     put = _put("AAA")
     book = _csp_book()
     chains = {"AAA": [put]}
@@ -695,12 +699,15 @@ async def test_stale_quote_on_a_held_name_skips_the_scan(tmp_path, _open):
         held_occ, "BBB", "put", 40, held_exp, 1, average=1.0, opened_at=utcnow(),
     ))
     assert await scanner.run_once() == 0
-    assert len(scanner.alerts.all()) == 1
-    assert scanner.alerts.all()[0]["status"] == "new"
-    assert scanner.alerts.all()[0]["kind"] == "CSP"
+    alerts = scanner.alerts.all()
+    assert len(alerts) == 1
+    assert alerts[0]["kind"] == "CSP" and alerts[0]["underlying"] == "AAA"
+    assert alerts[0]["status"] == "taken"
     run = scanner.alerts.runs()[-1]
-    assert run["status"] == "skipped" and run["reason"] == "stale quote"
-    assert run["alerts_sent"] == 0
+    assert run["status"] == "ok" and run["alerts_sent"] == 0
+    assert "BBB: stale quote" in (run["reason"] or "")
+    assert any(s["symbol"] == "BBB" and s["reason"] == "stale quote" for s in scanner.last_skips)
+    assert not any(a["kind"] == "exit" for a in alerts)
     assert book.writes == []
 
 
