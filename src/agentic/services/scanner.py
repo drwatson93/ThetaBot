@@ -320,6 +320,10 @@ class OpportunityScanner:
         context_by_underlying: dict[str, UnderlyingContext] = {}
         self.last_quality = {}  # rebuilt this scan by _overlay_quality (informational readout)
         skips: list[dict] = []
+        # Freshness is judged once per symbol, when that symbol is evaluated.
+        # A later pass must not age a quote that was fresh at that moment.
+        fresh: set[str] = set()
+        stale: set[str] = set()
 
         # CSP pass — watchlist puts, per-ticker criteria + underlying gates (entry intelligence).
         csp_cands: list[EntryCandidate] = []
@@ -328,6 +332,8 @@ class OpportunityScanner:
         for underlying in cfg.watchlist:
             crit = cfg.criteria_for(underlying, cfg.criteria)
             chain = await chain_for(underlying)
+            if self._reject_if_stale(underlying, chain, skips, fresh, stale):
+                continue
             ctx = await self._context_for(underlying, chain, crit)
             self._enrich_ctx_from_tv(underlying, ctx)
             ctx.recent_news_count = len(self._recent_news(underlying))
@@ -435,6 +441,8 @@ class OpportunityScanner:
                 continue
             crit = cfg.criteria_for(h.symbol, cfg.cc_criteria)
             chain = await chain_for(h.symbol)
+            if self._reject_if_stale(h.symbol, chain, skips, fresh, stale):
+                continue
             if h.symbol not in context_by_underlying:
                 context_by_underlying[h.symbol] = await self._context_for(h.symbol, chain, crit)
             px = getattr(context_by_underlying.get(h.symbol), "price", None)
@@ -467,12 +475,13 @@ class OpportunityScanner:
         feed_problem = self._feed_problem(chain_cache, quote_by_occ)
         if feed_problem:
             return self._skip_scan(feed_problem)
-        if self._quotes_stale(quote_by_occ):
-            return self._skip_scan("stale quote")
-        # A held name that was not on this scan is quoted for the exit check.
-        # A stale quote there is the same gate: nothing goes out, and prior
-        # alerts are not reconciled.
-        if await self._stale_held_quote(open_positions, quote_by_occ, chain_cache):
+        # Held names that were not screened are quoted here, at this fetch.
+        # One stale symbol blocks that symbol. The whole scan stops only when
+        # every quoted symbol was stale (the feed is down).
+        await self._stale_held_quote(
+            open_positions, quote_by_occ, chain_cache, skips, fresh, stale,
+        )
+        if self._all_quoted_symbols_stale(chain_cache, stale):
             return self._skip_scan("stale quote")
 
         # Persist the full scan disposition (approved + reasoned rejections) — the negative-example
@@ -502,15 +511,21 @@ class OpportunityScanner:
         # The health gate already returned. Reconcile the positions this scan
         # already read, then grade and consider exits, then emit new plays.
         now = utcnow()
-        notes: list[str] = []
+        notes: list[str] = [
+            f"{s['symbol']}: stale quote" for s in skips if s.get("reason") == "stale quote"
+        ]
         self._reconcile_entries(open_positions, now)
         await self._grade_scorecard(now, notes)
         exit_inserted, exit_confirmed = await self._exit_alerts(
-            open_positions, quote_by_occ, chain_cache, notes, now,
+            open_positions, quote_by_occ, chain_cache, notes, now, stale,
         )
 
-        inserted, confirmed = await self._emit_alerts(csp_approved, quote_by_occ, "CSP")
-        more_inserted, more_confirmed = await self._emit_alerts(cc_approved, quote_by_occ, "CC")
+        inserted, confirmed = await self._emit_alerts(
+            csp_approved, quote_by_occ, "CSP", stale,
+        )
+        more_inserted, more_confirmed = await self._emit_alerts(
+            cc_approved, quote_by_occ, "CC", stale,
+        )
         self.alerts.record_run(
             status="ok", reason="; ".join(notes) or None,
             alerts_sent=confirmed + more_confirmed + exit_confirmed,
@@ -562,35 +577,68 @@ class OpportunityScanner:
             return "empty quote map"
         return None
 
-    def _quotes_stale(self, quotes: dict) -> bool:
-        """True when any quote on this scan is older than max_quote_age_seconds."""
+    def _reject_if_stale(self, symbol: str, chain, skips: list, fresh: set, stale: set) -> bool:
+        """True when this symbol must not produce an alert.
+
+        Judged at evaluation time. A symbol already marked fresh stays fresh:
+        wall-clock age from later symbols is not a second gate. An empty chain
+        is not stale; the feed gate handles that. One old quote blocks the symbol.
+        """
+        if symbol in fresh:
+            return False
+        if symbol in stale:
+            return True
+        quotes = [q for q in (chain or []) if getattr(q, "occ_symbol", None)]
         if not quotes:
             return False
-        max_age = self.settings.max_quote_age_seconds
         now = utcnow()
-        return any(q.is_stale(max_age, now) for q in quotes.values())
+        max_age = self.settings.max_quote_age_seconds
+        if any(q.is_stale(max_age, now) for q in quotes):
+            stale.add(symbol)
+            skips.append({"symbol": symbol, "reason": "stale quote"})
+            log.info("%s skipped: stale quote", symbol)
+            return True
+        fresh.add(symbol)
+        return False
 
-    async def _stale_held_quote(self, positions, quote_by_occ, chain_cache) -> bool:
-        """True when a held short's quote, fetched for the exit check, is too old.
+    def _all_quoted_symbols_stale(self, chain_cache: dict, stale: set) -> bool:
+        """True when every symbol that produced a quote was stale when judged.
 
-        Quotes already on this scan were checked with the rest. A name read only
-        because it is held uses that same rule.
+        Nothing quoted is not a failure. One fresh symbol means the feed is up.
         """
-        now = utcnow()
-        max_age = self.settings.max_quote_age_seconds
+        quoted = [
+            symbol for symbol, chain in chain_cache.items()
+            if any(getattr(q, "occ_symbol", None) for q in (chain or []))
+        ]
+        if not quoted:
+            return False
+        return all(symbol in stale for symbol in quoted)
+
+    async def _stale_held_quote(
+        self, positions, quote_by_occ, chain_cache, skips, fresh: set, stale: set,
+    ) -> None:
+        """Judge a held short whose underlying was not already evaluated.
+
+        A symbol judged with its chain keeps that result, so a slow scan does
+        not turn a fresh read into a skip. A name fetched only because it is
+        held is judged now. A stale quote blocks that symbol's exit. It skips
+        the scan only when every quoted symbol is stale.
+        """
         for position in positions or []:
             if not _is_short_open(position):
                 continue
-            occ = getattr(position, "occ_symbol", None)
-            if not occ or occ in quote_by_occ:
+            symbol = getattr(position, "underlying", None)
+            if not symbol or symbol in fresh or symbol in stale:
+                continue
+            if not getattr(position, "occ_symbol", None):
                 continue
             try:
-                quote, fresh = await self._quote_for_held(position, quote_by_occ, chain_cache)
+                await self._quote_for_held(position, quote_by_occ, chain_cache)
             except Exception:  # noqa: BLE001 — the exit pass notes a bad read
                 continue
-            if quote is not None and fresh and quote.is_stale(max_age, now):
-                return True
-        return False
+            self._reject_if_stale(
+                symbol, chain_cache.get(symbol) or [], skips, fresh, stale,
+            )
 
     def _skip_scan(self, reason: str) -> int:
         """Send nothing and record a skipped scan_runs row."""
@@ -688,6 +736,7 @@ class OpportunityScanner:
 
     async def _exit_alerts(
         self, positions, quote_by_occ, chain_cache, notes: list[str], now,
+        stale_symbols: set,
     ) -> tuple[int, int]:
         """One exit alert per held short, through the same insert and webhook path."""
         inserted = 0
@@ -704,7 +753,7 @@ class OpportunityScanner:
                 continue
             try:
                 decision = await self._exit_decision(
-                    position, quote_by_occ, chain_cache, notes, now,
+                    position, quote_by_occ, chain_cache, notes, now, stale_symbols,
                 )
             except Exception as exc:  # noqa: BLE001 — one bad position must not break the scan
                 log.info("exit skipped: %s (%s)", occ, type(exc).__name__)
@@ -717,7 +766,7 @@ class OpportunityScanner:
             inserted += n_ins
             confirmed += n_ok
         for row in self.alerts.unsent("exit"):
-            if row["dedup_key"] in touched:
+            if row["dedup_key"] in touched or row["underlying"] in stale_symbols:
                 continue
             n_ins, n_ok = await self._emit_play(
                 dedup_key=row["dedup_key"], kind="exit", underlying=row["underlying"],
@@ -729,13 +778,20 @@ class OpportunityScanner:
             confirmed += n_ok
         return inserted, confirmed
 
-    async def _exit_decision(self, position, quote_by_occ, chain_cache, notes, now):
+    async def _exit_decision(
+        self, position, quote_by_occ, chain_cache, notes, now, stale_symbols: set,
+    ):
         """The exit play to emit, or None.
 
         80% of the credit does not need an open time. The 50% clause does, and
         a missing open time is noted. A missing quote is noted and skipped.
+        A quote that was stale when its symbol was judged does not fire an exit.
         """
         occ = position.occ_symbol
+        if position.underlying in stale_symbols:
+            notes.append(f"exit skipped: {occ} stale quote")
+            log.info("exit skipped: %s stale quote", occ)
+            return None
         quote, _fresh = await self._quote_for_held(position, quote_by_occ, chain_cache)
         if quote is None or quote.midpoint is None:
             notes.append(f"exit skipped: {occ} missing quote")
@@ -795,13 +851,14 @@ class OpportunityScanner:
             return float(row["fill_price"])
         return _broker_average(position)
 
-    async def _emit_alerts(self, approved, quote_by_occ, kind: str) -> tuple[int, int]:
+    async def _emit_alerts(self, approved, quote_by_occ, kind: str, stale_symbols: set) -> tuple[int, int]:
         """Insert a new play once, and deliver it.
 
         Returns ``(inserted, confirmed)``. A row that is already ``sent`` is
         left alone. A ``pending`` or ``failed`` row is posted again, including
-        one this scan did not approve. ``confirmed`` counts only webhooks
-        ``_deliver`` accepted. Pause is checked inside ``_emit_play``.
+        one this scan did not approve, unless that symbol's quote was stale.
+        ``confirmed`` counts only webhooks ``_deliver`` accepted. Pause is
+        checked inside ``_emit_play``.
         """
         inserted = 0
         confirmed = 0
@@ -822,7 +879,7 @@ class OpportunityScanner:
             inserted += n_ins
             confirmed += n_ok
         for row in self.alerts.unsent(kind):
-            if row["dedup_key"] in touched:
+            if row["dedup_key"] in touched or row["underlying"] in stale_symbols:
                 continue
             n_ins, n_ok = await self._emit_play(
                 dedup_key=row["dedup_key"], kind=kind, underlying=row["underlying"],

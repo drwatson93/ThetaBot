@@ -58,13 +58,41 @@ class RobinhoodMarketData(MarketDataProvider):
     """Implements the full MarketDataProvider contract against Robinhood's MCP tools."""
 
     def __init__(self, broker, *, dte_window_days: int = 21,
-                 chain_ttl_seconds: float = 240, bars_ttl_seconds: float = 3600):
+                 chain_ttl_seconds: float = 240, bars_ttl_seconds: float = 3600,
+                 max_quote_age_seconds: float | None = None):
         self._b = broker
         self._dte_window = dte_window_days
-        self._chain_ttl = chain_ttl_seconds
+        ttl = float(chain_ttl_seconds)
+        cap = float(max_quote_age_seconds) if max_quote_age_seconds is not None else None
+        # A cache hit must not be older than the scanner's freshness limit.
+        if cap is not None and cap > 0:
+            ttl = min(ttl, cap)
+        self._chain_ttl = ttl
+        self._max_quote_age = cap if cap is not None and cap > 0 else None
         self._bars_ttl = bars_ttl_seconds
         self._chain_cache: dict[str, tuple[float, list[OptionContractQuote]]] = {}
         self._bars_cache: dict[str, tuple[float, list[dict]]] = {}
+
+    def _fresh_cached_chain(self, underlying: str) -> list[OptionContractQuote] | None:
+        """Chain still inside the TTL whose quotes are not already past max age.
+
+        None means "do not use the cache" (missing, expired, or the quotes
+        themselves would fail the freshness check). An empty list is a hit.
+        """
+        cached = self._chain_cache.get(underlying)
+        if not cached:
+            return None
+        cached_at, chain = cached
+        if time.time() - cached_at >= self._chain_ttl:
+            return None
+        max_age = self._max_quote_age
+        if max_age is None or not chain:
+            return chain
+        now = datetime.fromtimestamp(time.time(), tz=timezone.utc)
+        for quote in chain:
+            if getattr(quote, "occ_symbol", None) and quote.is_stale(max_age, now):
+                return None
+        return chain
 
     @property
     def is_realtime(self) -> bool:
@@ -133,14 +161,17 @@ class RobinhoodMarketData(MarketDataProvider):
 
     # --- option chain (entry screening) ----------------------------------------------------------
     async def get_chain(self, underlying: str) -> list[OptionContractQuote]:
-        c = self._chain_cache.get(underlying)
-        if c and time.time() - c[0] < self._chain_ttl:
-            return c[1]
+        cached = self._fresh_cached_chain(underlying)
+        if cached is not None:
+            return cached
         spot = await self.get_underlying_price(underlying)
         try:
             ch = await self._call("get_option_chains", {"underlying_symbol": underlying})
         except Exception:  # noqa: BLE001
-            return self._chain_cache.get(underlying, (0, []))[1]
+            # Keep the cached quotes' real as_of. Do not restamp them as now:
+            # the freshness check has to see that this fallback is old.
+            previous = self._chain_cache.get(underlying)
+            return previous[1] if previous else []
         chains = (ch.get("data") or {}).get("chains") or []
         exps = chains[0].get("expiration_dates", []) if chains else []
         today = date.today()

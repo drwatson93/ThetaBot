@@ -247,7 +247,10 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             from datetime import date as _date
 
             from ..marketdata.robinhood_md import RobinhoodMarketData
-            md = RobinhoodMarketData(broker, dte_window_days=dte_max)
+            md = RobinhoodMarketData(
+                broker, dte_window_days=dte_max,
+                max_quote_age_seconds=getattr(deps.settings, "max_quote_age_seconds", None),
+            )
             chain = await md.get_chain(sym)
         except Exception as exc:  # noqa: BLE001 — advisory read; never crash the dashboard
             return {"symbol": sym, "available": False, "reason": f"chain fetch failed: {exc}"}

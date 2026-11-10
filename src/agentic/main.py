@@ -82,7 +82,9 @@ def build_market_data(settings: Settings, broker=None) -> MarketDataProvider:
         # Reuse the trading broker's Robinhood MCP session for market data — one login, no Alpaca.
         from .marketdata.robinhood_md import RobinhoodMarketData
         if broker is not None and hasattr(broker, "_call_tool"):
-            return RobinhoodMarketData(broker)
+            return RobinhoodMarketData(
+                broker, max_quote_age_seconds=settings.max_quote_age_seconds,
+            )
         log.warning("market_data=robinhood but the broker is not a Robinhood MCP broker; "
                     "falling back to paper data.")
         return PaperMarketData()
