@@ -36,6 +36,12 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
 _BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+\S+")
 _COLON_TOKEN_RE = re.compile(r":\s*\S+")
+# Labeled secrets and long digit runs (account numbers). Values only; the label stays.
+_LABELED_SECRET_RE = re.compile(
+    r"(?i)\b((?:account(?:[_\s-]?number)?|access_token|refresh_token|"
+    r"api[_-]?key|token|secret|password)\s*[:=]\s*)(\S+)"
+)
+_LONG_DIGITS_RE = re.compile(r"\b\d{8,}\b")
 # OCC: <root><YYMMDD><C|P><strike*1000, 8 digits> — trailing 15 chars are fixed.
 def _parse_occ(occ: str) -> tuple[str, date, str, float] | None:
     if not occ or len(occ) < 16:
@@ -114,16 +120,23 @@ def _redact_env_value(detail: str, raw: str | None) -> str:
     return detail
 
 
-def sanitize_error(exc: BaseException, url: str | None = None) -> str:
-    """Exception text with webhook URL, header name/value, and key-like tokens stripped."""
-    detail = str(exc) or ""
+def _scrub_detail(detail: str, url: str | None = None) -> str:
+    """Strip webhook URLs, header secrets, tokens, and account-number-like values."""
     if url:
         detail = detail.replace(url, "[redacted]")
     detail = _redact_env_value(detail, get_secret("TRADE_ALERT_HEADER_VALUE"))
     detail = _redact_env_value(detail, get_secret("TRADE_ALERT_HEADER_NAME"))
     detail = _BEARER_TOKEN_RE.sub("Bearer [redacted]", detail)
     detail = _COLON_TOKEN_RE.sub(": [redacted]", detail)
-    detail = _URL_RE.sub("[redacted]", detail).strip()
+    detail = _URL_RE.sub("[redacted]", detail)
+    detail = _LABELED_SECRET_RE.sub(r"\1[redacted]", detail)
+    detail = _LONG_DIGITS_RE.sub("[redacted]", detail)
+    return detail.strip()
+
+
+def sanitize_error(exc: BaseException, url: str | None = None) -> str:
+    """Exception text with webhook URL, header, token, and account-number secrets stripped."""
+    detail = _scrub_detail(str(exc) or "", url)
     msg = type(exc).__name__ if not detail else f"{type(exc).__name__}: {detail}"
     return msg[:400]
 

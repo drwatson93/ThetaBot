@@ -21,7 +21,9 @@ from ..store.audit import AuditStore
 from ..store.decisions import DecisionStore
 from ..store.positions import PositionStore
 from .killswitch import KillSwitch
-from .live_positions import attach_quote, fetch_broker_positions, select_live, snapshot
+from .live_positions import (
+    attach_quote, fetch_broker_positions, format_broker_failure, select_live, snapshot,
+)
 from .market_hours import is_market_hours, is_order_window
 
 log = logging.getLogger("agentic.monitor")
@@ -71,8 +73,9 @@ class MonitorLoop:
                 await self.run_once()
                 self.killswitch.record_success()
             except Exception as exc:  # noqa: BLE001 — a bad cycle must not kill the loop
-                log.exception("Monitor cycle error: %s", exc)
-                self.audit.record(AuditEventType.ERROR, {"where": "monitor", "error": str(exc)})
+                detail = format_broker_failure(exc)
+                log.exception("Monitor cycle error: %s", detail)
+                self.audit.record(AuditEventType.ERROR, {"where": "monitor", "error": detail})
                 self.killswitch.record_broker_error("monitor")
             delay = (
                 self.settings.poll_interval_seconds
