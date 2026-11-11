@@ -74,7 +74,8 @@ class MonitorLoop:
                 self.killswitch.record_success()
             except Exception as exc:  # noqa: BLE001 — a bad cycle must not kill the loop
                 detail = format_broker_failure(exc)
-                log.exception("Monitor cycle error: %s", detail)
+                # No exc_info: the traceback would print the raw __cause__ (tokens, account ids).
+                log.error("Monitor cycle error: %s", detail)
                 self.audit.record(AuditEventType.ERROR, {"where": "monitor", "error": detail})
                 self.killswitch.record_broker_error("monitor")
             delay = (
@@ -140,7 +141,7 @@ class MonitorLoop:
         paper book) is read with no argument. A blank account is not sent to
         ``get_option_positions``. A failed read raises; it does not return stored rows.
         """
-        return await fetch_broker_positions(self.broker)
+        return await fetch_broker_positions(self.broker, stop_event=self._stop)
 
     async def _evaluate(self, pos, quote) -> None:
         """Evaluate rules for one position.
