@@ -122,7 +122,7 @@ async def test_signal_to_approval_to_execution(ctx):
     assert r.status_code == 202
 
     # 2. Monitor would call this each cycle; do it directly.
-    await ctx["processor"].process_pending()
+    await ctx["processor"].process_pending(ctx["positions"].list_open())
 
     # 3. A decision is recorded. The processor does not ask for approval or place an order.
     pending = ctx["decisions"].list_by_status(DecisionStatus.PROPOSED)
@@ -141,7 +141,7 @@ async def test_reject_blocks_execution(ctx):
     client = ctx["client"]
     client.post("/webhook/tradingview",
                 json={"token": TOKEN, "action": "close", "symbol": "AAA", "alert_id": "x2"})
-    await ctx["processor"].process_pending()
+    await ctx["processor"].process_pending(ctx["positions"].list_open())
     decision_id = ctx["decisions"].list_by_status(DecisionStatus.PROPOSED)[0].id
 
     rr = client.post(f"/control/reject/{decision_id}")

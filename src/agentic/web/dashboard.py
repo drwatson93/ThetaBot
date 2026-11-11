@@ -3,7 +3,7 @@
   GET /                -> the dashboard page
   GET /dashboard       -> the dashboard page
   GET /api/stats       -> win rate, realized/unrealized P&L, per-rule rollup
-  GET /api/positions   -> open + closed positions with P&L, percent P/L, the exit plan, underlying last, and the rule that closed them
+  GET /api/positions   -> contracts the broker holds right now, with P&L, percent P/L, the exit plan, and underlying last
   GET /api/decisions   -> recent close decisions with reasons (the "why", for memory tuning)
   GET /api/audit       -> recent audit events
 
@@ -22,6 +22,13 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from ..domain.models import utcnow
 from ..domain.order_pricing import public_close_pricing_fields, public_pricing_fields
+from ..services.live_positions import (
+    attach_quote,
+    fresh_rule_label,
+    load_live_positions,
+    ny_today,
+    stored_history,
+)
 from ..services.stats import compute_stats, position_rows
 from .auth import require_auth, require_owner
 from .position_cards import card_pnl_percent, holding_plan, live_profit_pct
@@ -132,6 +139,30 @@ async def load_underlying_quotes(deps: "WebDeps", positions) -> dict[str, dict]:
     return quotes
 
 
+def _scanner_broker(deps: "WebDeps"):
+    sc = getattr(deps, "scanner", None)
+    return getattr(sc, "broker", None) if sc is not None else None
+
+
+def _scanner_md(deps: "WebDeps"):
+    sc = getattr(deps, "scanner", None)
+    return getattr(sc, "market_data", None) if sc is not None else None
+
+
+async def _current_book(deps: "WebDeps"):
+    """Live contracts plus closed history that is not treated as an open book.
+
+    A failed broker read contributes no open contracts. Stored OPEN rows are
+    left out of both lists.
+    """
+    try:
+        history = stored_history(deps.positions.list_all())
+    except Exception:  # noqa: BLE001
+        history = []
+    live, err = await load_live_positions(_scanner_broker(deps))
+    return history, live, err
+
+
 def make_dashboard_router(deps: "WebDeps") -> APIRouter:
     # All dashboard + data routes require auth (when a password is configured).
     router = APIRouter(dependencies=[Depends(require_auth)])
@@ -142,7 +173,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
 
     @router.get("/api/stats")
     async def api_stats() -> dict:
-        positions = deps.positions.list_all()
+        history, live, pos_err = await _current_book(deps)
+        positions = history + live
         orders = _orders()
         decisions = deps.decisions.recent(1000)
         real_only = False
@@ -162,27 +194,43 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             "resolved_count": wk["resolved_count"],
             "win_rate": wk["win_rate"],
         }
+        if pos_err:
+            stats["positions_error"] = pos_err
+            stats["open_count"] = 0
+            stats["unrealized_pnl"] = 0.0
         return stats
 
     @router.get("/api/positions")
     async def api_positions() -> dict:
-        positions = deps.positions.list_all()
+        live, err = await load_live_positions(_scanner_broker(deps))
+        md = _scanner_md(deps)
+        priced: list[tuple] = []
+        for pos in live:
+            quote = await attach_quote(pos, md)
+            priced.append((pos, quote))
+        positions = [pos for pos, _quote in priced]
         quotes = await load_underlying_quotes(deps, positions)
+        # Decisions are not joined. A rule label is whatever the current config
+        # matches on this read, so a removed name like dte-close cannot appear.
         rows = position_rows(
-            positions, _orders(), deps.decisions.recent(1000),
+            positions, _orders(), [],
             real_only=False,
             underlying_quotes=quotes,
         )
-        for row in rows:
-            # Same dollars the card already shows. Does not recompute P&L.
+        today = ny_today()
+        rules = deps.settings.rules
+        for row, (pos, quote) in zip(rows, priced):
+            row["dte"] = (pos.expiration - today).days
+            row["rule"] = fresh_rule_label(pos, rules, quote)
             row["pnl_pct"] = card_pnl_percent(
                 row.get("unrealized_pnl"), row.get("credit_received"), row.get("quantity"),
             )
         return {
             "positions": rows,
-            "plan": holding_plan(deps.settings.rules),
+            "error": err,
+            "plan": holding_plan(rules),
             # Live profit-target arm (a fraction). The gauge tick uses this; null when that rule is off.
-            "profit_pct": live_profit_pct(deps.settings.rules),
+            "profit_pct": live_profit_pct(rules),
         }
 
     @router.get("/api/decisions")
@@ -710,10 +758,15 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 ) if deps.trade_journal is not None else None
             except Exception:  # noqa: BLE001
                 flywheel = None
+            live: list = []
             try:
-                pos_all = deps.positions.list_all()  # fetched once, shared by stats + exposure
+                # Closed history can stay in the brief's P&L. Open contracts come
+                # from this broker read. A failed read contributes none.
+                history, live, _pos_err = await _current_book(deps)
+                pos_all = history + live
             except Exception:  # noqa: BLE001
                 pos_all = []
+                live = []
             try:
                 from ..services.stats import compute_stats
                 stats = compute_stats(pos_all, _orders(),
@@ -740,15 +793,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 setup_accuracy = None
             risk_profiles = dict(getattr(sc, "last_risk_profile", {}) or {}) if sc else None
 
-            # Open short options (for the management + assignment-capacity reads) and total buying
-            # power across accounts. Drop paper positions in live mode.
-            try:
-                open_positions = [p for p in pos_all
-                                  if str(getattr(getattr(p, "status", None), "value",
-                                                 getattr(p, "status", None))).upper() in ("OPEN", "CLOSING")
-                                  ]
-            except Exception:  # noqa: BLE001
-                open_positions = []
+            # Open short options are the broker read above. Stored OPEN rows are not used.
+            open_positions = live
             total_bp = sum(a.get("buying_power", 0) or 0
                            for a in accounts if "error" not in a) or None
 
@@ -837,9 +883,11 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         from ..domain.enums import Direction, OptionType
         clock = dict(getattr(sc, "last_cc_clock", {}) or {}) if sc else {}
         covered: dict[str, int] = {}
-        for p in deps.positions.list_open():
-            if p.direction is Direction.SHORT and p.option_type is OptionType.CALL:
-                covered[p.underlying] = covered.get(p.underlying, 0) + p.quantity
+        held, err = await load_live_positions(_scanner_broker(deps))
+        if not err:
+            for p in held:
+                if p.direction is Direction.SHORT and p.option_type is OptionType.CALL:
+                    covered[p.underlying] = covered.get(p.underlying, 0) + p.quantity
         return {"holdings": [{
             "symbol": h.symbol, "shares": h.quantity, "average_cost": h.average_cost,
             "coverable": int(h.quantity // 100), "covered": covered.get(h.symbol, 0),

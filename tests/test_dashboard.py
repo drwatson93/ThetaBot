@@ -17,7 +17,7 @@ from agentic.services.stats import compute_stats, position_pnl, position_rows
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from tests.fakes import OrderStore
+from tests.fakes import OrderStore, PaperBroker
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -114,12 +114,10 @@ def test_dashboard_endpoints(tmp_path):
     assert set(wk) == {"since", "realized_pnl", "wins", "losses", "resolved_count", "win_rate"}
     assert wk["resolved_count"] <= stats["resolved_count"]  # window is a subset of all-time
 
-    rows = client.get("/api/positions").json()["positions"]
-    assert rows[0]["outcome"] == "win" and rows[0]["rule"] == "profit-50"
-    # No scanner / market data in this fixture — field is present, quote is genuinely unavailable.
-    assert rows[0]["underlying_price"] is None
-    assert rows[0]["underlying_price_source"] is None
-    assert rows[0]["underlying_price_as_of"] is None
+    body = client.get("/api/positions").json()
+    # No broker on this app. The stored closed row is not served as a position.
+    assert body["positions"] == []
+    assert body["error"] == "No broker is connected."
 
     decs = client.get("/api/decisions").json()["decisions"]
     assert decs[0]["rule_name"] == "profit-50"
@@ -254,6 +252,11 @@ def _pos_app(tmp_path, pos, scanner=None):
     audit = AuditStore(db)
     positions = PositionStore(db)
     positions.upsert(pos)
+    if scanner is None:
+        scanner = SimpleNamespace(market_data=None, last_context={}, last_scan_at=None)
+    if getattr(scanner, "broker", None) is None:
+        held = [pos] if pos.status in (PositionStatus.OPEN, PositionStatus.CLOSING) else []
+        scanner.broker = PaperBroker(seed_positions=held)
     deps = WebDeps(
         settings=Settings(mode="paper"), signals=SignalStore(db),
         killswitch=KillSwitch(db, audit), approval_gate=None, audit=audit,
@@ -298,22 +301,23 @@ def test_api_positions_underlying_price_falls_back_to_last_scan(tmp_path):
 
 
 def test_api_positions_underlying_price_null_when_quote_unavailable(tmp_path):
-    """Closed-off-watchlist (and quote errors) stay null — never invent a stock last."""
+    """A live contract with a failed equity quote stays null — never invent a stock last."""
     md = _FakeRobinhoodMD({}, boom=True)
     client = _pos_app(
-        tmp_path, _pos("AAPL260622C00250000", PositionStatus.CLOSED, 2.0),
+        tmp_path, _pos("AAPL260622C00250000", PositionStatus.OPEN, 2.0, mark=1.0),
         scanner=SimpleNamespace(market_data=md, last_context={}, last_scan_at=None),
     )
     r = client.get("/api/positions")
     assert r.status_code == 200
+    assert r.json()["error"] is None
     row = r.json()["positions"][0]
     assert row["underlying_price"] is None
     assert row["underlying_price_source"] is None
-    assert md.calls == []  # closed + not in last_context → no live fetch
+    assert md.calls == ["AAPL"]
 
 
-def test_api_positions_closed_still_listed_gets_live_quote(tmp_path):
-    """Closed rows still in last-scan context get the live last, not only the scan close."""
+def test_api_positions_does_not_list_a_stored_closed_contract(tmp_path):
+    """A closed row left in the positions table is not a position the broker holds."""
     md = _FakeRobinhoodMD({"AAPL": 180.25})
     client = _pos_app(
         tmp_path, _pos("AAPL260622P00250000", PositionStatus.CLOSED, 2.0, opt=OptionType.PUT),
@@ -322,10 +326,10 @@ def test_api_positions_closed_still_listed_gets_live_quote(tmp_path):
             last_context={"AAPL": UnderlyingContext(symbol="AAPL", price=179.0)},
         ),
     )
-    row = client.get("/api/positions").json()["positions"][0]
-    assert row["underlying_price"] == 180.25
-    assert row["underlying_price_source"] == "robinhood"
-    assert md.calls == ["AAPL"]
+    body = client.get("/api/positions").json()
+    assert body["positions"] == []
+    assert body["error"] is None
+    assert md.calls == []
 
 
 def test_robinhood_get_underlying_price_uses_equity_last():

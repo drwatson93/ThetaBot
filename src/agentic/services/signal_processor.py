@@ -61,6 +61,7 @@ class SignalProcessor:
     ):
         self.settings = settings
         self.signals = signals
+        # Constructor shape is unchanged. Matches use the list passed to process_pending.
         self.positions = positions
         self.decisions = decisions
         self.executor = executor
@@ -69,10 +70,23 @@ class SignalProcessor:
         self.matcher = matcher or SignalMatcher(
             base_requires_approval=_signal_base_approval(settings)
         )
+        self._cycle_positions = None
 
-    async def process_pending(self) -> int:
+    async def process_pending(self, open_positions: list | None = None) -> int:
+        """Match NEW signals against the contracts the caller just read.
+
+        The monitor passes the broker book, including an empty one. This does
+        not read the positions table. Omitting the list matches nothing.
+        """
         # Re-read the rule before every signal. A batch that starts enabled must
         # not close the rest if tv-signal is turned off halfway through.
+        self._cycle_positions = open_positions
+        try:
+            return await self._process_pending_body()
+        finally:
+            self._cycle_positions = None
+
+    async def _process_pending_body(self) -> int:
         new = self.signals.list_by_status(SignalStatus.NEW)
         for sig in new:
             rule = _enabled_signal_rule(self.settings)
@@ -118,7 +132,7 @@ class SignalProcessor:
             )
             return
 
-        open_positions = self.positions.list_open()
+        open_positions = [] if self._cycle_positions is None else self._cycle_positions
         matches = self.matcher.match(sig, open_positions)
         if not matches:
             self.signals.set_status(sig.id, SignalStatus.NO_MATCH)

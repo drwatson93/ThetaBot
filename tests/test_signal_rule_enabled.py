@@ -79,7 +79,7 @@ async def test_enabled_signal_rule_routes_and_disabled_does_not(tmp_path, requir
         tmp_path, enabled=True, requires_approval=requires_approval,
     )
     _queue(signals, "live-1")
-    await processor.process_pending()
+    await processor.process_pending(processor.positions.list_open())
     # A match is recorded. Nothing is sent to an executor or an approval gate.
     assert len(decisions.recent()) == 1
     assert executor.closes == []
@@ -88,7 +88,7 @@ async def test_enabled_signal_rule_routes_and_disabled_does_not(tmp_path, requir
     # Hot edit on the shared Settings object, after the processor was built.
     settings.rules = [_rule(enabled=False, requires_approval=requires_approval)]
     queued = _queue(signals, "while-off")
-    await processor.process_pending()
+    await processor.process_pending(processor.positions.list_open())
     assert executor.closes == []
     assert gate.requests == []
     assert len(decisions.recent()) == 1
@@ -96,13 +96,13 @@ async def test_enabled_signal_rule_routes_and_disabled_does_not(tmp_path, requir
 
     # Re-enable must not replay the signal that arrived while the rule was off.
     settings.rules = [_rule(enabled=True, requires_approval=requires_approval)]
-    await processor.process_pending()
+    await processor.process_pending(processor.positions.list_open())
     assert len(decisions.recent()) == 1
     assert executor.closes == []
     assert gate.requests == []
 
     _queue(signals, "after-on")
-    await processor.process_pending()
+    await processor.process_pending(processor.positions.list_open())
     assert len(decisions.recent()) == 2
     assert executor.closes == []
     assert gate.requests == []
@@ -141,7 +141,7 @@ async def test_webhook_expire_is_not_replayed_if_reenabled_before_process(tmp_pa
     assert audit.latest(AuditEventType.SIGNAL, source="webhook")["payload"]["reason"] == "signal_rule_disabled"
 
     settings.rules = [_rule(enabled=True, requires_approval=False)]
-    await processor.process_pending()
+    await processor.process_pending(processor.positions.list_open())
     assert decisions.recent() == []
     assert executor.closes == []
     assert gate.requests == []
@@ -152,7 +152,7 @@ async def test_webhook_expire_is_not_replayed_if_reenabled_before_process(tmp_pa
     )
     assert live.status_code == 202
     assert live.json()["status"] == "queued"
-    await processor.process_pending()
+    await processor.process_pending(processor.positions.list_open())
     assert len(decisions.recent()) == 1
     assert executor.closes == []
     assert gate.requests == []
@@ -173,7 +173,7 @@ async def test_disable_mid_batch_expires_the_rest(tmp_path):
     processor._process_one = _record_then_disable
     _queue(signals, "batch-1")
     _queue(signals, "batch-2")
-    await processor.process_pending()
+    await processor.process_pending(processor.positions.list_open())
     assert executor.closes == []
     assert len(decisions.recent()) == 1
     assert gate.requests == []

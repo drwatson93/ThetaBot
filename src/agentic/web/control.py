@@ -164,8 +164,15 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         cumulative + AI narrative) WITHOUT sending it — for previewing on demand."""
         from ..services.reporting import render_weekly
 
+        from ..services.live_positions import load_live_positions
+        broker = getattr(deps.scanner, "broker", None) if deps.scanner is not None else None
+        live = []
+        if broker is not None:
+            found, err = await load_live_positions(broker)
+            if not err:
+                live = found
         title, body = await render_weekly(
-            deps.settings, deps.positions, deps.orders, deps.decisions)
+            deps.settings, deps.positions, deps.orders, deps.decisions, live=live)
         return JSONResponse({"title": title, "body": body})
 
     @router.post("/purge-stale", dependencies=[Depends(require_owner)])

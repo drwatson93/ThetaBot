@@ -28,10 +28,9 @@ async def test_monitor_syncs_positions_into_store(wiring):
     monitor = MonitorLoop(settings, broker, PaperMarketData(), positions, audit, killswitch)
     seen = await monitor.run_once()
     assert seen == 2
-    stored = positions.list_open()
-    assert len(stored) == 2
-    # Quote enrichment populated marks.
-    assert all(p.current_mark is not None for p in stored)
+    # The broker book is not copied into the positions table.
+    assert positions.list_open() == []
+    assert positions.list_all() == []
     # A POLL audit event was recorded.
     assert any(e["event_type"] == "POLL" for e in audit.recent())
 

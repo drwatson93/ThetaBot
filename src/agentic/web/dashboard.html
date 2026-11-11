@@ -797,6 +797,12 @@ function gaugeTargetLeft(arm){
 async function loadHolds(){
   const data = await getJSON("/api/positions");
   const positions = data.positions || [];
+  if(data.error){
+    $("pos-count").textContent = "positions unavailable";
+    $("holds").innerHTML = `<div class="pos-item muted">${esc(data.error)}</div>`;
+    $("resolved").innerHTML = "";
+    return;
+  }
   const plan = data.plan ? data.plan : "No exit rules are on";
   const open = positions.filter(p => p.status==="OPEN" || p.status==="CLOSING");
   const done = positions.filter(p => !(p.status==="OPEN" || p.status==="CLOSING"));
@@ -1139,8 +1145,11 @@ async function loadTables(){
     <td class="num">${r.closes?pct(r.wins/r.closes):"—"}</td>
     <td class="num ${cls(r.realized_pnl)}">${money(r.realized_pnl)}</td></tr>`).join("")
     || `<tr><td colspan="5" class="muted">no closed positions yet</td></tr>`;
-  const {positions} = await getJSON("/api/positions");
-  $("positions").querySelector("tbody").innerHTML = positions.map(p => {
+  const posData = await getJSON("/api/positions");
+  const positions = posData.positions || [];
+  $("positions").querySelector("tbody").innerHTML = (posData.error
+    ? `<tr><td colspan="10" class="muted">${esc(posData.error)}</td></tr>`
+    : "") + positions.map(p => {
     const pnl = p.realized_pnl!=null?p.realized_pnl:p.unrealized_pnl;
     return `<tr><td title="${esc(p.occ_symbol)}">${esc(p.underlying)} ${p.strike}${esc(p.option_type[0])}</td>
       <td class="muted">${esc(p.strategy.replace(/_/g," ").toLowerCase())}</td><td>${esc(p.status)}</td>

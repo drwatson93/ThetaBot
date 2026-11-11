@@ -1,4 +1,9 @@
-"""Position repository — upsert by OCC symbol, list, mark closed."""
+"""Position table repository.
+
+Live positions are not read or written here. The monitor and ``/api/positions``
+take the book from the broker on each read. This module stays so an existing
+database still opens and old rows do not crash startup. The table is not dropped.
+"""
 from __future__ import annotations
 
 from datetime import date, datetime

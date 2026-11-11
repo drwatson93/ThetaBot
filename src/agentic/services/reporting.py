@@ -132,10 +132,15 @@ async def _weekly_ai_summary(settings, week_stats, cumulative, rows) -> str | No
         return None
 
 
-async def render_weekly(settings, positions, orders, decisions, *, days: int = 7) -> tuple[str, str]:
+async def render_weekly(settings, positions, orders, decisions, *, days: int = 7,
+                        live=None) -> tuple[str, str]:
     """Build the weekly report (trailing window + cumulative context + AI narrative). Shared by the
-    scheduled loop and the /control/preview-weekly endpoint so both render identically."""
-    pos = positions.list_all()
+    scheduled loop and the /control/preview-weekly endpoint so both render identically.
+
+    ``live`` is the current broker book. Stored OPEN rows are not part of the report.
+    """
+    from .live_positions import stored_history
+    pos = stored_history(positions.list_all()) + list(live or [])
     ords = orders.list_all() if orders is not None else []
     decs = decisions.recent(1000)
     real = False
@@ -166,13 +171,21 @@ class ReportingLoop:
     def stop(self) -> None:
         self._stop.set()
 
-    def _gather(self):
-        pos = self.positions.list_all()
+    async def _gather(self):
+        from .live_positions import load_live_positions, stored_history
+        live = []
+        broker = getattr(self.scanner, "broker", None) if self.scanner else None
+        if broker is not None:
+            found, err = await load_live_positions(broker)
+            if not err:
+                live = found
+        pos = stored_history(self.positions.list_all()) + live
         orders = self.orders.list_all() if self.orders is not None else []
         decisions = self.decisions.recent(1000)
         real = False
         return (compute_stats(pos, orders, decisions, real_only=real),
-                position_rows(pos, orders, decisions, real_only=real))
+                position_rows(pos, orders, decisions, real_only=real),
+                live)
 
     async def run(self) -> None:
         cfg = self.settings.reporting
@@ -186,7 +199,7 @@ class ReportingLoop:
                 cur = now_et()
                 if should_send_daily(cur, self._last_daily,
                                      cfg.daily_digest_hour, cfg.daily_digest_minute):
-                    stats, rows = self._gather()
+                    stats, rows, _live = await self._gather()
                     tv_health = None
                     if self.tv_indicators is not None:
                         from .tv_health import build_tv_health
@@ -206,8 +219,10 @@ class ReportingLoop:
                     log.info("Sent daily digest.")
                 if should_send_weekly(cur, self._last_weekly, cfg.weekly_report_weekday,
                                       cfg.daily_digest_hour, cfg.daily_digest_minute):
+                    _stats, _rows, live = await self._gather()
                     title, msg = await render_weekly(
-                        self.settings, self.positions, self.orders, self.decisions)
+                        self.settings, self.positions, self.orders, self.decisions,
+                        live=live)
                     await self.notifier.send(title, msg)
                     self._last_weekly = cur.date()
                     log.info("Sent weekly report.")

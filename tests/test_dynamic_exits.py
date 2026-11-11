@@ -1,4 +1,4 @@
-"""Dynamic exits: fixed & trailing take-profit, stop-loss triggers, monitor peak tracking."""
+"""Dynamic exits: fixed & trailing take-profit, stop-loss triggers."""
 from datetime import date, timedelta
 
 import pytest
@@ -131,7 +131,8 @@ class _MD:
 
 
 @pytest.mark.asyncio
-async def test_monitor_tracks_and_persists_peak(tmp_path):
+async def test_monitor_does_not_store_peak_between_reads(tmp_path):
+    """Profit high-water marks are not kept. Each read prices the broker book fresh."""
     db = Database(tmp_path / "m.db")
     positions = PositionStore(db)
     audit = AuditStore(db)
@@ -139,13 +140,11 @@ async def test_monitor_tracks_and_persists_peak(tmp_path):
     mon = MonitorLoop(Settings(broker="paper", market_data="paper"),
                       _Broker([pos]), _MD(_q(ask=0.5, bid=0.45)), positions, audit,
                       KillSwitch(db, audit))
-    await mon.run_once()                       # 50% captured
-    assert positions.get_by_occ(pos.occ_symbol).peak_profit_pct == pytest.approx(0.5)
-
-    # A worse quote next cycle must NOT lower the high-water mark.
-    mon.market_data = _MD(_q(ask=0.7, bid=0.65))   # only 30%
     await mon.run_once()
-    assert positions.get_by_occ(pos.occ_symbol).peak_profit_pct == pytest.approx(0.5)
+    mon.market_data = _MD(_q(ask=0.7, bid=0.65))
+    await mon.run_once()
+    assert positions.list_all() == []
+    assert pos.peak_profit_pct == 0.0
 
 
 # --- rules hot-reload ---------------------------------------------------------------------------
