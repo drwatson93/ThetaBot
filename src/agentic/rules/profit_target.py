@@ -43,10 +43,15 @@ class ProfitTargetRule(Rule):
             return None
 
         # Trailing: arm at profit_pct, then exit on a trail_gap pullback from the peak.
+        # The print that first reaches the arm is the high so far, so it does not
+        # close. A later pullback does, and the exit stays floored at the arm.
         gap = float(self.params.get("trail_gap", 0.20))
-        peak = max(position.peak_profit_pct or 0.0, cur)
+        prior = float(position.peak_profit_pct or 0.0)
+        peak = max(prior, cur)
         if peak < arm:
             return None  # not yet armed — let it keep working
+        if prior < arm:
+            return None
         exit_level = max(arm, peak - gap)
         if cur <= exit_level:
             reason = (f"Trailing take-profit: captured ~{cur * 100:.0f}% pulled back to exit "

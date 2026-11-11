@@ -9,6 +9,7 @@ import shutil
 import subprocess
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,11 +17,12 @@ from fastapi.testclient import TestClient
 from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import OptionType, PositionStatus, Strategy
 from agentic.domain.models import Position
+from agentic.marketdata.base import PaperMarketData
 from agentic.services.killswitch import KillSwitch
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
 from agentic.store.decisions import DecisionStore
-from tests.fakes import OrderStore
+from tests.fakes import OrderStore, PaperBroker
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
 from agentic.web.app import WebDeps, create_app
@@ -277,6 +279,12 @@ def _client(tmp_path, monkeypatch, settings: Settings, positions: list[Position]
         positions=store,
         orders=OrderStore(db),
         decisions=DecisionStore(db),
+        scanner=SimpleNamespace(
+            broker=PaperBroker(seed_positions=list(positions)),
+            market_data=PaperMarketData(),
+            last_context={},
+            last_scan_at=None,
+        ),
     )
     return TestClient(create_app(deps)), settings
 

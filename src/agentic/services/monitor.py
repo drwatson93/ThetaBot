@@ -1,9 +1,9 @@
-"""Monitor loop: poll broker positions, refresh quotes, (Phase 1+) evaluate rules.
+"""Monitor loop: read the broker book, price it, and evaluate exit rules.
 
-Phase 0 scope: read-only. Each cycle it pulls open positions from the broker (source of
-truth), enriches each with a fresh market-data quote, upserts into the position store,
-and records a POLL audit event. The rules engine / executor hooks are wired but optional
-so later phases plug in without restructuring the loop.
+Each cycle reads option positions from the broker and keeps only contracts the
+broker still reports that have not expired in America/New_York. Quotes and exit
+rules run on that list. Nothing is written to the positions table. A failed
+broker read skips the cycle instead of reusing a stored book.
 """
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ from ..notify.trade_alerts import build_exit_alert_payload, sanitize_error
 from ..store.audit import AuditStore
 from ..store.decisions import DecisionStore
 from ..store.positions import PositionStore
-from ..rules.base import cost_to_close, profit_captured
 from .killswitch import KillSwitch
+from .live_positions import attach_quote, fetch_broker_positions, select_live, snapshot
 from .market_hours import is_market_hours, is_order_window
 
 log = logging.getLogger("agentic.monitor")
@@ -60,6 +60,9 @@ class MonitorLoop:
         self.roll_manager = roll_manager
         self.trade_alerts = trade_alerts
         self._stop = asyncio.Event()
+        # High-water profit for trailing exits. Keyed by contract, kept only
+        # while that contract is in the current book, and never written down.
+        self._peaks: dict[str, float] = {}
 
     async def run(self) -> None:
         log.info("Monitor loop started (broker=%s).", self.broker.capabilities().name)
@@ -82,46 +85,33 @@ class MonitorLoop:
                 pass
 
     async def run_once(self) -> int:
-        """One monitor cycle. Returns the number of open positions seen."""
+        """One monitor cycle. Returns how many held, unexpired contracts were seen.
+
+        A failed broker read raises so the loop skips this cycle. The positions
+        table is not consulted and not updated.
+        """
         # Pick up any live rule edits (settings API) without a restart.
         if self.rules_engine is not None:
             self.rules_engine.refresh(self.settings.rules)
+        # Raises LiveBookError when the read fails. Do not substitute stored rows.
         broker_positions = await self._open_positions()
-        _caps = getattr(self.broker, "capabilities", None)
-        src_is_paper = _caps().is_paper if _caps is not None else None  # tag positions' source
-        # Rule evaluation and rolls only run during the regular session: after hours nothing is
-        # actionable (orders can't fill, quotes are stale), so evaluating would only emit alerts
-        # you can't act on — and repeat them every closed-market poll. Position sync still runs
-        # around the clock so the dashboard and reconcile stay current.
-        market_open = is_market_hours()
+        live = [snapshot(p) for p in select_live(broker_positions)]
+        # Exit rules run only in the order window. After hours a quote is not
+        # actionable, and repeating the alert every closed-market poll is noise.
         can_trade = is_order_window(start=self.settings.trading_start)
-        for pos in broker_positions:
-            quote = await self.market_data.get_quote(pos)
-            if quote is not None:
-                pos.current_bid = quote.bid
-                pos.current_ask = quote.ask
-                pos.current_mark = quote.mark
-                if quote.delta is not None:
-                    pos.delta = quote.delta
-                if quote.iv is not None:
-                    pos.iv = quote.iv
-            # High- and low-water marks of captured profit: MFE (for trailing take-profit exits) and
-            # MAE (worst drawdown, journaled at resolution to study exit timing).
-            cur = profit_captured(pos, cost_to_close(quote))
-            if cur is not None:
-                pos.peak_profit_pct = max(pos.peak_profit_pct or 0.0, cur)
-                pos.trough_profit_pct = min(pos.trough_profit_pct or 0.0, cur)
-            pos.is_paper = src_is_paper
-            self.positions.upsert(pos)
-
-            # Phase 1+: evaluate rules; persist new decisions and notify (regular session only).
+        held: set[str] = set()
+        for pos in live:
+            quote = await attach_quote(pos, self.market_data)
+            self._note_peak(pos, quote)
+            held.add(pos.occ_symbol)
             if can_trade and self.rules_engine is not None and self.decisions is not None:
                 await self._evaluate(pos, quote)
+        self._peaks = {occ: peak for occ, peak in self._peaks.items() if occ in held}
 
         self.audit.record(
             AuditEventType.POLL,
-            {"open_positions": len(broker_positions),
-             "symbols": [p.occ_symbol for p in broker_positions],
+            {"open_positions": len(live),
+             "symbols": [p.occ_symbol for p in live],
              "paused": self.killswitch.is_paused()},
             source="monitor",
         )
@@ -134,26 +124,20 @@ class MonitorLoop:
             if not signal_rule_is_enabled(self.settings):
                 self.signal_processor._expire_while_disabled()
             elif can_trade:
-                await self.signal_processor.process_pending()
+                await self.signal_processor.process_pending(live)
 
-        log.info("Polled %d open position(s).", len(broker_positions))
-        return len(broker_positions)
+        log.info("Polled %d open position(s).", len(live))
+        return len(live)
 
     async def _open_positions(self):
-        """Open option positions for this cycle.
+        """Open option positions for this cycle, from the broker only.
 
         The Robinhood session resolves ``account_number`` (config, else get_accounts)
         and the monitor passes that value through. A book with no resolver (the test
         paper book) is read with no argument. A blank account is not sent to
-        ``get_option_positions``; the broker has already logged that once.
+        ``get_option_positions``. A failed read raises; it does not return stored rows.
         """
-        ensure = getattr(self.broker, "ensure_account_number", None)
-        if ensure is None:
-            return await self.broker.get_open_positions()
-        acct = await ensure()
-        if not str(acct or "").strip():
-            return []
-        return await self.broker.get_open_positions(acct)
+        return await fetch_broker_positions(self.broker)
 
     async def _evaluate(self, pos, quote) -> None:
         """Evaluate rules for one position.
@@ -167,7 +151,7 @@ class MonitorLoop:
         """
         decisions = self._one_close_per_tick(pos, self.rules_engine.evaluate(pos, quote))
         for decision in decisions:
-            action = self._admit_decision(decision)
+            action = self._admit_decision(decision, pos)
             if action == "skip":
                 continue
             if action == "new":
@@ -251,9 +235,34 @@ class MonitorLoop:
         ).fetchone()
         return row is not None
 
-    def _admit_decision(self, decision) -> str:
+    def _note_peak(self, pos, quote) -> None:
+        """Remember this contract's best profit for a later pullback.
+
+        The value lives on the in-memory snapshot for this poll and in
+        ``_peaks`` for the next one. The broker object and the positions table
+        are left alone. A contract that leaves the book is dropped by the caller.
+        """
+        from ..rules.base import cost_to_close, profit_captured
+
+        prior = self._peaks.get(pos.occ_symbol, 0.0)
+        pos.peak_profit_pct = prior
+        current = profit_captured(pos, cost_to_close(quote))
+        if current is not None:
+            self._peaks[pos.occ_symbol] = max(prior, float(current))
+
+    def _admit_decision(self, decision, pos=None) -> str:
         """``new`` if this is the first time today, ``retry`` if the prior close failed,
-        ``skip`` if it was already handled."""
+        ``skip`` if it was already handled.
+
+        A decision stored before the live book used a stable contract id still
+        counts: the same contract, rule, and day is not alerted again.
+        """
+        if pos is not None and self.decisions is not None:
+            day = decision.dedup_key.rsplit(":", 1)[-1]
+            if self.decisions.same_contract_today(
+                pos.occ_symbol, decision.rule_type.value, day, decision.position_id,
+            ):
+                return "skip"
         if self.decisions.insert_if_new(decision):
             return "new"
         if self.executor is None or decision.notify_only or decision.requires_approval:

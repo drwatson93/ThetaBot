@@ -73,6 +73,28 @@ class DecisionStore:
         )
         self.db.conn.commit()
 
+    def same_contract_today(
+        self, occ_symbol: str, rule_type: str, day: str, position_id: str,
+    ) -> bool:
+        """True when today already has this rule for this contract under another id.
+
+        Older rows used a random position id. The live book uses a stable one,
+        so the dedup key alone would alert the same contract again after deploy.
+        """
+        if not occ_symbol or not rule_type or not day:
+            return False
+        row = self.db.conn.execute(
+            """SELECT 1 FROM decisions d
+               JOIN positions p ON p.id = d.position_id
+               WHERE p.occ_symbol = ?
+                 AND d.rule_type = ?
+                 AND d.position_id != ?
+                 AND substr(d.created_at, 1, 10) = ?
+               LIMIT 1""",
+            (occ_symbol, rule_type, position_id, day),
+        ).fetchone()
+        return row is not None
+
     def get_by_dedup(self, dedup_key: str) -> CloseDecision | None:
         r = self.db.conn.execute(
             "SELECT * FROM decisions WHERE dedup_key = ?", (dedup_key,)

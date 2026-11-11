@@ -164,9 +164,22 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         cumulative + AI narrative) WITHOUT sending it — for previewing on demand."""
         from ..services.reporting import render_weekly
 
+        from ..services.live_positions import BROKER_UNAVAILABLE, load_live_positions
+        broker = getattr(deps.scanner, "broker", None) if deps.scanner is not None else None
+        live = []
+        if broker is None:
+            err = BROKER_UNAVAILABLE
+        else:
+            found, err = await load_live_positions(broker)
+            if not err:
+                live = found
         title, body = await render_weekly(
-            deps.settings, deps.positions, deps.orders, deps.decisions)
-        return JSONResponse({"title": title, "body": body})
+            deps.settings, deps.positions, deps.orders, deps.decisions,
+            live=live, positions_error=err)
+        payload = {"title": title, "body": body}
+        if err:
+            payload["positions_error"] = err
+        return JSONResponse(payload)
 
     @router.post("/purge-stale", dependencies=[Depends(require_owner)])
     async def purge_stale() -> JSONResponse:
@@ -263,9 +276,16 @@ def make_control_router(deps: "WebDeps") -> APIRouter:
         }
         try:
             out["buying_power"] = await broker.get_buying_power()
-            out["open_positions"] = len(await broker.get_open_positions())
         except Exception as exc:  # noqa: BLE001 — surface the live-read failure verbatim
             out["read_error"] = f"{type(exc).__name__}: {exc}"
+            return JSONResponse(out)
+        from ..services.live_positions import load_live_positions
+        live, err = await load_live_positions(broker)
+        if err:
+            out["ok"] = False
+            out["read_error"] = err
+        else:
+            out["open_positions"] = len(live)
         return JSONResponse(out)
 
     @router.get("/legacy-archive", dependencies=[Depends(require_owner)])

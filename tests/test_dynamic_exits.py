@@ -1,4 +1,4 @@
-"""Dynamic exits: fixed & trailing take-profit, stop-loss triggers, monitor peak tracking."""
+"""Dynamic exits: fixed & trailing take-profit, stop-loss triggers."""
 from datetime import date, timedelta
 
 import pytest
@@ -65,8 +65,14 @@ def test_trailing_closes_on_pullback():
 
 def test_trailing_floors_at_arm():
     r = ProfitTargetRule("trail", False, {"profit_pct": 0.5, "trailing": True, "trail_gap": 0.2})
-    # peak == arm (50%), currently 50% -> exit level floors at 50% -> close (never below arm)
+    # peak was already the arm. Sitting on that floor closes; the exit never books less.
     assert r.evaluate(_pos(credit=1.0, peak=0.5), _q(ask=0.5, bid=0.45), NOW) is not None
+
+
+def test_trailing_first_print_at_arm_holds():
+    r = ProfitTargetRule("trail", False, {"profit_pct": 0.5, "trailing": True, "trail_gap": 0.2})
+    # The first print that reaches the arm is the high so far. It does not exit.
+    assert r.evaluate(_pos(credit=1.0, peak=0.0), _q(ask=0.5, bid=0.45), NOW) is None
 
 
 # --- stop-loss ----------------------------------------------------------------------------------
@@ -131,7 +137,8 @@ class _MD:
 
 
 @pytest.mark.asyncio
-async def test_monitor_tracks_and_persists_peak(tmp_path):
+async def test_monitor_does_not_store_peak_between_reads(tmp_path):
+    """The high-water mark stays in the monitor, not the table or the broker object."""
     db = Database(tmp_path / "m.db")
     positions = PositionStore(db)
     audit = AuditStore(db)
@@ -139,13 +146,67 @@ async def test_monitor_tracks_and_persists_peak(tmp_path):
     mon = MonitorLoop(Settings(broker="paper", market_data="paper"),
                       _Broker([pos]), _MD(_q(ask=0.5, bid=0.45)), positions, audit,
                       KillSwitch(db, audit))
-    await mon.run_once()                       # 50% captured
-    assert positions.get_by_occ(pos.occ_symbol).peak_profit_pct == pytest.approx(0.5)
-
-    # A worse quote next cycle must NOT lower the high-water mark.
-    mon.market_data = _MD(_q(ask=0.7, bid=0.65))   # only 30%
     await mon.run_once()
-    assert positions.get_by_occ(pos.occ_symbol).peak_profit_pct == pytest.approx(0.5)
+    mon.market_data = _MD(_q(ask=0.7, bid=0.65))
+    await mon.run_once()
+    assert positions.list_all() == []
+    assert pos.peak_profit_pct == 0.0
+
+
+@pytest.mark.asyncio
+async def test_trailing_across_two_quotes_exits_on_the_pullback(tmp_path):
+    """A print at the arm holds. A later rise, then a pullback past the trail, exits.
+
+    The peak is remembered across polls in this process and dropped when the
+    contract leaves the book. Nothing is written to the positions table.
+    """
+    from agentic.config import RuleConfig
+    from agentic.rules.engine import RulesEngine
+    from agentic.store.decisions import DecisionStore
+
+    rules = [RuleConfig(
+        name="trail", rule_type="PROFIT_TARGET", enabled=True, requires_approval=False,
+        params={"profit_pct": 0.5, "trailing": True, "trail_gap": 0.2},
+    )]
+    db = Database(tmp_path / "trail.db")
+    positions = PositionStore(db)
+    decisions = DecisionStore(db)
+    audit = AuditStore(db)
+    pos = _pos(credit=1.0)
+    quotes = [
+        _q(ask=0.50, bid=0.45),  # exactly the 50% arm
+        _q(ask=0.20, bid=0.15),  # 80%, still running
+        _q(ask=0.45, bid=0.40),  # 55% <= 80% - 20%, floored at the arm
+    ]
+
+    class _Step:
+        def __init__(self):
+            self.n = 0
+
+        async def get_quote(self, _position):
+            quote = quotes[self.n]
+            self.n += 1
+            return quote
+
+    broker = _Broker([pos])
+    mon = MonitorLoop(
+        Settings(broker="paper", market_data="paper", rules=rules),
+        broker, _Step(), positions, audit, KillSwitch(db, audit),
+        rules_engine=RulesEngine.from_configs(rules), decisions=decisions,
+    )
+    await mon.run_once()
+    assert decisions.recent() == []
+    await mon.run_once()
+    assert decisions.recent() == []
+    await mon.run_once()
+    found = decisions.recent()
+    assert len(found) == 1 and "Trailing" in found[0].reason
+    assert positions.list_all() == []
+    assert pos.peak_profit_pct == 0.0
+    assert pos.occ_symbol in mon._peaks
+    broker._p = []
+    await mon.run_once()
+    assert mon._peaks == {}
 
 
 # --- rules hot-reload ---------------------------------------------------------------------------

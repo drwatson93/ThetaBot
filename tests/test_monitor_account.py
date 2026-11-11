@@ -13,6 +13,7 @@ from agentic.brokers.robinhood_mcp import RobinhoodMCPBroker
 from agentic.config import Settings
 from agentic.marketdata.base import PaperMarketData
 from agentic.services.killswitch import KillSwitch
+from agentic.services.live_positions import LiveBookError
 from agentic.services.monitor import MonitorLoop
 from agentic.store.audit import AuditStore
 from agentic.store.db import Database
@@ -49,8 +50,10 @@ async def test_monitor_passes_account_number_to_option_positions(tmp_path):
 async def test_monitor_skips_positions_when_account_missing(tmp_path):
     broker = RecordingReadBroker("")
     monitor, audit, settings = _monitor(tmp_path, broker)
-    assert await monitor.run_once() == 0
-    assert await monitor.run_once() == 0
+    with pytest.raises(LiveBookError):
+        await monitor.run_once()
+    with pytest.raises(LiveBookError):
+        await monitor.run_once()
     assert broker.position_calls == []
     assert broker_degraded(settings, broker) is True
     assert [e for e in audit.recent() if e["event_type"] == "ERROR"] == []
@@ -129,9 +132,11 @@ async def test_missing_account_logs_once_and_skips_the_tool(monkeypatch, caplog,
     monkeypatch.setattr(broker, "_call_tool", fake)
     monitor, audit, settings = _monitor(tmp_path, broker)
     with caplog.at_level(logging.WARNING, logger="agentic.brokers.rh_mcp"):
-        assert await monitor.run_once() == 0
+        with pytest.raises(LiveBookError):
+            await monitor.run_once()
         assert await broker.get_buying_power() == 0.0
-        assert await monitor.run_once() == 0
+        with pytest.raises(LiveBookError):
+            await monitor.run_once()
     assert seen == ["get_accounts"]
     warnings = [r.getMessage() for r in caplog.records if "unset" in r.getMessage()]
     assert warnings == [
