@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -827,3 +827,69 @@ def test_migration_backfills_one_scorecard_row_per_alert(tmp_path):
     assert cards["a1"]["pnl"] is None and cards["a1"]["graded_at"] is None
     assert cards["b1"]["strike"] == 25.0 and cards["b1"]["contracts"] == 1
     assert cards["b1"]["mid"] == pytest.approx(0.80) and cards["b1"]["taken"] == 0
+
+
+@pytest.mark.asyncio
+async def test_scanner_ignores_expired_contract_the_broker_still_returns(tmp_path, _open, monkeypatch):
+    """An expired short the broker has not dropped is not sized, quoted, or exit-alerted."""
+    now = datetime(2026, 6, 15, 16, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: now)
+    expired = date(2026, 6, 14)
+    occ = "XYZ260614P00040000"
+    quote = OptionContractQuote(
+        occ_symbol=occ, underlying="XYZ", option_id=None, option_type="put",
+        strike=40.0, expiration=expired, bid=0.10, ask=0.10, mark=0.10,
+        delta=-0.25, iv=0.35, open_interest=400, volume=80,
+    )
+    quote.as_of = now
+    seen: list[str] = []
+
+    class _Seen(_Chain):
+        async def get_chain(self, underlying: str):
+            seen.append(underlying)
+            return await super().get_chain(underlying)
+
+        async def get_quote(self, position):
+            seen.append("quote:" + str(getattr(position, "occ_symbol", "")))
+            return await super().get_quote(position)
+
+    book = _Book(
+        buying_power=50_000, account_value=50_000,
+        positions=[_short(occ, "XYZ", "put", 40, expired, 1, average=1.0, credit=1.0)],
+    )
+    db = Database(tmp_path / "expired-book.db")
+    audit = AuditStore(db)
+    scanner = OpportunityScanner(
+        Settings(mode="paper", broker="paper", market_data="paper",
+                 entry={"enabled": True, "watchlist": []}),
+        book, _Seen({"XYZ": [quote]}), EntryDecisionStore(db), _NoOrders(),
+        audit, KillSwitch(db, audit), alerts=AlertStore(db),
+    )
+    assert await scanner.run_once() == 0
+    assert scanner.alerts.all() == []
+    assert seen == []
+    assert book.writes == []
+
+
+@pytest.mark.asyncio
+async def test_alert_expiry_and_scorecard_use_new_york(tmp_path, _open, monkeypatch):
+    """02:00 UTC on Nov 12 is still Nov 11 in New York, so a Nov 11 alert is not expired."""
+    early = datetime(2026, 11, 12, 2, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: early)
+    book = _Book(buying_power=10_000, account_value=10_000, positions=[])
+    scanner = _scanner(tmp_path, book, {}, [])
+    alert_id = scanner.alerts.insert_if_new({
+        "dedup_key": "CSP:XYZ:XYZ261111P00010000",
+        "kind": "CSP", "underlying": "XYZ", "occ_symbol": "XYZ261111P00010000",
+        "strike": 10.0, "expiration": "2026-11-11", "contracts": 1, "premium": 0.40,
+    })
+    scanner.alerts.set_delivery_status(alert_id, "sent")
+    assert await scanner.run_once() == 0
+    assert scanner.alerts.all()[0]["status"] == "stale"
+    assert scanner.alerts.scorecards()[0]["graded_at"] is None
+
+    later = datetime(2026, 11, 12, 6, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("agentic.services.scanner.utcnow", lambda: later)
+    assert await scanner.run_once() == 0
+    assert scanner.alerts.all()[0]["status"] == "expired"
+    assert scanner.alerts.scorecards()[0]["graded_at"] is not None

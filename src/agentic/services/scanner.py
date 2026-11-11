@@ -30,6 +30,7 @@ from .alert_score import (
 )
 from .risk_breaker import apply_sector_cap
 from .killswitch import KillSwitch
+from .live_positions import LiveBookError, fetch_broker_positions, ny_today, select_live
 from .market_hours import is_market_hours, is_order_window
 from ..entry.context import UnderlyingContext, build_context, passes_underlying_gates
 from ..entry.regime import MarketRegime, build_market_regime, classify_move
@@ -292,7 +293,13 @@ class OpportunityScanner:
         account_value = await book.get_account_value()
         self.last_breaker = None
 
-        open_positions = await book.get_open_positions()
+        try:
+            raw_positions = await fetch_broker_positions(book)
+        except LiveBookError:
+            return self._skip_scan("broker position read failed")
+        # Same filter as /api/positions, judged on this scan's clock in New York
+        # so a frozen test clock and a live clock agree on what is expired.
+        open_positions = select_live(raw_positions, today=ny_today(utcnow()))
         holdings = await book.get_equity_positions()
         self.last_holdings = holdings
         # Buying power is the broker figure. Nothing is subtracted for a tax reserve.
@@ -656,8 +663,9 @@ class OpportunityScanner:
         A stale alert that matches before expiry is taken and flagged late.
         After the expiration date, anything not already taken is expired.
         Exit alerts are left alone: a held short is not proof the exit was taken.
+        The expiration date is a New York calendar date.
         """
-        today = now.date()
+        today = ny_today(now)
         for alert in self.alerts.open_entries():
             try:
                 exp = date.fromisoformat(str(alert["expiration"])[:10])
@@ -682,8 +690,11 @@ class OpportunityScanner:
                 log.info("alert %s stale", alert.get("dedup_key"))
 
     async def _grade_scorecard(self, now, notes: list[str]) -> None:
-        """Grade each expired entry once. Taken uses the fill; the rest use the mid."""
-        today = now.date()
+        """Grade each expired entry once. Taken uses the fill; the rest use the mid.
+
+        Expiration is a New York calendar date, matching alert expiry.
+        """
+        today = ny_today(now)
         spots: dict[str, float | None] = {}
         for alert in self.alerts.ungraded_entries():
             try:

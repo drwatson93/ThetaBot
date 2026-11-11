@@ -46,20 +46,25 @@ def _money(x: float | None) -> str:
 
 
 def build_daily_digest(*, stats: dict, rows: list[dict], scanner, mode: str,
-                       tv_health: dict | None = None, degraded: bool = False) -> tuple[str, str]:
+                       tv_health: dict | None = None, degraded: bool = False,
+                       positions_error: str | None = None) -> tuple[str, str]:
     open_rows = [r for r in rows if r["status"] in ("OPEN", "CLOSING")]
     scanned = getattr(scanner, "last_scan_at", None) if scanner else None
     err = getattr(scanner, "last_error", None) if scanner else None
     n_cand = len(getattr(scanner, "last_candidates", []) or []) if scanner else 0
     n_skip = len(getattr(scanner, "last_skips", []) or []) if scanner else 0
+    open_label = "positions unavailable" if positions_error else f"{len(open_rows)} open"
+    unrealized = "unavailable" if positions_error else _money(stats.get("unrealized_pnl"))
 
     lines = []
     if degraded:
         lines.append("!! ON SIMULATOR — live mode but the broker fell back to PAPER. NOT trading "
                      "your real account. Fix the RH connection.")
+    if positions_error:
+        lines.append(f"Positions unavailable: {positions_error}")
     lines += [
-        f"Mode {mode} · {len(open_rows)} open · realized {_money(stats.get('realized_pnl'))} "
-        f"· unrealized {_money(stats.get('unrealized_pnl'))}",
+        f"Mode {mode} · {open_label} · realized {_money(stats.get('realized_pnl'))} "
+        f"· unrealized {unrealized}",
         f"Resolved {stats.get('resolved_count', 0)} "
         f"(W {stats.get('wins', 0)}/L {stats.get('losses', 0)}"
         + (f", {stats['win_rate']*100:.0f}% win" if stats.get('win_rate') is not None else "")
@@ -80,12 +85,13 @@ def build_daily_digest(*, stats: dict, rows: list[dict], scanner, mode: str,
             lines.append(tv_line)
     if err:
         lines.append(f"! last error: {str(err)[:120]}")
-    title = f"Bot daily · {len(open_rows)} open · {_money(stats.get('realized_pnl'))} realized"
+    title = f"Bot daily · {open_label} · {_money(stats.get('realized_pnl'))} realized"
     return title, "\n".join(lines)
 
 
 def build_weekly_report(*, stats: dict, rows: list[dict], cumulative: dict | None = None,
-                        ai_summary: str | None = None, days: int = 7) -> tuple[str, str]:
+                        ai_summary: str | None = None, days: int = 7,
+                        positions_error: str | None = None) -> tuple[str, str]:
     """Weekly rollup. ``stats`` is the trailing-window rollup (realized/W-L/by-rule scoped to the
     last ``days``); ``cumulative`` (optional) adds a since-inception context line; ``ai_summary``
     (optional) appends a short AI-written narrative. Open/unrealized reflect the current book.
@@ -102,7 +108,10 @@ def build_weekly_report(*, stats: dict, rows: list[dict], cumulative: dict | Non
     ]
     for b in stats.get("by_rule", [])[:6]:
         lines.append(f"  {b['rule']}: {b['closes']}x, {b['wins']}W, {_money(b['realized_pnl'])}")
-    lines.append(f"Open now: {len(open_rows)} · unrealized {_money(stats.get('unrealized_pnl'))}")
+    if positions_error:
+        lines.append(f"Positions unavailable: {positions_error}")
+    else:
+        lines.append(f"Open now: {len(open_rows)} · unrealized {_money(stats.get('unrealized_pnl'))}")
     if cumulative is not None:
         cwr = cumulative.get("win_rate")
         lines.append(
@@ -133,7 +142,7 @@ async def _weekly_ai_summary(settings, week_stats, cumulative, rows) -> str | No
 
 
 async def render_weekly(settings, positions, orders, decisions, *, days: int = 7,
-                        live=None) -> tuple[str, str]:
+                        live=None, positions_error: str | None = None) -> tuple[str, str]:
     """Build the weekly report (trailing window + cumulative context + AI narrative). Shared by the
     scheduled loop and the /control/preview-weekly endpoint so both render identically.
 
@@ -150,7 +159,8 @@ async def render_weekly(settings, positions, orders, decisions, *, days: int = 7
     rows = position_rows(pos, ords, decs, real_only=real)
     ai_summary = await _weekly_ai_summary(settings, week_stats, cumulative, rows)
     return build_weekly_report(
-        stats=week_stats, rows=rows, cumulative=cumulative, ai_summary=ai_summary, days=days)
+        stats=week_stats, rows=rows, cumulative=cumulative, ai_summary=ai_summary, days=days,
+        positions_error=positions_error)
 
 
 class ReportingLoop:
@@ -172,10 +182,12 @@ class ReportingLoop:
         self._stop.set()
 
     async def _gather(self):
-        from .live_positions import load_live_positions, stored_history
+        from .live_positions import BROKER_UNAVAILABLE, load_live_positions, stored_history
         live = []
         broker = getattr(self.scanner, "broker", None) if self.scanner else None
-        if broker is not None:
+        if broker is None:
+            err = BROKER_UNAVAILABLE
+        else:
             found, err = await load_live_positions(broker)
             if not err:
                 live = found
@@ -185,7 +197,7 @@ class ReportingLoop:
         real = False
         return (compute_stats(pos, orders, decisions, real_only=real),
                 position_rows(pos, orders, decisions, real_only=real),
-                live)
+                live, err)
 
     async def run(self) -> None:
         cfg = self.settings.reporting
@@ -199,7 +211,7 @@ class ReportingLoop:
                 cur = now_et()
                 if should_send_daily(cur, self._last_daily,
                                      cfg.daily_digest_hour, cfg.daily_digest_minute):
-                    stats, rows, _live = await self._gather()
+                    stats, rows, _live, pos_err = await self._gather()
                     tv_health = None
                     if self.tv_indicators is not None:
                         from .tv_health import build_tv_health
@@ -213,16 +225,16 @@ class ReportingLoop:
                         degraded = broker_degraded(self.settings, brk)
                     title, msg = build_daily_digest(
                         stats=stats, rows=rows, scanner=self.scanner, mode="read-only",
-                        tv_health=tv_health, degraded=degraded)
+                        tv_health=tv_health, degraded=degraded, positions_error=pos_err)
                     await self.notifier.send(title, msg)
                     self._last_daily = cur.date()
                     log.info("Sent daily digest.")
                 if should_send_weekly(cur, self._last_weekly, cfg.weekly_report_weekday,
                                       cfg.daily_digest_hour, cfg.daily_digest_minute):
-                    _stats, _rows, live = await self._gather()
+                    _stats, _rows, live, pos_err = await self._gather()
                     title, msg = await render_weekly(
                         self.settings, self.positions, self.orders, self.decisions,
-                        live=live)
+                        live=live, positions_error=pos_err)
                     await self.notifier.send(title, msg)
                     self._last_weekly = cur.date()
                     log.info("Sent weekly report.")

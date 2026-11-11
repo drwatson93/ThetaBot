@@ -121,8 +121,6 @@
     border-radius:var(--r-sm);font-size:13px}
   .plan .ic{color:var(--accent);flex:none;font-weight:700}
   .plan b{font-weight:650}
-  .resolved{padding:10px 16px;font-size:12.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 14px;border-top:1px solid var(--line)}
-  .resolved b{color:var(--ink);font-weight:600}
   /* stat stack */
   .stat{padding:13px 16px;display:flex;align-items:baseline;justify-content:space-between;gap:10px}
   .stat + .stat{border-top:1px solid var(--line)}
@@ -312,7 +310,6 @@
       <section class="card2">
         <div class="card-h"><h2>What you're holding</h2><span class="count" id="pos-count"></span></div>
         <div id="holds"></div>
-        <div id="resolved"></div>
       </section>
       <section class="card2">
         <div class="card-h"><h2>Recent activity</h2></div>
@@ -800,12 +797,10 @@ async function loadHolds(){
   if(data.error){
     $("pos-count").textContent = "positions unavailable";
     $("holds").innerHTML = `<div class="pos-item muted">${esc(data.error)}</div>`;
-    $("resolved").innerHTML = "";
     return;
   }
   const plan = data.plan ? data.plan : "No exit rules are on";
   const open = positions.filter(p => p.status==="OPEN" || p.status==="CLOSING");
-  const done = positions.filter(p => !(p.status==="OPEN" || p.status==="CLOSING"));
   $("pos-count").textContent = open.length + (open.length===1?" open position":" open positions");
   $("holds").innerHTML = open.map(p => {
     const put = p.option_type === "PUT";
@@ -838,13 +833,6 @@ async function loadHolds(){
       <div class="plan"><span class="ic">→</span><div><b>Plan:</b> ${esc(plan)}</div></div>
     </article>`;
   }).join("") || `<div class="pos-item muted">No open positions right now. The scanner will open new cash-secured puts when a watchlist name meets your rules.</div>`;
-
-  const recent = done.slice(0,4).map(p => {
-    const pnl = p.realized_pnl;
-    const w = p.outcome==="win"||p.status==="EXPIRED";
-    return `<span>${esc(p.underlying)} $${p.strike}${p.option_type[0]} <b class="${w?"pos-c":(p.outcome==="loss"?"neg":"")}">${esc(p.status.toLowerCase())}${pnl!=null?" "+money(pnl):""}</b></span>`;
-  }).join("");
-  $("resolved").innerHTML = recent ? `<div class="resolved"><span class="muted">Recently closed:</span> ${recent}</div>` : "";
 }
 
 /* ---- this week ---- */
@@ -858,8 +846,8 @@ async function loadWeek(){
   $("week").innerHTML = `
     <div class="stat"><span class="k">Realized P&L</span><span class="v ${cls(s.realized_pnl)}">${money(s.realized_pnl)}</span></div>
     <div class="stat"><span class="k">Win rate</span><span class="v">${pct(s.win_rate)} <span class="badge">${s.wins} / ${s.resolved_count}</span></span></div>
-    <div class="stat"><span class="k">Open now</span><span class="v">${s.open_count}</span></div>
-    <div class="stat"><span class="k">Unrealized</span><span class="v ${cls(s.unrealized_pnl)}">${money(s.unrealized_pnl)}</span></div>
+    <div class="stat"><span class="k">Open now</span><span class="v">${s.positions_error ? esc(s.positions_error) : s.open_count}</span></div>
+    <div class="stat"><span class="k">Unrealized</span><span class="v ${s.positions_error ? "" : cls(s.unrealized_pnl)}">${s.positions_error ? "—" : money(s.unrealized_pnl)}</span></div>
     <div class="wkline"><span class="wklbl">This week</span> ${wk}</div>`;
 }
 
@@ -1172,14 +1160,18 @@ async function loadTables(){
     <td class="num">${c.open_interest!=null?c.open_interest:"—"}</td>
     <td class="num">${c.iv_rank!=null?c.iv_rank.toFixed(0):"—"}</td></tr>`).join("")
     || `<tr><td colspan="8" class="muted">no scan yet</td></tr>`;
-  const {holdings} = await getJSON("/api/holdings");
-  $("holdings").querySelector("tbody").innerHTML = holdings.map(h => {
+  const holdData = await getJSON("/api/holdings");
+  const holdings = holdData.holdings || [];
+  const holdErr = holdData.positions_error;
+  const holdNote = holdErr ? `<tr><td colspan="6" class="muted">${esc(holdErr)}</td></tr>` : "";
+  $("holdings").querySelector("tbody").innerHTML = holdNote + holdings.map(h => {
     const c = h.clock || {};
     const note = (c.days_held != null ? (c.below_basis_allowed ? `<span class="pill mixed">stuck ${c.days_held}d · calls below basis allowed</span>`
          : `<span class="pill">held ${c.days_held}d${c.under_water ? " · under water" : ""}${c.clock_days ? " · clock " + c.clock_days + "d" : ""}</span>`) : "");
+    const covered = holdErr || h.covered==null ? "—" : `${h.covered}/${h.coverable}`;
     return `<tr><td>${esc(h.symbol)}</td><td class="num">${h.shares}</td><td class="num">${money(h.average_cost)}</td>
-    <td class="num">${h.coverable}</td><td class="num">${h.covered}/${h.coverable}</td><td>${note}</td></tr>`; }).join("")
-    || `<tr><td colspan="6" class="muted">no share holdings</td></tr>`;
+    <td class="num">${h.coverable}</td><td class="num">${covered}</td><td>${note}</td></tr>`; }).join("")
+    || (holdErr ? holdNote : `<tr><td colspan="6" class="muted">no share holdings</td></tr>`);
   const cc = await getJSON("/api/cc-candidates");
   $("cc-candidates").querySelector("tbody").innerHTML = cc.candidates.map(c => `<tr>
     <td>${esc(c.underlying)} ${c.strike}C</td><td class="num">${c.strike}</td><td class="num">${c.dte}</td>

@@ -14,16 +14,18 @@ from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import (
     DecisionStatus, Direction, OptionType, PositionStatus, RuleType, Strategy,
 )
-from agentic.domain.models import CloseDecision, Position
+from agentic.domain.models import CloseDecision, Position, utcnow
 from agentic.marketdata.base import PaperMarketData
 from agentic.rules.engine import RulesEngine
 from agentic.services.killswitch import KillSwitch
 from agentic.services.live_positions import (
     BROKER_READ_FAILED,
     LiveBookError,
+    load_live_positions,
     ny_today,
     select_live,
     stable_position_id,
+    still_held,
 )
 from agentic.services.monitor import MonitorLoop
 from agentic.store.audit import AuditStore
@@ -77,10 +79,14 @@ def _pos(occ, underlying, expiration, *, mark=0.20, credit=1.00,
 class Book:
     """Fake broker. ``rows`` is replaced between reads. ``fail`` raises."""
 
-    def __init__(self, rows, *, fail=False):
+    def __init__(self, rows, *, fail=False, connected=None, roles=None):
         self.rows = list(rows)
         self.fail = fail
         self.reads = 0
+        if connected is not None:
+            self._connected = connected
+        if roles is not None:
+            self._roles = roles
 
     async def get_open_positions(self):
         self.reads += 1
@@ -296,3 +302,114 @@ async def test_nothing_is_persisted_between_two_reads(tmp_path, monkeypatch):
     loaded = PositionStore(reopened).list_all()
     assert [p.occ_symbol for p in loaded] == [stale.occ_symbol]
     reopened.close()
+
+
+def test_datetime_expiration_compares_its_date():
+    exp = datetime(2026, 11, 11, 21, 0, tzinfo=timezone.utc)
+    pos = _pos("XYZ261111P00010000", "XYZ", NY_DAY)
+    pos.expiration = exp
+    assert still_held(pos, today=date(2026, 11, 11)) is True
+    assert still_held(pos, today=date(2026, 11, 12)) is False
+
+
+def test_disconnected_broker_is_not_an_empty_book(tmp_path, monkeypatch):
+    """A session that is down returns no rows from the broker method. That is an error."""
+    _pin_ny(monkeypatch)
+    held = _pos("XYZ261218P00010000", "XYZ", NY_DAY + timedelta(days=20), mark=0.40)
+    db = Database(tmp_path / "down.db")
+    broker = Book([held], connected=False)
+    body = _app(db, Settings(mode="paper", rules=_rules()), broker).get("/api/positions").json()
+    assert body["positions"] == []
+    assert body["error"] == BROKER_READ_FAILED
+    assert broker.reads == 0
+
+
+def test_missing_list_positions_is_not_an_empty_book(tmp_path, monkeypatch):
+    _pin_ny(monkeypatch)
+    held = _pos("XYZ261218P00010000", "XYZ", NY_DAY + timedelta(days=20), mark=0.40)
+    db = Database(tmp_path / "role.db")
+    broker = Book([held], connected=True, roles={"option_chain": "get_option_chains"})
+    body = _app(db, Settings(mode="paper", rules=_rules()), broker).get("/api/positions").json()
+    assert body["positions"] == []
+    assert body["error"] == BROKER_READ_FAILED
+    assert broker.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnected_broker_skips_the_monitor_cycle(tmp_path, monkeypatch):
+    _pin_ny(monkeypatch)
+    held = _pos("XYZ261218P00010000", "XYZ", NY_DAY + timedelta(days=20), mark=0.20)
+    db = Database(tmp_path / "down-mon.db")
+    store = PositionStore(db)
+    decisions = DecisionStore(db)
+    audit = AuditStore(db)
+    broker = Book([held], connected=False)
+    monitor = MonitorLoop(
+        Settings(mode="paper", rules=_rules()), broker, PaperMarketData(), store, audit,
+        KillSwitch(db, audit), rules_engine=RulesEngine.from_configs(_rules()),
+        decisions=decisions,
+    )
+    with pytest.raises(LiveBookError):
+        await monitor.run_once()
+    assert decisions.recent() == []
+    assert broker.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_connected_empty_book_is_a_successful_read():
+    class Empty:
+        _connected = True
+        _roles = {"list_positions": "get_option_positions"}
+
+        async def ensure_account_number(self, account_number=None):
+            return "ACCT-XYZ"
+
+        async def get_open_positions(self, account_number=None):
+            assert account_number == "ACCT-XYZ"
+            return []
+
+    live, err = await load_live_positions(Empty())
+    assert live == [] and err is None
+
+
+def test_unexpected_position_error_is_an_empty_book(tmp_path, monkeypatch):
+    async def boom(_broker):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr("agentic.web.dashboard.load_live_positions", boom)
+    db = Database(tmp_path / "boom.db")
+    body = _app(db, Settings(mode="paper", rules=_rules()), Book([])).get("/api/positions").json()
+    assert body["positions"] == []
+    assert body["error"] == BROKER_READ_FAILED
+
+
+@pytest.mark.asyncio
+async def test_prior_decision_for_the_same_contract_is_not_repeated(tmp_path, monkeypatch):
+    """A decision stored under the old random id still dedups the stable id."""
+    _pin_ny(monkeypatch)
+    held = _pos("XYZ261218P00010000", "XYZ", NY_DAY + timedelta(days=20), mark=0.20)
+    db = Database(tmp_path / "dedup.db")
+    store = PositionStore(db)
+    store.upsert(held)
+    decisions = DecisionStore(db)
+    day = utcnow().date().isoformat()
+    decisions.insert_if_new(CloseDecision(
+        position_id=held.id, rule_name="profit-target", rule_type=RuleType.PROFIT_TARGET,
+        reason="already alerted", requires_approval=False,
+        dedup_key=f"{held.id}:PROFIT_TARGET:{day}", status=DecisionStatus.PROPOSED,
+    ))
+    fresh = _pos(held.occ_symbol, "XYZ", held.expiration, mark=0.20)
+    other = _pos("ABC261218P00010000", "ABC", held.expiration, mark=0.20)
+    audit = AuditStore(db)
+    monitor = MonitorLoop(
+        Settings(mode="paper", rules=_rules()), Book([fresh, other]), PaperMarketData(),
+        store, audit, KillSwitch(db, audit),
+        rules_engine=RulesEngine.from_configs(_rules()), decisions=decisions,
+    )
+    await monitor.run_once()
+    rows = decisions.recent()
+    # ABC is new, so it alerts. XYZ was already alerted under the old id.
+    assert len(rows) == 2
+    assert held.id in {row.position_id for row in rows}
+    assert stable_position_id(held.occ_symbol) not in {row.position_id for row in rows}
+    assert stable_position_id(other.occ_symbol) in {row.position_id for row in rows}

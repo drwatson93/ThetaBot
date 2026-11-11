@@ -60,6 +60,9 @@ class MonitorLoop:
         self.roll_manager = roll_manager
         self.trade_alerts = trade_alerts
         self._stop = asyncio.Event()
+        # High-water profit for trailing exits. Keyed by contract, kept only
+        # while that contract is in the current book, and never written down.
+        self._peaks: dict[str, float] = {}
 
     async def run(self) -> None:
         log.info("Monitor loop started (broker=%s).", self.broker.capabilities().name)
@@ -96,10 +99,14 @@ class MonitorLoop:
         # Exit rules run only in the order window. After hours a quote is not
         # actionable, and repeating the alert every closed-market poll is noise.
         can_trade = is_order_window(start=self.settings.trading_start)
+        held: set[str] = set()
         for pos in live:
             quote = await attach_quote(pos, self.market_data)
+            self._note_peak(pos, quote)
+            held.add(pos.occ_symbol)
             if can_trade and self.rules_engine is not None and self.decisions is not None:
                 await self._evaluate(pos, quote)
+        self._peaks = {occ: peak for occ, peak in self._peaks.items() if occ in held}
 
         self.audit.record(
             AuditEventType.POLL,
@@ -144,7 +151,7 @@ class MonitorLoop:
         """
         decisions = self._one_close_per_tick(pos, self.rules_engine.evaluate(pos, quote))
         for decision in decisions:
-            action = self._admit_decision(decision)
+            action = self._admit_decision(decision, pos)
             if action == "skip":
                 continue
             if action == "new":
@@ -228,9 +235,34 @@ class MonitorLoop:
         ).fetchone()
         return row is not None
 
-    def _admit_decision(self, decision) -> str:
+    def _note_peak(self, pos, quote) -> None:
+        """Remember this contract's best profit for a later pullback.
+
+        The value lives on the in-memory snapshot for this poll and in
+        ``_peaks`` for the next one. The broker object and the positions table
+        are left alone. A contract that leaves the book is dropped by the caller.
+        """
+        from ..rules.base import cost_to_close, profit_captured
+
+        prior = self._peaks.get(pos.occ_symbol, 0.0)
+        pos.peak_profit_pct = prior
+        current = profit_captured(pos, cost_to_close(quote))
+        if current is not None:
+            self._peaks[pos.occ_symbol] = max(prior, float(current))
+
+    def _admit_decision(self, decision, pos=None) -> str:
         """``new`` if this is the first time today, ``retry`` if the prior close failed,
-        ``skip`` if it was already handled."""
+        ``skip`` if it was already handled.
+
+        A decision stored before the live book used a stable contract id still
+        counts: the same contract, rule, and day is not alerted again.
+        """
+        if pos is not None and self.decisions is not None:
+            day = decision.dedup_key.rsplit(":", 1)[-1]
+            if self.decisions.same_contract_today(
+                pos.occ_symbol, decision.rule_type.value, day, decision.position_id,
+            ):
+                return "skip"
         if self.decisions.insert_if_new(decision):
             return "new"
         if self.executor is None or decision.notify_only or decision.requires_approval:

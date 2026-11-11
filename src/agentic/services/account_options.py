@@ -16,6 +16,7 @@ from typing import Any
 from ..config import Settings
 from ..domain.enums import Direction, OptionType
 from ..entry.screener import EntryCandidate, screen_candidates
+from .live_positions import fetch_broker_positions, select_live
 from .screening import screen_universe
 
 log = logging.getLogger("agentic.account_options")
@@ -71,7 +72,8 @@ async def account_option_suggestions(
     # existing short calls per underlying, so we never suggest covering shares already written
     short_calls: dict[str, int] = {}
     try:
-        for p in await broker.get_open_positions(account_number):
+        held = select_live(await fetch_broker_positions(broker, account_number))
+        for p in held:
             if p.direction is Direction.SHORT and p.option_type is OptionType.CALL:
                 short_calls[p.underlying] = short_calls.get(p.underlying, 0) + p.quantity
     except Exception as exc:  # noqa: BLE001 — advisory; never break on a positions read

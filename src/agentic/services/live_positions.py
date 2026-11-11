@@ -63,7 +63,9 @@ def still_held(position, today: date | None = None) -> bool:
     if qty <= 0:
         return False
     exp = getattr(position, "expiration", None)
-    if isinstance(exp, datetime) or not isinstance(exp, date):
+    if isinstance(exp, datetime):
+        exp = exp.date()
+    if not isinstance(exp, date):
         return False
     today = ny_today() if today is None else today
     return exp >= today
@@ -90,23 +92,46 @@ def snapshot(position: Position) -> Position:
     return replace(position, id=stable_position_id(position.occ_symbol))
 
 
-async def fetch_broker_positions(broker) -> list:
+def _read_blocked(broker) -> str | None:
+    """Why this session cannot return a book, before ``get_open_positions`` is called.
+
+    A disconnected Robinhood session and a session with no ``list_positions``
+    tool both return ``[]``. That is a failed read, not an empty book. A paper
+    book has neither flag and is read normally.
+    """
+    if getattr(broker, "_connected", None) is False:
+        return "failed"
+    roles = getattr(broker, "_roles", None)
+    if isinstance(roles, dict) and not roles.get("list_positions"):
+        return "failed"
+    return None
+
+
+async def fetch_broker_positions(broker, account_number: str | None = None) -> list:
     """Read option positions from the broker. Raises LiveBookError on failure.
 
-    A book with no account resolver is called with no argument. A Robinhood
-    session resolves ``account_number`` first. A blank account is an empty book,
-    not a failed read. This never consults the positions table.
+    A book with no account resolver is called with no argument, or with
+    ``account_number`` when the caller already has one. A Robinhood session
+    resolves the account first. A blank account, a disconnected session, and a
+    missing ``list_positions`` tool are failed reads. An account that resolves
+    and returns no rows is an empty book. This never consults the positions table.
     """
     if broker is None:
         raise LiveBookError("unavailable")
+    blocked = _read_blocked(broker)
+    if blocked:
+        raise LiveBookError(blocked)
     ensure = getattr(broker, "ensure_account_number", None)
     try:
         if ensure is None:
-            raw = await broker.get_open_positions()
+            if account_number:
+                raw = await broker.get_open_positions(account_number)
+            else:
+                raw = await broker.get_open_positions()
         else:
-            acct = await ensure()
+            acct = await ensure(account_number)
             if not str(acct or "").strip():
-                return []
+                raise LiveBookError("failed")
             raw = await broker.get_open_positions(acct)
     except LiveBookError:
         raise
@@ -128,6 +153,9 @@ async def load_live_positions(broker) -> tuple[list[Position], str | None]:
     except LiveBookError as exc:
         if str(exc) == "unavailable":
             return [], BROKER_UNAVAILABLE
+        return [], BROKER_READ_FAILED
+    except Exception:
+        log.warning("live position read failed", exc_info=True)
         return [], BROKER_READ_FAILED
     return [snapshot(p) for p in select_live(raw)], None
 

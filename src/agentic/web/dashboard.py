@@ -13,6 +13,7 @@ nothing to bundle.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from typing import TYPE_CHECKING
@@ -23,6 +24,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from ..domain.models import utcnow
 from ..domain.order_pricing import public_close_pricing_fields, public_pricing_fields
 from ..services.live_positions import (
+    BROKER_READ_FAILED,
     attach_quote,
     fresh_rule_label,
     load_live_positions,
@@ -36,6 +38,8 @@ from .calc_page import CALC_PAGE
 
 if TYPE_CHECKING:
     from .app import WebDeps
+
+log = logging.getLogger("agentic.dashboard")
 
 
 def _alerts_status(deps: "WebDeps") -> dict:
@@ -196,42 +200,54 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         }
         if pos_err:
             stats["positions_error"] = pos_err
-            stats["open_count"] = 0
-            stats["unrealized_pnl"] = 0.0
+            stats["open_count"] = None
+            stats["unrealized_pnl"] = None
         return stats
 
     @router.get("/api/positions")
     async def api_positions() -> dict:
-        live, err = await load_live_positions(_scanner_broker(deps))
-        md = _scanner_md(deps)
-        priced: list[tuple] = []
-        for pos in live:
-            quote = await attach_quote(pos, md)
-            priced.append((pos, quote))
-        positions = [pos for pos, _quote in priced]
-        quotes = await load_underlying_quotes(deps, positions)
-        # Decisions are not joined. A rule label is whatever the current config
-        # matches on this read, so a removed name like dte-close cannot appear.
-        rows = position_rows(
-            positions, _orders(), [],
-            real_only=False,
-            underlying_quotes=quotes,
-        )
-        today = ny_today()
         rules = deps.settings.rules
-        for row, (pos, quote) in zip(rows, priced):
-            row["dte"] = (pos.expiration - today).days
-            row["rule"] = fresh_rule_label(pos, rules, quote)
-            row["pnl_pct"] = card_pnl_percent(
-                row.get("unrealized_pnl"), row.get("credit_received"), row.get("quantity"),
+        try:
+            live, err = await load_live_positions(_scanner_broker(deps))
+            md = _scanner_md(deps)
+            priced: list[tuple] = []
+            for pos in live:
+                quote = await attach_quote(pos, md)
+                priced.append((pos, quote))
+            positions = [pos for pos, _quote in priced]
+            quotes = await load_underlying_quotes(deps, positions)
+            # Decisions are not joined. A rule label is whatever the current config
+            # matches on this read, so a removed name like dte-close cannot appear.
+            rows = position_rows(
+                positions, _orders(), [],
+                real_only=False,
+                underlying_quotes=quotes,
             )
-        return {
-            "positions": rows,
-            "error": err,
-            "plan": holding_plan(rules),
-            # Live profit-target arm (a fraction). The gauge tick uses this; null when that rule is off.
-            "profit_pct": live_profit_pct(rules),
-        }
+            today = ny_today()
+            for row, (pos, quote) in zip(rows, priced):
+                exp = pos.expiration
+                if isinstance(exp, datetime):
+                    exp = exp.date()
+                row["dte"] = (exp - today).days
+                row["rule"] = fresh_rule_label(pos, rules, quote)
+                row["pnl_pct"] = card_pnl_percent(
+                    row.get("unrealized_pnl"), row.get("credit_received"), row.get("quantity"),
+                )
+            return {
+                "positions": rows,
+                "error": err,
+                "plan": holding_plan(rules),
+                # Live profit-target arm (a fraction). The gauge tick uses this; null when that rule is off.
+                "profit_pct": live_profit_pct(rules),
+            }
+        except Exception:
+            log.warning("position read failed", exc_info=True)
+            return {
+                "positions": [],
+                "error": BROKER_READ_FAILED,
+                "plan": holding_plan(rules),
+                "profit_pct": live_profit_pct(rules),
+            }
 
     @router.get("/api/decisions")
     async def api_decisions(limit: int = 100) -> dict:
@@ -759,14 +775,16 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             except Exception:  # noqa: BLE001
                 flywheel = None
             live: list = []
+            _pos_err = None
             try:
                 # Closed history can stay in the brief's P&L. Open contracts come
-                # from this broker read. A failed read contributes none.
+                # from this broker read. A failed read is named in the brief.
                 history, live, _pos_err = await _current_book(deps)
                 pos_all = history + live
             except Exception:  # noqa: BLE001
                 pos_all = []
                 live = []
+                _pos_err = _pos_err or BROKER_READ_FAILED
             try:
                 from ..services.stats import compute_stats
                 stats = compute_stats(pos_all, _orders(),
@@ -819,7 +837,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 tv_by_symbol=tv_by_symbol, regime=regime, news_by_symbol=news_by_symbol,
                 accounts=accounts, econ_events=econ_events, now=now, ai_analysis=ai_analysis,
                 open_positions=open_positions, total_buying_power=total_bp,
-                tier_proposals=(list(getattr(sc, "last_tier_proposals", []) or []) if sc else []))
+                tier_proposals=(list(getattr(sc, "last_tier_proposals", []) or []) if sc else []),
+                positions_error=_pos_err)
             out = {"title": title, "body": body, "created_at": now.isoformat(),
                    "has_ai": ai_analysis is not None, "id": None}
             # Persist every generation so the brief can be re-read from a phone later without
@@ -888,11 +907,15 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             for p in held:
                 if p.direction is Direction.SHORT and p.option_type is OptionType.CALL:
                     covered[p.underlying] = covered.get(p.underlying, 0) + p.quantity
-        return {"holdings": [{
+        body = {"holdings": [{
             "symbol": h.symbol, "shares": h.quantity, "average_cost": h.average_cost,
-            "coverable": int(h.quantity // 100), "covered": covered.get(h.symbol, 0),
+            "coverable": int(h.quantity // 100),
+            "covered": None if err else covered.get(h.symbol, 0),
             "clock": clock.get(h.symbol),
         } for h in holds]}
+        if err:
+            body["positions_error"] = err
+        return body
 
     @router.get("/api/tiers")
     async def api_tiers() -> dict:

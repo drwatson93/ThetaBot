@@ -18,6 +18,7 @@ from agentic.store.entry_decisions import EntryDecisionStore
 from tests.fakes import OrderStore
 from agentic.store.positions import PositionStore
 from agentic.store.signals import SignalStore
+from agentic.services.live_positions import select_live
 from agentic.web.app import WebDeps, create_app
 
 TOKEN = "test-secret-token"
@@ -61,7 +62,7 @@ def ctx(tmp_path, monkeypatch):
     client = TestClient(create_app(deps))
     return dict(client=client, signals=signals, decisions=decisions, positions=positions,
                 processor=signal_processor, occ=pos.occ_symbol, killswitch=killswitch,
-                entry_decisions=entry_decisions)
+                entry_decisions=entry_decisions, held=select_live([pos]))
 
 
 def test_brief_endpoint_renders_and_degrades(ctx):
@@ -122,7 +123,7 @@ async def test_signal_to_approval_to_execution(ctx):
     assert r.status_code == 202
 
     # 2. Monitor would call this each cycle; do it directly.
-    await ctx["processor"].process_pending(ctx["positions"].list_open())
+    await ctx["processor"].process_pending(ctx["held"])
 
     # 3. A decision is recorded. The processor does not ask for approval or place an order.
     pending = ctx["decisions"].list_by_status(DecisionStatus.PROPOSED)
@@ -141,7 +142,7 @@ async def test_reject_blocks_execution(ctx):
     client = ctx["client"]
     client.post("/webhook/tradingview",
                 json={"token": TOKEN, "action": "close", "symbol": "AAA", "alert_id": "x2"})
-    await ctx["processor"].process_pending(ctx["positions"].list_open())
+    await ctx["processor"].process_pending(ctx["held"])
     decision_id = ctx["decisions"].list_by_status(DecisionStatus.PROPOSED)[0].id
 
     rr = client.post(f"/control/reject/{decision_id}")
