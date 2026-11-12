@@ -5,14 +5,21 @@ a fixture only: live reads must not use it.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import date, datetime, timedelta, timezone
 
+import anyio
+import httpcore
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from agentic.brokers.base import BrokerCapabilities
+from agentic.brokers.robinhood_mcp import RobinhoodMCPBroker
 from agentic.config import RuleConfig, Settings
 from agentic.domain.enums import (
-    DecisionStatus, Direction, OptionType, PositionStatus, RuleType, Strategy,
+    AuditEventType, DecisionStatus, Direction, OptionType, PositionStatus, RuleType, Strategy,
 )
 from agentic.domain.models import CloseDecision, Position, utcnow
 from agentic.marketdata.base import PaperMarketData
@@ -21,6 +28,8 @@ from agentic.services.killswitch import KillSwitch
 from agentic.services.live_positions import (
     BROKER_READ_FAILED,
     LiveBookError,
+    fetch_broker_positions,
+    format_broker_failure,
     load_live_positions,
     ny_today,
     select_live,
@@ -413,3 +422,559 @@ async def test_prior_decision_for_the_same_contract_is_not_repeated(tmp_path, mo
     assert held.id in {row.position_id for row in rows}
     assert stable_position_id(held.occ_symbol) not in {row.position_id for row in rows}
     assert stable_position_id(other.occ_symbol) in {row.position_id for row in rows}
+
+
+def _empty_connect_group():
+    """ExceptionGroup wrapping httpx.ConnectError with an empty message.
+
+    ``ConnectError`` requires the message argument; ``""`` is that empty message.
+    """
+    return ExceptionGroup(
+        "unhandled errors in a TaskGroup",
+        [httpx.ConnectError("")],
+    )
+
+
+def _nested_closed_resource():
+    """Nested TaskGroup group: ClosedResourceError caused by an empty ConnectError."""
+    try:
+        raise httpx.ConnectError("")
+    except httpx.ConnectError as conn:
+        try:
+            raise anyio.ClosedResourceError() from conn
+        except anyio.ClosedResourceError as closed:
+            return ExceptionGroup(
+                "unhandled errors in a TaskGroup",
+                [ExceptionGroup("unhandled errors in a TaskGroup", [closed])],
+            )
+
+
+def _patch_sleep(monkeypatch):
+    slept: list[float] = []
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("agentic.services.live_positions.asyncio.sleep", _sleep)
+    return slept
+
+
+def test_format_empty_connect_error_names_the_type():
+    text = format_broker_failure(_empty_connect_group())
+    assert text == "ExceptionGroup -> ConnectError"
+    assert text != "failed"
+
+
+def test_format_nested_group_includes_closed_resource_and_connect_error():
+    text = format_broker_failure(_nested_closed_resource())
+    assert text == (
+        "ExceptionGroup -> ExceptionGroup -> ClosedResourceError -> ConnectError"
+    )
+    assert text != "failed"
+
+
+def test_format_sibling_connect_error_is_included():
+    exc = ExceptionGroup(
+        "unhandled errors in a TaskGroup",
+        [anyio.ClosedResourceError(), httpx.ConnectError("")],
+    )
+    assert format_broker_failure(exc) == (
+        "ExceptionGroup -> ClosedResourceError -> ConnectError"
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_failures_are_distinct_and_not_retried(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+
+    class Disconnected:
+        def __init__(self):
+            self.reads = 0
+            self._connected = False
+
+        async def get_open_positions(self, account_number=None):
+            self.reads += 1
+            return []
+
+    down = Disconnected()
+    with pytest.raises(LiveBookError, match="^broker disconnected$"):
+        await fetch_broker_positions(down)
+    assert down.reads == 0
+
+    class MissingTool:
+        _connected = True
+        _roles = {"option_chain": "get_option_chains"}
+
+        def __init__(self):
+            self.reads = 0
+
+        async def get_open_positions(self, account_number=None):
+            self.reads += 1
+            return []
+
+    missing = MissingTool()
+    with pytest.raises(LiveBookError, match="^list_positions tool missing$"):
+        await fetch_broker_positions(missing)
+    assert missing.reads == 0
+
+    class Blank:
+        _connected = True
+        _roles = {"list_positions": "get_option_positions"}
+
+        async def ensure_account_number(self, account_number=None):
+            return "   "
+
+        async def get_open_positions(self, account_number=None):
+            raise AssertionError("positions tool must not be called")
+
+    with pytest.raises(LiveBookError, match="^blank account$"):
+        await fetch_broker_positions(Blank())
+
+    class NoPayload:
+        async def get_open_positions(self):
+            return None
+
+    with pytest.raises(LiveBookError, match="^broker returned no payload$"):
+        await fetch_broker_positions(NoPayload())
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_connect_group_error_is_not_the_word_failed(monkeypatch, caplog):
+    _patch_sleep(monkeypatch)
+
+    class Boom:
+        def __init__(self):
+            self.reads = 0
+
+        async def get_open_positions(self):
+            self.reads += 1
+            raise _empty_connect_group()
+
+    broker = Boom()
+    with caplog.at_level(logging.WARNING, logger="agentic.live_positions"):
+        with pytest.raises(LiveBookError) as ei:
+            await fetch_broker_positions(broker)
+    text = str(ei.value)
+    assert text == "ExceptionGroup -> ConnectError"
+    assert text != "failed"
+    assert "ConnectError" in text
+    assert broker.reads == 2
+    assert "ConnectError" in caplog.text
+    assert "live position read failed:" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raise_error", [
+    _empty_connect_group,
+    lambda: httpcore.ConnectError(),
+    lambda: anyio.ClosedResourceError(),
+    _nested_closed_resource,
+])
+async def test_transient_connect_retries_once_then_returns_broker_rows(
+    monkeypatch, tmp_path, raise_error,
+):
+    slept = _patch_sleep(monkeypatch)
+    stale = _pos("XYZ261218P00010000", "XYZ", NY_DAY + timedelta(days=20))
+    db = Database(tmp_path / "retry.db")
+    PositionStore(db).upsert(stale)
+
+    class Flaky:
+        def __init__(self):
+            self.reads = 0
+
+        async def get_open_positions(self):
+            self.reads += 1
+            if self.reads == 1:
+                raise raise_error()
+            return []
+
+    broker = Flaky()
+    assert await fetch_broker_positions(broker) == []
+    assert broker.reads == 2
+    assert len(slept) == 1 and 1 <= slept[0] <= 2
+    # The stored row is still on disk and was not returned as the book.
+    assert [p.occ_symbol for p in PositionStore(db).list_all()] == [stale.occ_symbol]
+
+
+@pytest.mark.asyncio
+async def test_non_connect_error_is_not_retried(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+
+    class Boom:
+        def __init__(self):
+            self.reads = 0
+
+        async def get_open_positions(self):
+            self.reads += 1
+            raise ExceptionGroup("unhandled errors in a TaskGroup", [ValueError("synthetic")])
+
+    broker = Boom()
+    with pytest.raises(LiveBookError) as ei:
+        await fetch_broker_positions(broker)
+    assert str(ei.value) == "ExceptionGroup -> ValueError: synthetic"
+    assert broker.reads == 1
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_broker_failure_text_redacts_secrets(monkeypatch, caplog):
+    _patch_sleep(monkeypatch)
+    token = "synthetic-token-not-real"
+    account = "88442211"
+    url = "https://alerts.example.test/hook/synthetic"
+    header = "synthetic-header-value-xyz"
+    monkeypatch.setenv("TRADE_ALERT_HEADER_VALUE", header)
+
+    class Leak:
+        async def get_open_positions(self):
+            raise RuntimeError(
+                f"account_number={account} Bearer {token} at {url} "
+                f"header {header} ref {account} " + ("x" * 400)
+            )
+
+    with caplog.at_level(logging.WARNING, logger="agentic.live_positions"):
+        with pytest.raises(LiveBookError) as ei:
+            await fetch_broker_positions(Leak())
+    text = str(ei.value)
+    assert "RuntimeError" in text
+    assert len(text) <= 300
+    assert "[redacted]" in text
+    for secret in (token, account, url, "alerts.example.test", header):
+        assert secret not in text
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_monitor_run_records_connect_error_detail(tmp_path, monkeypatch):
+    """/api/ops last_error and the audit row name ConnectError, and skip the stored book."""
+    _patch_sleep(monkeypatch)
+    stale = _pos("XYZ261218P00010000", "XYZ", NY_DAY + timedelta(days=20), mark=0.20)
+    db = Database(tmp_path / "ops-conn.db")
+    store = PositionStore(db)
+    store.upsert(stale)
+    before = _count(db)
+    decisions = DecisionStore(db)
+    audit = AuditStore(db)
+    killswitch = KillSwitch(db, audit)
+
+    class ConnectBroker:
+        def __init__(self):
+            self.reads = 0
+
+        def capabilities(self):
+            return BrokerCapabilities("paper", False, True)
+
+        async def get_open_positions(self):
+            self.reads += 1
+            raise _empty_connect_group()
+
+    broker = ConnectBroker()
+    settings = Settings(mode="paper", rules=_rules())
+    monitor = MonitorLoop(
+        settings, broker, PaperMarketData(), store, audit, killswitch,
+        rules_engine=RulesEngine.from_configs(_rules()),
+        decisions=decisions,
+    )
+
+    async def _once():
+        try:
+            return await MonitorLoop.run_once(monitor)
+        finally:
+            monitor._stop.set()
+
+    monkeypatch.setattr(monitor, "run_once", _once)
+    await monitor.run()
+
+    assert broker.reads == 2
+    assert decisions.recent() == []
+    assert _count(db) == before
+    row = audit.latest(AuditEventType.ERROR)
+    assert row is not None
+    detail = row["payload"]["error"]
+    assert row["payload"]["where"] == "monitor"
+    assert detail == "LiveBookError: ExceptionGroup -> ConnectError"
+    assert detail != "failed"
+    assert "ConnectError" in detail
+
+    client = TestClient(create_app(WebDeps(
+        settings=settings,
+        signals=SignalStore(db),
+        killswitch=killswitch,
+        approval_gate=None,
+        audit=audit,
+        positions=store,
+        orders=OrderStore(db),
+        decisions=decisions,
+    )))
+    ops = client.get("/api/ops").json()
+    assert ops["last_error"]["where"] == "monitor"
+    assert ops["last_error"]["error"] == detail
+    assert "ConnectError" in ops["last_error"]["error"]
+    assert ops["last_error"]["error"] != "failed"
+
+
+def test_cap_keeps_the_leaf_connect_error():
+    try:
+        raise httpx.ConnectError("")
+    except httpx.ConnectError as conn:
+        err = RuntimeError("y" * 500)
+        err.__cause__ = conn
+        text = format_broker_failure(err)
+    assert len(text) <= 300
+    assert text.endswith("-> ConnectError")
+
+
+def test_cause_and_context_same_object_is_listed_once():
+    conn = httpx.ConnectError("")
+    closed = anyio.ClosedResourceError()
+    closed.__cause__ = conn
+    closed.__context__ = conn
+    text = format_broker_failure(closed)
+    assert text == "ClosedResourceError -> ConnectError"
+    assert text.count("ConnectError") == 1
+
+
+def test_ssl_reason_survives_formatting():
+    text = format_broker_failure(RuntimeError("[SSL: CERTIFICATE_VERIFY_FAILED] eof"))
+    assert "CERTIFICATE_VERIFY_FAILED" in text
+    assert "[SSL: [redacted]" not in text
+
+
+@pytest.mark.asyncio
+async def test_suppressed_context_connect_error_is_not_retried(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+
+    class Boom:
+        def __init__(self):
+            self.reads = 0
+
+        async def get_open_positions(self):
+            self.reads += 1
+            try:
+                raise httpx.ConnectError("")
+            except httpx.ConnectError:
+                raise ValueError("synthetic") from None
+
+    broker = Boom()
+    with pytest.raises(LiveBookError) as ei:
+        await fetch_broker_positions(broker)
+    assert str(ei.value) == "ValueError: synthetic"
+    assert "ConnectError" not in str(ei.value)
+    assert broker.reads == 1
+    assert slept == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message,secret", [
+    ("token = 'quoted secret tail'", "quoted secret tail"),
+    ('token = "quoted secret tail"', "quoted secret tail"),
+    ("id_token=id-value-synthetic", "id-value-synthetic"),
+    ("session_token=session-value-synthetic", "session-value-synthetic"),
+    ("access_token=access-value-synthetic", "access-value-synthetic"),
+    ("refresh_token=refresh-value-synthetic", "refresh-value-synthetic"),
+    ("account_id=5PY12345", "5PY12345"),
+    ("Bearer synthetic-token-not-real", "synthetic-token-not-real"),
+])
+async def test_live_book_error_hides_each_secret(monkeypatch, message, secret):
+    _patch_sleep(monkeypatch)
+
+    class Leak:
+        async def get_open_positions(self):
+            raise RuntimeError(message)
+
+    with pytest.raises(LiveBookError) as ei:
+        await fetch_broker_positions(Leak())
+    assert secret not in str(ei.value)
+    assert "[redacted]" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_monitor_log_does_not_print_the_raw_cause(tmp_path, monkeypatch, caplog):
+    _patch_sleep(monkeypatch)
+    db = Database(tmp_path / "log-redact.db")
+    store = PositionStore(db)
+    audit = AuditStore(db)
+    killswitch = KillSwitch(db, audit)
+    secret_tail = "quoted secret tail"
+    account_id = "5PY12345"
+    bearer = "synthetic-token-not-real"
+
+    class LeakBroker:
+        def capabilities(self):
+            return BrokerCapabilities("paper", False, True)
+
+        async def get_open_positions(self):
+            raise RuntimeError(
+                f"token = '{secret_tail}' account_id={account_id} Bearer {bearer}"
+            )
+
+    settings = Settings(mode="paper", rules=_rules())
+    monitor = MonitorLoop(
+        settings, LeakBroker(), PaperMarketData(), store, audit, killswitch,
+    )
+
+    async def _once():
+        try:
+            return await MonitorLoop.run_once(monitor)
+        finally:
+            monitor._stop.set()
+
+    monkeypatch.setattr(monitor, "run_once", _once)
+    with caplog.at_level(logging.DEBUG):
+        await monitor.run()
+    blob = caplog.text + str(audit.latest(AuditEventType.ERROR))
+    for secret in (secret_tail, account_id, bearer):
+        assert secret not in blob
+    detail = audit.latest(AuditEventType.ERROR)["payload"]["error"]
+    assert detail.startswith("LiveBookError:")
+    assert "[redacted]" in detail
+
+    client = TestClient(create_app(WebDeps(
+        settings=settings,
+        signals=SignalStore(db),
+        killswitch=killswitch,
+        approval_gate=None,
+        audit=audit,
+        positions=store,
+        orders=OrderStore(db),
+        decisions=DecisionStore(db),
+    )))
+    ops_err = client.get("/api/ops").json()["last_error"]["error"]
+    for secret in (secret_tail, account_id, bearer):
+        assert secret not in ops_err
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_keyboard_interrupt_propagate(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+
+    class Boom:
+        def __init__(self, exc):
+            self.exc = exc
+            self.reads = 0
+
+        async def get_open_positions(self):
+            self.reads += 1
+            raise self.exc
+
+    for exc in (asyncio.CancelledError(), KeyboardInterrupt()):
+        broker = Boom(exc)
+        with pytest.raises(type(exc)):
+            await fetch_broker_positions(broker)
+        assert broker.reads == 1
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_base_exception_group_propagates(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+
+    class Boom:
+        def __init__(self):
+            self.reads = 0
+
+        async def get_open_positions(self):
+            self.reads += 1
+            raise BaseExceptionGroup("mixed", [ValueError("synthetic"), KeyboardInterrupt()])
+
+    broker = Boom()
+    with pytest.raises(BaseExceptionGroup) as ei:
+        await fetch_broker_positions(broker)
+    assert type(ei.value) is BaseExceptionGroup
+    assert not isinstance(ei.value, LiveBookError)
+    assert any(isinstance(sub, KeyboardInterrupt) for sub in ei.value.exceptions)
+    assert any(isinstance(sub, ValueError) for sub in ei.value.exceptions)
+    assert broker.reads == 1
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_retry_skips_sleep_when_monitor_stop_is_set(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+    stop = asyncio.Event()
+    stop.set()
+
+    class Flaky:
+        def __init__(self):
+            self.reads = 0
+
+        async def get_open_positions(self):
+            self.reads += 1
+            if self.reads == 1:
+                raise _empty_connect_group()
+            return []
+
+    broker = Flaky()
+    assert await fetch_broker_positions(broker, stop_event=stop) == []
+    assert broker.reads == 2
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_account_lookup_connect_error_is_retried_not_blank(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+    broker = RobinhoodMCPBroker(account_number="", settings=Settings())
+    broker._connected = True
+    broker._tools = ["get_accounts", "get_option_positions"]
+    broker._roles = {"list_positions": "get_option_positions"}
+    calls: list[str] = []
+
+    async def fake(name, args):
+        calls.append(name)
+        if name == "get_accounts" and calls.count("get_accounts") == 1:
+            raise _empty_connect_group()
+        if name == "get_accounts":
+            return {"data": {"accounts": [
+                {"account_number": "ACCT-SYN", "agentic_allowed": True},
+            ]}}
+        return {"data": {"positions": []}}
+
+    monkeypatch.setattr(broker, "_call_tool", fake)
+    assert await fetch_broker_positions(broker) == []
+    assert calls.count("get_accounts") == 2
+    assert len(slept) == 1
+    assert "ACCT-SYN" not in "".join(calls)
+
+
+@pytest.mark.asyncio
+async def test_account_lookup_connect_error_is_not_reported_as_blank(monkeypatch):
+    _patch_sleep(monkeypatch)
+    broker = RobinhoodMCPBroker(account_number="", settings=Settings())
+    broker._connected = True
+    broker._tools = ["get_accounts", "get_option_positions"]
+    broker._roles = {"list_positions": "get_option_positions"}
+
+    async def fake(name, args):
+        raise _empty_connect_group()
+
+    monkeypatch.setattr(broker, "_call_tool", fake)
+    with pytest.raises(LiveBookError) as ei:
+        await fetch_broker_positions(broker)
+    text = str(ei.value)
+    assert "ConnectError" in text
+    assert text != "blank account"
+    assert "blank account" not in text
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_account_stays_blank_without_retry(monkeypatch):
+    slept = _patch_sleep(monkeypatch)
+    broker = RobinhoodMCPBroker(account_number="", settings=Settings())
+    broker._connected = True
+    broker._tools = ["get_accounts", "get_option_positions"]
+    broker._roles = {"list_positions": "get_option_positions"}
+    calls: list[str] = []
+
+    async def fake(name, args):
+        calls.append(name)
+        return {"data": {"accounts": [
+            {"account_number": "ACCT-SYN", "agentic_allowed": False},
+            {"account_number": "ACCT-OTH", "agentic_allowed": False},
+        ]}}
+
+    monkeypatch.setattr(broker, "_call_tool", fake)
+    with pytest.raises(LiveBookError, match="^blank account$"):
+        await fetch_broker_positions(broker)
+    assert calls == ["get_accounts"]
+    assert slept == []

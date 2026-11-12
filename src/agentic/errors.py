@@ -73,3 +73,44 @@ def describe_exception(exc: BaseException) -> dict[str, Any]:
         "root_causes": root_causes,
         "traceback": tb,
     }
+
+
+# Raised error, a group leaf, or an explicit __cause__. Not implicit __context__.
+_TRANSIENT_CONNECT = (
+    ("httpx", "ConnectError"),
+    ("httpcore", "ConnectError"),
+    ("anyio", "ClosedResourceError"),
+)
+
+
+def _matches_transient_connect(exc: BaseException) -> bool:
+    for cls in type(exc).mro():
+        module = getattr(cls, "__module__", "") or ""
+        name = cls.__name__
+        for prefix, type_name in _TRANSIENT_CONNECT:
+            if name == type_name and (module == prefix or module.startswith(prefix + ".")):
+                return True
+    return False
+
+
+def _raised_connect_nodes(exc: BaseException, seen: set[int], depth: int = 0):
+    """The raised error, group leaves, and explicit causes. Suppressed context is skipped."""
+    if id(exc) in seen or depth > 12:
+        return
+    seen.add(id(exc))
+    yield exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            yield from _raised_connect_nodes(sub, seen, depth + 1)
+    cause = exc.__cause__
+    if cause is not None:
+        yield from _raised_connect_nodes(cause, seen, depth + 1)
+
+
+def is_transient_connect_error(exc: BaseException) -> bool:
+    """True when this raised failure itself is a transient connect error.
+
+    A ``ValueError`` raised ``from None`` while handling a ConnectError is not one:
+    the ConnectError is only suppressed context.
+    """
+    return any(_matches_transient_connect(node) for node in _raised_connect_nodes(exc, set()))

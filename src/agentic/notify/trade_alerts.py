@@ -34,8 +34,18 @@ INVALID_HEADER_NAME_ERROR = (
 # RFC 7230 §3.2.6 token / tchar — header names only; no colon, space, or controls.
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
-_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+\S+")
-_COLON_TOKEN_RE = re.compile(r":\s*\S+")
+# Quoted values (spaces included) or one bare token. Quotes are tried first.
+_SECRET_VALUE = r"(?:\"[^\"]*\"|'[^']*'|\S+)"
+_BEARER_TOKEN_RE = re.compile(rf"(?i)\bBearer\s+{_SECRET_VALUE}")
+_COLON_TOKEN_RE = re.compile(rf":\s*{_SECRET_VALUE}")
+# Label may be a suffix of a snake/camel name: id_token, access_token, accountId, account_id.
+_LABELED_SECRET_RE = re.compile(
+    rf"(?i)([A-Za-z0-9_]*(?:token|secret|password|api_?key|authorization|cookie|session|"
+    rf"account(?:_?(?:id|number))?)\s*[:=]\s*){_SECRET_VALUE}"
+)
+_LONG_DIGITS_RE = re.compile(r"\b\d{8,}\b")
+# Bracketed TLS reasons are diagnostics, not header values: [SSL: CERTIFICATE_VERIFY_FAILED].
+_SSL_REASON_RE = re.compile(r"\[(?:SSL|TLS)\b[^\]]*\]", re.I)
 # OCC: <root><YYMMDD><C|P><strike*1000, 8 digits> — trailing 15 chars are fixed.
 def _parse_occ(occ: str) -> tuple[str, date, str, float] | None:
     if not occ or len(occ) < 16:
@@ -114,16 +124,45 @@ def _redact_env_value(detail: str, raw: str | None) -> str:
     return detail
 
 
-def sanitize_error(exc: BaseException, url: str | None = None) -> str:
-    """Exception text with webhook URL, header name/value, and key-like tokens stripped."""
-    detail = str(exc) or ""
+def _hold_ssl_reasons(detail: str) -> tuple[str, list[str]]:
+    held: list[str] = []
+
+    def _repl(match: re.Match) -> str:
+        held.append(match.group(0))
+        return f"\x00ssl{len(held) - 1}\x00"
+
+    return _SSL_REASON_RE.sub(_repl, detail), held
+
+
+def _restore_ssl_reasons(detail: str, held: list[str]) -> str:
+    for i, original in enumerate(held):
+        detail = detail.replace(f"\x00ssl{i}\x00", original)
+    return detail
+
+
+def scrub_error_text(detail: str, url: str | None = None, *, generic_colons: bool = True) -> str:
+    """Strip webhook URLs, header secrets, tokens, and account-number-like values.
+
+    ``generic_colons`` redacts any ``: value`` (header style). Turn it off when the
+    text already has ``TypeName: message`` markers that must stay readable.
+    """
     if url:
         detail = detail.replace(url, "[redacted]")
     detail = _redact_env_value(detail, get_secret("TRADE_ALERT_HEADER_VALUE"))
     detail = _redact_env_value(detail, get_secret("TRADE_ALERT_HEADER_NAME"))
+    detail, held_ssl = _hold_ssl_reasons(detail)
     detail = _BEARER_TOKEN_RE.sub("Bearer [redacted]", detail)
-    detail = _COLON_TOKEN_RE.sub(": [redacted]", detail)
-    detail = _URL_RE.sub("[redacted]", detail).strip()
+    detail = _LABELED_SECRET_RE.sub(r"\1[redacted]", detail)
+    if generic_colons:
+        detail = _COLON_TOKEN_RE.sub(": [redacted]", detail)
+    detail = _URL_RE.sub("[redacted]", detail)
+    detail = _LONG_DIGITS_RE.sub("[redacted]", detail)
+    return _restore_ssl_reasons(detail, held_ssl).strip()
+
+
+def sanitize_error(exc: BaseException, url: str | None = None) -> str:
+    """Exception text with webhook URL, header, token, and account-number secrets stripped."""
+    detail = scrub_error_text(str(exc) or "", url)
     msg = type(exc).__name__ if not detail else f"{type(exc).__name__}: {detail}"
     return msg[:400]
 

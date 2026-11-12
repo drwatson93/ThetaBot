@@ -21,7 +21,9 @@ from ..store.audit import AuditStore
 from ..store.decisions import DecisionStore
 from ..store.positions import PositionStore
 from .killswitch import KillSwitch
-from .live_positions import attach_quote, fetch_broker_positions, select_live, snapshot
+from .live_positions import (
+    attach_quote, fetch_broker_positions, format_broker_failure, select_live, snapshot,
+)
 from .market_hours import is_market_hours, is_order_window
 
 log = logging.getLogger("agentic.monitor")
@@ -71,8 +73,10 @@ class MonitorLoop:
                 await self.run_once()
                 self.killswitch.record_success()
             except Exception as exc:  # noqa: BLE001 — a bad cycle must not kill the loop
-                log.exception("Monitor cycle error: %s", exc)
-                self.audit.record(AuditEventType.ERROR, {"where": "monitor", "error": str(exc)})
+                detail = format_broker_failure(exc)
+                # No exc_info: the traceback would print the raw __cause__ (tokens, account ids).
+                log.error("Monitor cycle error: %s", detail)
+                self.audit.record(AuditEventType.ERROR, {"where": "monitor", "error": detail})
                 self.killswitch.record_broker_error("monitor")
             delay = (
                 self.settings.poll_interval_seconds
@@ -137,7 +141,7 @@ class MonitorLoop:
         paper book) is read with no argument. A blank account is not sent to
         ``get_option_positions``. A failed read raises; it does not return stored rows.
         """
-        return await fetch_broker_positions(self.broker)
+        return await fetch_broker_positions(self.broker, stop_event=self._stop)
 
     async def _evaluate(self, pos, quote) -> None:
         """Evaluate rules for one position.

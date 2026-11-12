@@ -48,9 +48,16 @@ from typing import Any
 from ..config import get_secret
 from ..domain.enums import Direction, OptionType, PositionStatus, Strategy
 from ..domain.models import EquityHolding, Order, Position
+from ..errors import is_transient_connect_error
 from .base import BrokerCapabilities, ExecutionBroker
 
 log = logging.getLogger("agentic.brokers.rh_mcp")
+
+
+def _safe_failure(exc: BaseException) -> str:
+    """Sanitized failure text. Imported lazily so this module does not import services at load."""
+    from ..services.live_positions import format_broker_failure
+    return format_broker_failure(exc)
 
 MCP_URL = "https://agent.robinhood.com/mcp/trading"
 
@@ -173,8 +180,9 @@ class RobinhoodMCPBroker(ExecutionBroker):
         self.url = url
         self._account_number = str(account_number or "").strip()
         self._settings = settings
-        # Blank config is filled once from get_accounts. A failed lookup is remembered so
-        # the monitor does not call get_option_positions (and log) on every poll.
+        # Blank config is filled once from get_accounts. A non-connect miss is remembered so
+        # the monitor does not call get_option_positions (and log) on every poll. A connect
+        # failure is not remembered; the caller retries it.
         self._account_lookup_done = False
         self._account_unresolved = False
         self._account_missing_logged = False
@@ -277,7 +285,8 @@ class RobinhoodMCPBroker(ExecutionBroker):
         ``robinhood.account_number``. When that is blank, one ``get_accounts`` read fills
         it: the single ``agentic_allowed`` account, or the only account on the login.
         Several accounts and no single agentic account are not guessed. The value is
-        never logged. A failed lookup is remembered and warned once.
+        never logged. A failed lookup is remembered and warned once. A connect failure
+        is not remembered: it propagates so the caller can retry it.
         """
         explicit = str(account_number or "").strip()
         if explicit:
@@ -287,16 +296,22 @@ class RobinhoodMCPBroker(ExecutionBroker):
             return current
         if self._account_lookup_done:
             return ""
-        self._account_lookup_done = True
         if not self._connected or "get_accounts" not in self._tools:
+            self._account_lookup_done = True
             self._warn_account_missing()
             return ""
         try:
-            accounts = await self.list_accounts()
+            accounts = await self._load_account_records()
         except Exception as exc:  # noqa: BLE001 — a lookup miss must not spam the monitor
-            log.warning("Account lookup failed: %s", exc)
+            # A dropped TLS session is not "no account". Leave the lookup unset so the
+            # caller can retry, and let the connect error surface.
+            if is_transient_connect_error(exc):
+                raise
+            self._account_lookup_done = True
+            log.warning("Account lookup failed: %s", _safe_failure(exc))
             self._warn_account_missing()
             return ""
+        self._account_lookup_done = True
         picked = self._pick_account_number(accounts)
         if not picked:
             self._warn_account_missing()
@@ -530,6 +545,13 @@ class RobinhoodMCPBroker(ExecutionBroker):
     async def _portfolio_field(self, keys: tuple[str, ...]) -> float:
         return await self._portfolio_field_async(keys)
 
+    async def _load_account_records(self) -> list[dict[str, Any]]:
+        """``get_accounts`` rows. Raises on a tool or connect failure (no fail-open)."""
+        raw = await self._call_tool("get_accounts", {})
+        data = raw.get("data", raw) if isinstance(raw, dict) else {}
+        accts = data.get("accounts") if isinstance(data, dict) else None
+        return [a for a in (accts or []) if isinstance(a, dict)]
+
     async def list_accounts(self) -> list[dict[str, Any]]:
         """All Robinhood accounts on the login (READ-ONLY, for the advisory calculator only — never
         traded). Returns the raw per-account dicts (account_number, brokerage_account_type, nickname,
@@ -540,13 +562,11 @@ class RobinhoodMCPBroker(ExecutionBroker):
         if not self._connected or "get_accounts" not in self._tools:
             return fallback
         try:
-            raw = await self._call_tool("get_accounts", {})
+            found = await self._load_account_records()
         except Exception as exc:  # noqa: BLE001 — advisory read; never raise
-            log.warning("list_accounts failed: %s", exc)
+            log.warning("list_accounts failed: %s", _safe_failure(exc))
             return fallback
-        data = raw.get("data", raw) if isinstance(raw, dict) else {}
-        accts = data.get("accounts") if isinstance(data, dict) else None
-        return [a for a in (accts or []) if isinstance(a, dict)] or fallback
+        return found or fallback
 
     async def resolve_option_id(self, occ_symbol: str) -> str | None:
         """Resolve an OCC symbol to the RH option-instrument UUID via get_option_instruments."""

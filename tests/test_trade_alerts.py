@@ -641,3 +641,27 @@ async def test_invalid_header_name_blocks_test_alert(tmp_path, monkeypatch):
     assert result["ok"] is False
     assert result["error"] == INVALID_HEADER_NAME_ERROR
     assert FULL_HEADER_LINE_KEY not in json.dumps(result)
+
+
+@pytest.mark.parametrize("message,secret", [
+    ("token = 'quoted secret tail'", "quoted secret tail"),
+    ('token = "quoted secret tail"', "quoted secret tail"),
+    ("token: 'quoted secret tail'", "secret tail'"),
+    ("id_token=id-value-synthetic", "id-value-synthetic"),
+    ("session_token=session-value-synthetic", "session-value-synthetic"),
+    ("access_token=access-value-synthetic", "access-value-synthetic"),
+    ("refresh_token=refresh-value-synthetic", "refresh-value-synthetic"),
+    ("account_id=5PY12345", "5PY12345"),
+    ("Bearer synthetic-token-not-real", "synthetic-token-not-real"),
+    ("Bearer 'quoted secret tail'", "quoted secret tail"),
+])
+def test_sanitize_error_redacts_labeled_and_quoted_secrets(message, secret):
+    err = sanitize_error(RuntimeError(message))
+    assert secret not in err
+    assert "[redacted]" in err
+
+
+def test_sanitize_error_keeps_ssl_reason():
+    err = sanitize_error(RuntimeError("[SSL: CERTIFICATE_VERIFY_FAILED] eof"))
+    assert "CERTIFICATE_VERIFY_FAILED" in err
+    assert "[SSL: [redacted]" not in err
